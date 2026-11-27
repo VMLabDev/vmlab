@@ -105,7 +105,7 @@ class JitReportTests(unittest.TestCase):
     def test_a_report_with_the_exits_of_chaining(self):
         line = ('{"level":"INFO","message":"vcpu 0: JIT: 1000 instructions, 7 of them in the '
                 'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
-                '0 resets of the region, 3 ms of compiling; exits: 80 chained, 15 jump cache '
+                '0 resets of the region, 3 ms of compiling; chaining: 80 chained, 15 jump cache '
                 'hits, 4 unlinked, 6 jump cache misses, 12 runs entered; 9 links, 2 unlinks, '
                 '5 fills, 40 clears of the jump cache"}\n')
         with tempfile.TemporaryDirectory() as run_dir:

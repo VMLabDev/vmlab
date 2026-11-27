@@ -16,6 +16,39 @@ pub fn next_identity() -> u64 {
     id
 }
 
+/// A page of RAM that a CPU reads and writes through the host, without a
+/// call of the memory (DESIGN.md of phase 3d, R12; card S3).
+///
+/// A CPU writes such a page straight only while its watch word is even.
+/// The word is odd while the page holds code that a CPU translated, and
+/// every write that a CPU or a device makes into a watched page goes
+/// through the memory, which moves the code stamps of the page, makes the
+/// word even again and then moves the stamps. A CPU that wrote straight
+/// reads the word again after its write, and when it is odd then, it tells
+/// the memory with `Memory::wrote_straight`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostPage {
+    /// The host address of the first byte of the page. The mapping lives
+    /// while the memory names the same `Memory::host_mapping`.
+    pub base: usize,
+    /// The address of the `AtomicU32` watch word of the page, or 0 for a
+    /// page that a CPU reads straight and writes only through the memory
+    /// (a ROM).
+    pub watch: usize,
+}
+
+impl HostPage {
+    /// The watch word of the page. `None` for a page that is not written
+    /// straight.
+    #[inline(always)]
+    pub fn watch(&self) -> Option<&std::sync::atomic::AtomicU32> {
+        // SAFETY: a non-zero `watch` is the address of an `AtomicU32` that
+        // lives as long as the mapping of `base` (the promise of
+        // `Memory::host_page`).
+        (self.watch != 0).then(|| unsafe { &*(self.watch as *const std::sync::atomic::AtomicU32) })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeStamp {
     pub identity: u64,
@@ -72,6 +105,59 @@ pub trait Memory {
     fn store_conditional(&mut self, address: u64, bytes: &[u8], generation: u64) -> Result<bool>;
     /// Serializes a generated read-modify-write sequence with ordinary accesses.
     fn transaction_lock(&self) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>>;
+
+    /// The host page of the page of RAM that starts at the physical address
+    /// `page` (a multiple of 4096), when a CPU may access it straight. The
+    /// mapping and the watch word live as long as `host_mapping` names the
+    /// same value. `None`, the default: every access is a call.
+    fn host_page(&mut self, _page: u64) -> Option<HostPage> {
+        None
+    }
+    /// A value that names the host pages that `host_page` hands out: a CPU
+    /// drops the pages it keeps when the value is another one. `None` for a
+    /// memory that hands out none.
+    fn host_mapping(&self) -> Option<(u64, u64)> {
+        None
+    }
+    /// The page of the physical address holds code that a CPU translates
+    /// now: from here every write into it moves its code stamp. The answer
+    /// is the watch word after the call, for `watch_holds`. Call it before
+    /// `code_stamp`, which comes before the code is read.
+    fn watch_code(&mut self, _address: u64) -> Option<u32> {
+        None
+    }
+    /// Whether the watch word of the page is still `word`: no write made it
+    /// even since `watch_code`. `false` means a write raced the
+    /// translation, and the block takes no stamp.
+    fn watch_holds(&self, _address: u64, _word: u32) -> bool {
+        true
+    }
+    /// A CPU wrote these bytes straight into a host page whose watch it then
+    /// found odd: move the stamps as `write` would have.
+    fn wrote_straight(&mut self, _address: u64, _len: usize) {}
+    /// The count of times that the writes through this handle moved
+    /// `generation`, for a memory that does not move it on every write.
+    /// `None`, the default: every write moves it once, and the CPU counts
+    /// its own.
+    fn own_generation(&self) -> Option<u64> {
+        None
+    }
+    /// Write `new` at `address` when the memory holds `expected` there, as
+    /// one host operation against the writes of every other CPU, also those
+    /// that a CPU makes straight. Both are the same size and the range is
+    /// aligned to it. The caller holds `transaction_lock`. The default reads,
+    /// compares and writes: right for a memory whose every write takes that
+    /// lock.
+    fn compare_and_store(&mut self, address: u64, expected: &[u8], new: &[u8]) -> Result<bool> {
+        let mut now = [0u8; 16];
+        let now = &mut now[..expected.len()];
+        self.read(address, now)?;
+        if now != expected {
+            return Ok(false);
+        }
+        self.write(address, new)?;
+        Ok(true)
+    }
 }
 
 #[derive(Debug)]
@@ -81,18 +167,41 @@ pub struct FlatMemory {
     generation: u64,
     identity: u64,
     page_generations: Vec<u64>,
+    /// The watch word of each page (`HostPage`).
+    watch: Box<[std::sync::atomic::AtomicU32]>,
 }
 
 impl FlatMemory {
     pub fn new(base: u64, data: Vec<u8>) -> Self {
-        let page_generations = vec![0; data.len().div_ceil(PAGE_SIZE)];
+        let pages = data.len().div_ceil(PAGE_SIZE);
         Self {
             base,
             data,
             generation: 0,
             identity: next_identity(),
-            page_generations,
+            page_generations: vec![0; pages],
+            watch: (0..pages)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
         }
+    }
+
+    /// Make the watch words of the pages `first..=last` even: a write into
+    /// a page ends what a CPU translated there.
+    fn unwatch(&self, first: usize, last: usize) {
+        for word in &self.watch[first..=last] {
+            let now = word.load(std::sync::atomic::Ordering::SeqCst);
+            if now & 1 != 0 {
+                word.store(now.wrapping_add(1), std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Move the stamps of the pages `first..=last`, after a write.
+    fn stamp(&mut self, first: usize, last: usize) {
+        self.generation = self.generation.wrapping_add(1);
+        self.unwatch(first, last);
+        self.page_generations[first..=last].fill(self.generation);
     }
     pub fn bytes(&self) -> &[u8] {
         &self.data
@@ -127,13 +236,47 @@ impl Memory for FlatMemory {
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
         let range = self.range(address, bytes.len())?;
         self.data[range.clone()].copy_from_slice(bytes);
-        self.generation = self.generation.wrapping_add(1);
-        if !range.is_empty() {
-            let first = range.start / PAGE_SIZE;
-            let last = (range.end - 1) / PAGE_SIZE;
-            self.page_generations[first..=last].fill(self.generation);
+        if range.is_empty() {
+            self.generation = self.generation.wrapping_add(1);
+        } else {
+            self.stamp(range.start / PAGE_SIZE, (range.end - 1) / PAGE_SIZE);
         }
         Ok(())
+    }
+    fn host_page(&mut self, page: u64) -> Option<HostPage> {
+        let range = self.range(page, PAGE_SIZE).ok()?;
+        if !range.start.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+        Some(HostPage {
+            base: self.data[range.clone()].as_mut_ptr() as usize,
+            watch: &self.watch[range.start / PAGE_SIZE] as *const _ as usize,
+        })
+    }
+    fn host_mapping(&self) -> Option<(u64, u64)> {
+        Some((self.identity, self.base))
+    }
+    fn watch_code(&mut self, address: u64) -> Option<u32> {
+        let offset = self.range(address, 1).ok()?.start;
+        let word = &self.watch[offset / PAGE_SIZE];
+        let now = word.load(std::sync::atomic::Ordering::SeqCst);
+        if now & 1 != 0 {
+            return Some(now);
+        }
+        word.store(now.wrapping_add(1), std::sync::atomic::Ordering::SeqCst);
+        Some(now.wrapping_add(1))
+    }
+    fn watch_holds(&self, address: u64, word: u32) -> bool {
+        self.range(address, 1).is_ok_and(|range| {
+            self.watch[range.start / PAGE_SIZE].load(std::sync::atomic::Ordering::SeqCst) == word
+        })
+    }
+    fn wrote_straight(&mut self, address: u64, len: usize) {
+        if let Ok(range) = self.range(address, len)
+            && !range.is_empty()
+        {
+            self.stamp(range.start / PAGE_SIZE, (range.end - 1) / PAGE_SIZE);
+        }
     }
     fn generation(&self) -> u64 {
         self.generation

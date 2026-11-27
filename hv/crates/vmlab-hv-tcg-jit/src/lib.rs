@@ -8,6 +8,7 @@
 //! - `emit`: the one-pass allocator with its spill (H3), the inline forms of
 //!   the operations of one word, the guards and their stubs (H9), and the
 //!   thunk through which every effect runs.
+//! - `perf`: the perf map (H13e), which names each block for `perf`.
 //! - The trampoline here (H4): `enter` saves the registers that the System V
 //!   ABI keeps, loads the context, and jumps to a block. A block leaves by a
 //!   jump to the common exit, which restores them and returns the exit code.
@@ -36,10 +37,11 @@
 
 pub mod asm;
 pub mod emit;
+pub mod perf;
 pub mod region;
 
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
-pub use emit::{Chain, Effect, Next, NextPc, Refused, Shape};
+pub use emit::{Chain, Defect, Effect, Next, NextPc, Refused, Shape};
 use region::Region;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -203,6 +205,11 @@ pub struct Jit {
     incoming: HashMap<u64, Vec<Site>>,
     jump: Box<[JumpEntry]>,
     jump_generation: u64,
+    defect: Defect,
+    /// The address and the length of the trampoline.
+    trampoline: (u64, u64),
+    /// Each block is named in the perf map (H13e).
+    perf_map: bool,
     pub stats: Stats,
 }
 
@@ -259,6 +266,9 @@ impl Jit {
             incoming: HashMap::new(),
             jump: vec![JumpEntry::EMPTY; JUMP_ENTRIES].into_boxed_slice(),
             jump_generation: JUMP_GENERATION_STEP,
+            defect: Defect::None,
+            trampoline: (base, len as u64),
+            perf_map: false,
             stats: Stats::default(),
         })
     }
@@ -379,6 +389,42 @@ impl Jit {
             .then_some(entry.code)
     }
 
+    /// Put `defect` into every block compiled from now on. For the tests
+    /// of K2 and K3 only (3e DESIGN.md J2): a guest never runs with one.
+    pub fn seed_defect(&mut self, defect: Defect) {
+        self.defect = defect;
+    }
+
+    /// Name every block compiled from now on in the perf map of the
+    /// process (H13e), with the trampoline first.
+    pub fn set_perf_map(&mut self, on: bool) -> std::io::Result<()> {
+        if on && !self.perf_map {
+            let (address, bytes) = self.trampoline;
+            perf::name(address, bytes, "vmlab-hv-jit enter")?;
+        }
+        self.perf_map = on;
+        Ok(())
+    }
+
+    /// Whether blocks are named in the perf map: the caller names each
+    /// block that it compiles with `name`.
+    pub fn perf_map(&self) -> bool {
+        self.perf_map
+    }
+
+    /// Name the code of `entry` in the perf map, when it is on. A failed
+    /// write turns the map off, and says why.
+    pub fn name(&mut self, entry: &Entry, label: &str) -> std::io::Result<()> {
+        if !self.perf_map {
+            return Ok(());
+        }
+        let written = perf::name(entry.address, u64::from(entry.bytes), label);
+        if written.is_err() {
+            self.perf_map = false;
+        }
+        written
+    }
+
     /// Whether the code of `entry` is still in the region.
     pub fn current(&self, entry: &Entry) -> bool {
         entry.generation == self.region.generation() && self.region.contains(entry.address)
@@ -406,7 +452,7 @@ impl Jit {
     }
 
     fn compile_inner(&mut self, shape: &Shape) -> Result<Entry, Refused> {
-        let (asm, labels) = emit::emit(shape, self.exit, self.features)?;
+        let (asm, labels) = emit::emit(shape, self.exit, self.features, self.defect)?;
         let mut sites = [(0, 0); SITES];
         for (n, (jump, stub)) in labels.iter().enumerate() {
             let position = |label| {

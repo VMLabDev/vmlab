@@ -574,6 +574,11 @@ against the interpreter, and against QEMU through the same two harnesses.
   states and the log. This proves the emitter on the blocks of a real boot,
   with MMIO and faults. It does not prove the inlined TLB sequence, which K2
   and unit tests cover. Speed: below the interpreter.
+  - **K3a.** `VMLAB_HV_JIT_CHECK_RUNS=<n>` checks the first n runs of each
+    compiled block, and every later run is a plain run of its code. Every
+    block that runs is still checked, at least once after each compile. A
+    check of every run is too slow for the 90 s device timeouts of a Debian
+    boot (J2a), so the boot of the proof uses n = 1000.
 - **K4. O4 with the JIT on.** The boot lockstep runs as in 3d, with compiled
   one-instruction blocks. It is the nightly and by-hand run that it is today.
 - **K5. kvm-unit-tests and S1** with the JIT on, at 1, 2 and 4 vCPUs: the
@@ -705,6 +710,69 @@ the flat images, `vmlab-hv` with `env.jit` for the boot).
   through the thunk, which puts the words that it reads into the frame and
   saves the caller-saved registers that hold values. J3 inlines them.
 
+### J2, the proof tools (measured)
+
+Helios, 2026-11-27, *measured*, with the load average of the host at 5 to
+14 of 32 threads. The tools: `VMLAB_HV_JIT_CHECK` (K3, K3a),
+`VMLAB_HV_JIT_PERF_MAP` (H13e), the counters of the debug log, and
+`Cpu::seed_jit_defect` for the tests.
+
+| Proof | Result |
+|---|---|
+| K3 on a Debian 13 boot, 1 vCPU, `VMLAB_HV_JIT_CHECK=1` and `VMLAB_HV_JIT_CHECK_RUNS=1000` | The login prompt on `ttyAMA0` after 244.1 s, no difference. 855,603 compiles and 134.3 million checked runs (637.7 million instructions) up to the last counter line, at 18.0e9 instructions. The same setting reached agent ready in 266.6 s in a run of the bench. |
+| K3 of every run on the same boot | No difference in 2.45 billion checked runs (14.97e9 instructions). At 32 MIPS the boot fell into emergency mode on the 90 s device timeouts after 544 s, before the login prompt (J2a). |
+| K3 on the K2 streams, seed `0x3e0001`, 1,000 rounds (`tests/jit.rs`) | 5,185 checked runs, no difference. |
+| A seeded defect (`Defect::AddSubtracts`: `Code::Add` subtracts) | K2 finds it in round 1 (the states differ). K3 finds it in round 1: a store at another address than the interpreter's. |
+
+The rows before (`cc6060d7`, `next`) and after (`76a9a1dd`), interleaved on
+the same cores, in `bench/history/aarch64.jsonl`. MIPS, median of 3, cores 20
+to 23 for the flat images; one boot each, side by side on cores 12 to 15 and
+16 to 19. The second pass of the flat images ran while the load rose; its
+rows are in the history too.
+
+| Workload | Before | After |
+|---|---|---|
+| CoreMark mix, flat, JIT | 160.3 | 158.4 |
+| Scalar loop, flat, JIT | 176.5 | 175.5 |
+| CoreMark mix, flat, interpreter | 133.5 | 113.3 |
+| Scalar loop, flat, interpreter | 149.7 | 131.4 |
+| Debian 13 boot with the JIT, to agent ready, s | 219.1 | 187.1 |
+| The same, boot MIPS | 82.5 | 96.0 |
+| Instructions in the interpreter (H2b) in the boot, in blocks | 48.6 million in 6.17 million | 45.2 million in 5.74 million |
+
+No instruction of the flat images ran in the interpreter. The interpreter rows
+of the flat images moved by 13 % between the two passes of one commit as well
+(`cc6060d7`: 133.5 and 108.9 on CoreMark), so the difference in that pair is
+the noise of the host. J2 changes no emitter form and the plain run of a
+compiled block only by its counters.
+
+- **J2a.** K3 costs per block a copy of the 72 register slots and one
+  compare, the slow paths of the loads and stores in the interpreter (the
+  log is on), and the replay through its own thunk. A block with an ordered
+  helper call copies and compares the whole state. The first build cloned the
+  whole state twice per block and formatted the two ends of every run: 15 to
+  20 MIPS. Without both, 32 MIPS. A first build of J2 also slowed the plain
+  JIT by a fifth (145 against 181 MIPS on the loop): the replay was a branch
+  in the one thunk, and the run of compiled code was no longer inlined.
+- **J2b.** The perf map is `/tmp/perf-<pid>.map` behind
+  `VMLAB_HV_JIT_PERF_MAP=1`: the trampoline as `vmlab-hv-jit enter`, and each
+  block as `a64 <pc> pa <physical address> el<n> <count> insns`. After a reset
+  of the region an address can carry two names: the later line names the
+  code that is there now.
+- **J2c.** The counter line of the debug log (every 1e9 instructions, from
+  `vmlab_hv_vmm::vcpu::emulated`) gains the fallbacks (runs of refused blocks,
+  and runs that the budget sent to the interpreter), the exits of compiled
+  runs by kind (the end of the block, an exception, a store into translated
+  code, a stop) and the runs and instructions that K3 checked. The bench reads
+  them into `jit_reports`.
+- **J2d.** K6: the tests of a store into translated code (into its own
+  block, through another address, under an address that maps other code, at
+  two addresses, a write from outside, a data store that keeps the blocks)
+  run on the interpreter, on the JIT and on the JIT with K3, and a new test
+  stores from a second CPU into code that the first ran. A chained pair waits
+  for J4.
+- **J2e.** No emitter form changed, so K1 had no group to run. K2 ran in
+  `ci::check` (`tests/jit.rs`).
 ### G3, measured by card J4
 
 Helios, 2026-11-27, one vCPU, *measured*. Before: `b640db7c` (`next` with

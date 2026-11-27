@@ -582,6 +582,37 @@ class BootMipsTests(unittest.TestCase):
         self.assertEqual(lib.DIRECTION["boot_mips"], "higher")
 
 
+class JitReportTests(unittest.TestCase):
+    OLD = ("vcpu 0: JIT: 2000000000 instructions, 5 of them in the interpreter in 2 blocks; "
+           "30 blocks compiled, 1 refused, 4000 bytes of code, 0 resets of the region, "
+           "7 ms of compiling")
+    NEW = OLD + ("; fallbacks: 2 runs of refused blocks, 3 at the budget; exits: 10 at the end, "
+                 "4 exceptions, 1 stores into code, 0 stops; K3: 6 blocks checked, 60 instructions")
+
+    def report(self, line):
+        with tempfile.TemporaryDirectory() as run_dir:
+            with open(os.path.join(run_dir, "stderr.log"), "w") as log_file:
+                log_file.write(f"[INFO] {line}\n")
+            return lib.last_jit_report(run_dir)
+
+    def test_a_line_without_the_counters_of_j2_still_reads(self):
+        report = self.report(self.OLD)
+        self.assertEqual(report["compiled_blocks"], 30)
+        self.assertNotIn("exits_end", report)
+
+    def test_the_counters_of_j2_read(self):
+        report = self.report(self.NEW)
+        self.assertEqual(report["refused_runs"], 2)
+        self.assertEqual(report["budget_runs"], 3)
+        self.assertEqual(report["exits_exception"], 4)
+        self.assertEqual(report["checked_instructions"], 60)
+
+    def test_the_check_turns_the_jit_on(self):
+        self.assertTrue(lib.jit_enabled({"VMLAB_HV_JIT_CHECK": "1"}))
+        self.assertTrue(lib.jit_check_enabled({"VMLAB_HV_JIT_CHECK": "on"}))
+        self.assertFalse(lib.jit_check_enabled({"VMLAB_HV_JIT": "1"}))
+
+
 class NoiseControlTests(unittest.TestCase):
     def test_g2g_samples_are_named_for_the_sender_and_receiver(self):
         import run

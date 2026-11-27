@@ -101,6 +101,12 @@ impl WriteDiscard {
     pub fn watch(&self, watch: WriteWatch) -> bool {
         self.watch.set(watch).is_ok()
     }
+
+    /// Whether `arm` was called: a write must come past `mark_dirty`, which
+    /// drops the private pages that it leaves.
+    pub fn discards(&self) -> bool {
+        self.discard.get().is_some()
+    }
 }
 
 impl<'a> vm_memory::bitmap::WithBitmapSlice<'a> for WriteDiscard {

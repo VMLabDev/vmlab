@@ -889,7 +889,14 @@ def jit_enabled(environ=None):
     """Whether VMLAB_HV_JIT turns the JIT of the aarch64 core on (3e
     DESIGN.md J1): the values that `exec::jit_from_environment` reads."""
     environ = os.environ if environ is None else environ
-    return environ.get("VMLAB_HV_JIT") in ("1", "on", "true")
+    return environ.get("VMLAB_HV_JIT") in ("1", "on", "true") or jit_check_enabled(environ)
+
+
+def jit_check_enabled(environ=None):
+    """Whether VMLAB_HV_JIT_CHECK turns K3 on (3e DESIGN.md J2): every
+    compiled block is checked against the interpreter, and the JIT is on."""
+    environ = os.environ if environ is None else environ
+    return environ.get("VMLAB_HV_JIT_CHECK") in ("1", "on", "true")
 
 
 JIT_REPORT = re.compile(
@@ -897,8 +904,13 @@ JIT_REPORT = re.compile(
     r"interpreter in (?P<interpreted_blocks>\d+) blocks; (?P<compiled_blocks>\d+) blocks compiled, "
     r"(?P<refused_blocks>\d+) refused, (?P<code_bytes>\d+) bytes of code, (?P<resets>\d+) resets "
     r"of the region, (?P<compile_ms>\d+) ms of compiling"
+    # The counters of J2, in the lines of a vmlab-hv that has them.
+    r"(?:; fallbacks: (?P<refused_runs>\d+) runs of refused blocks, (?P<budget_runs>\d+) at the "
+    r"budget; exits: (?P<exits_end>\d+) at the end, (?P<exits_exception>\d+) exceptions, "
+    r"(?P<exits_retry>\d+) stores into code, (?P<exits_stop>\d+) stops; K3: "
+    r"(?P<checked_blocks>\d+) blocks checked, (?P<checked_instructions>\d+) instructions)?"
     # The exits of card J4 (chaining and the jump cache), when the line has them.
-    r"(?:; exits: (?P<chained>\d+) chained, (?P<jump_hits>\d+) jump cache hits, "
+    r"(?:; chaining: (?P<chained>\d+) chained, (?P<jump_hits>\d+) jump cache hits, "
     r"(?P<unlinked>\d+) unlinked, (?P<lookups>\d+) jump cache misses, (?P<entered>\d+) runs "
     r"entered; (?P<links>\d+) links, (?P<unlinks>\d+) unlinks, (?P<fills>\d+) fills"
     r"(?:, (?P<clears>\d+) clears of the jump cache)?)?")
@@ -913,8 +925,11 @@ def last_jit_report(run_dir):
             for line in log_file:
                 match = JIT_REPORT.search(line)
                 if match:
-                    last = {key: int(value) for key, value in match.groupdict().items()
-                            if value is not None}
+                    last = {
+                        key: int(value)
+                        for key, value in match.groupdict().items()
+                        if value is not None
+                    }
     except OSError:
         return None
     return last
