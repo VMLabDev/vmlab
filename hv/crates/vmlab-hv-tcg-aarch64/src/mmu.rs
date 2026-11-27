@@ -12,6 +12,12 @@
 //! the walk. An entry is one 4K page of a mapping, tagged with its ASID
 //! unless the mapping is global. A fault is never kept.
 //!
+//! With the JIT on, the `Mmu` also keeps the fast TLB of compiled code (3e
+//! DESIGN.md H7), whose entries are copies of its own with their host
+//! address. Every flush of its own entries flushes the fast TLB too
+//! (H7b), and so does every change of the controls, also one of the table
+//! base or of the ASID alone, because a fast entry has no ASID.
+//!
 //! The CPU of phase 3d is Armv8.0: no hardware update of the access flag and
 //! no dirty state. A descriptor with the access flag clear takes an access
 //! flag fault, and the guest sets the flag. QEMU's `cortex-a53` does the
@@ -32,6 +38,7 @@ use crate::state::State;
 use crate::sysreg::{self, reg};
 use vmlab_hv_tcg::tlb::{Entry, PAGE_BITS, Tlb};
 use vmlab_hv_tcg::{Error, Memory};
+use vmlab_hv_tcg_jit::tlb::FastTlb;
 
 /// A translation regime (DESIGN.md G4). EL2 and EL2&0 come with a CPU that
 /// has EL2.
@@ -533,6 +540,8 @@ pub struct Mmu {
     /// What the memory named its host pages when the entries took theirs
     /// (`Memory::host_mapping`).
     mapping: Option<(u64, u64)>,
+    /// The fast TLB of compiled code, while the JIT is on.
+    fast: Option<Box<FastTlb>>,
 }
 
 impl Mmu {
@@ -544,7 +553,26 @@ impl Mmu {
             asid: controls.asid(),
             changes: 0,
             mapping: None,
+            fast: None,
         }
+    }
+
+    /// Keep a fast TLB for compiled code from now on, or drop it.
+    pub fn set_fast(&mut self, on: bool) {
+        if on != self.fast.is_some() {
+            self.fast = on.then(FastTlb::new);
+        }
+    }
+
+    /// The fast TLB of compiled code, while there is one.
+    #[inline(always)]
+    pub fn fast(&self) -> Option<&FastTlb> {
+        self.fast.as_deref()
+    }
+
+    #[inline(always)]
+    pub fn fast_mut(&mut self) -> Option<&mut FastTlb> {
+        self.fast.as_deref_mut()
     }
 
     /// Drop every entry when the memory names other host pages than those
@@ -596,6 +624,9 @@ impl Mmu {
         self.asid = new.asid();
         if !tables_only {
             self.flush();
+        } else if let Some(fast) = &mut self.fast {
+            // A fast entry has no ASID, and no TLBI tells it of new tables.
+            fast.flush();
         }
     }
 
@@ -752,6 +783,9 @@ impl Mmu {
         for tlb in &mut self.tlbs {
             tlb.flush();
         }
+        if let Some(fast) = &mut self.fast {
+            fast.flush();
+        }
     }
 
     /// Drop the entries of the mapping that holds the address of a TLBI
@@ -761,6 +795,10 @@ impl Mmu {
         let asid = asid.map(|asid| self.asid_of(asid));
         self.changes += 1;
         self.tlbs[regime.index()].flush_page(argument, TLBI_PAGE_BITS, asid);
+        // Without its ASID: a fast entry has none, and more goes than must.
+        if let Some(fast) = &mut self.fast {
+            fast.flush_page(argument & TLBI_PAGE_BITS, TLBI_PAGE_BITS);
+        }
     }
 
     /// Drop the entries of an ASID that are not global.
@@ -768,6 +806,9 @@ impl Mmu {
         let asid = self.asid_of(asid);
         self.changes += 1;
         self.tlbs[regime.index()].flush_asid(asid);
+        if let Some(fast) = &mut self.fast {
+            fast.flush();
+        }
     }
 
     /// An ASID of a TLBI argument as the entries hold it: eight bits unless

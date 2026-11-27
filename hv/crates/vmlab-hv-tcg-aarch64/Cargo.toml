@@ -11,6 +11,9 @@ vmlab-hv-tcg-ir = { path = "../vmlab-hv-tcg-ir" }
 vmlab-hv-tcg = { path = "../vmlab-hv-tcg" }
 vmlab-hv-tcg-jit = { path = "../vmlab-hv-tcg-jit" }
 
+[dev-dependencies]
+parking_lot.workspace = true
+
 [build-dependencies]
 cc = "1"
 
