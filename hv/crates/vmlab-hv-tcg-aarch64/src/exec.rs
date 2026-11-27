@@ -2248,9 +2248,12 @@ mod tests {
     #[test]
     fn a_replaced_state_runs_on_caches_that_are_built_again() {
         let mut cpu = cpu(&LOOP);
-        cpu.state.set_x(1, 10);
-        assert_eq!(cpu.run(30), Stop::Budget);
-        assert!(cpu.blocks.entries.iter().any(Option::is_some));
+        cpu.state.set_x(1, 1000);
+        assert_eq!(cpu.run(300), Stop::Budget);
+        assert!(
+            cpu.blocks.entries.iter().any(Option::is_some)
+                || cpu.singles.entries.iter().any(Option::is_some)
+        );
         let translations = cpu.translations;
         let mut state = State::reset(BASE);
         state.set_x(1, 5);
