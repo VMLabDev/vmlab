@@ -310,7 +310,7 @@ impl VcpuBackend for EmulatedVcpu {
             use vmlab_hv_tcg_aarch64::sysreg::reg;
             let regs = &self.cpu.state.system.regs;
             log::debug!(
-                "vcpu {}: exception {} of the guest: {:?} from {:#x} to {:#x}, ESR_EL1 {:#x}, FAR_EL1 {:#x}, ELR_EL1 {:#x}, after {} instructions and {} translated blocks in {} ms (again {} same {} other {} stale) ops {} generic {} effect {} instr {} run {:?}",
+                "vcpu {}: exception {} of the guest: {:?} from {:#x} to {:#x}, ESR_EL1 {:#x}, FAR_EL1 {:#x}, ELR_EL1 {:#x}, after {} instructions and {} translated blocks in {} ms (again {} same {} other {} stale) ops {} generic {} effect {} instr {} run {:?} hist {:?}",
                 self.id,
                 self.cpu.exceptions,
                 taken.cause,
@@ -330,6 +330,7 @@ impl VcpuBackend for EmulatedVcpu {
                 self.cpu.effect_total,
                 self.cpu.instr_total,
                 self.cpu.run_counts(),
+                self.cpu.histogram(),
             );
         }
         self.drive_timer();
