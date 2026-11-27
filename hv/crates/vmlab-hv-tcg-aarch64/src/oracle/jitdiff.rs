@@ -292,10 +292,10 @@ fn run_rounds(
         if kind == Rounds::Joins {
             // About one instruction in five branches to another of the
             // image, before or after it, or to the HVC after its end.
-            for from in 0..count {
+            for (from, word) in words.iter_mut().enumerate().take(count) {
                 if generator.rng.chance(1, 5) {
                     let to = generator.rng.below(count as u64 + 1) as usize;
-                    words[from] = branch_between(&mut generator.rng, from, to);
+                    *word = branch_between(&mut generator.rng, from, to);
                 }
             }
         }
