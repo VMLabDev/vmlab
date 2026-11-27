@@ -2867,9 +2867,11 @@ impl Compiled {
     /// is the address that it is entered at now, for the perf map. With
     /// `check`, the block keeps what K3 needs. With `sites` and `jumps`, its
     /// exits look for the code of the next block (3e DESIGN.md H5, H6).
+    #[allow(clippy::too_many_arguments)]
     fn compile_code(
         &mut self,
         jit: &mut jit::Jit,
+        buffers: &mut ShapeBuffers,
         pc: u64,
         check: bool,
         sites: bool,
@@ -2879,94 +2881,79 @@ impl Compiled {
         // What a leave reads from the frame: its outputs, its address, and
         // every word that its own operations read (card S4). A word that
         // those operations compute first is in the list too, which costs a
-        // store of a stale value that they then overwrite.
+        // store of a stale value that they then overwrite. The lists go
+        // into the buffers of the CPU (3e DESIGN.md J11).
         let generics = &self.generics;
         let calls_of = &self.calls;
-        let leaves: Vec<Vec<Slot>> = self
-            .leaves
-            .iter()
-            .map(|leave| {
-                let cold = leave.ops.iter().flat_map(|op| {
-                    let words: Vec<Slot> = match op.code {
-                        Code::Generic => generics[op.imm as usize]
-                            .args()
-                            .into_iter()
-                            .flat_map(place_words)
-                            .collect(),
-                        Code::Call => calls_of[op.imm as usize]
-                            .args
-                            .iter()
-                            .copied()
-                            .flat_map(place_words)
-                            .collect(),
-                        Code::Select => vec![op.a, op.b, op.imm as Slot],
-                        _ => vec![op.a, op.b],
-                    };
-                    words
-                });
-                leave
-                    .outputs
-                    .iter()
-                    .flat_map(|(_, place)| place_words(*place))
-                    .chain(leave.address)
-                    .chain(cold)
-                    .collect()
-            })
-            .collect();
-        let accesses: Vec<jit::Effect> = self
-            .accesses
-            .iter()
-            .map(|access| match *access {
+        let leaves = refill(&mut buffers.leaves, self.leaves.len());
+        for (leave, words) in self.leaves.iter().zip(leaves.iter_mut()) {
+            for (_, place) in &leave.outputs {
+                words.extend(place_words(*place));
+            }
+            words.extend(leave.address);
+            for op in &leave.ops {
+                match op.code {
+                    Code::Generic => {
+                        for place in generics[op.imm as usize].args() {
+                            words.extend(place_words(place));
+                        }
+                    }
+                    Code::Call => {
+                        for place in &calls_of[op.imm as usize].args {
+                            words.extend(place_words(*place));
+                        }
+                    }
+                    Code::Select => words.extend([op.a, op.b, op.imm as Slot]),
+                    _ => words.extend([op.a, op.b]),
+                }
+            }
+        }
+        let accesses = refill_effects(&mut buffers.accesses, self.accesses.len());
+        for (access, effect) in self.accesses.iter().zip(accesses.iter_mut()) {
+            match *access {
                 Access16::Read {
                     address,
                     result,
                     exit,
                     ..
-                } => jit::Effect {
-                    reads: vec![address],
-                    writes: place_words(result).collect(),
-                    leave: Some(exit),
-                    direct: None,
-                    condition: None,
-                },
+                } => {
+                    effect.reads.push(address);
+                    effect.writes.extend(place_words(result));
+                    effect.leave = Some(exit);
+                }
                 Access16::Write {
                     address,
                     value,
                     exclusive,
                     exit,
                     ..
-                } => jit::Effect {
-                    reads: std::iter::once(address).chain(place_words(value)).collect(),
-                    writes: exclusive.into_iter().collect(),
-                    leave: Some(exit),
-                    direct: None,
-                    condition: None,
+                } => {
+                    effect.reads.push(address);
+                    effect.reads.extend(place_words(value));
+                    effect.writes.extend(exclusive);
+                    effect.leave = Some(exit);
+                }
+            }
+        }
+        let calls = refill_effects(&mut buffers.calls, self.calls.len());
+        for (index, (call, effect)) in self.calls.iter().zip(calls.iter_mut()).enumerate() {
+            for place in &call.args {
+                effect.reads.extend(place_words(*place));
+            }
+            for (place, _) in &call.results {
+                effect.writes.extend(place_words(*place));
+            }
+            // H12: compiled code calls the helper of its kind itself.
+            effect.direct = Some((
+                match call.function {
+                    HelperFn::Pure(_) => pure_call as jit::Thunk as usize as u64,
+                    HelperFn::Ordered(_) => ordered_call as jit::Thunk as usize as u64,
                 },
-            })
-            .collect();
-        let calls: Vec<jit::Effect> = self
-            .calls
-            .iter()
-            .enumerate()
-            .map(|(index, call)| jit::Effect {
-                reads: call.args.iter().copied().flat_map(place_words).collect(),
-                writes: call
-                    .results
-                    .iter()
-                    .flat_map(|(place, _)| place_words(*place))
-                    .collect(),
-                leave: None,
-                // H12: compiled code calls the helper of its kind itself.
-                direct: Some((
-                    match call.function {
-                        HelperFn::Pure(_) => pure_call as jit::Thunk as usize as u64,
-                        HelperFn::Ordered(_) => ordered_call as jit::Thunk as usize as u64,
-                    },
-                    index as u64,
-                )),
-                condition: self.lazy_condition(call),
-            })
-            .collect();
+                index as u64,
+            ));
+            effect.condition = self.lazy_condition(call);
+        }
+        let (leaves, accesses, calls) = (&*leaves, &*accesses, &*calls);
         // The compiled code sets the PC (3e DESIGN.md H5): the last
         // instruction that the loop runs, else the next PC of the block.
         let next = match (self.terminal, self.next) {
@@ -2989,9 +2976,9 @@ impl Compiled {
             ops: &self.ops,
             generics: &self.generics,
             frame: &self.frame,
-            accesses: &accesses,
-            calls: &calls,
-            leaves: &leaves,
+            accesses,
+            calls,
+            leaves,
             inputs: &self.inputs,
             outputs: &self.outputs,
             instructions: self.instructions,
@@ -3025,6 +3012,45 @@ impl Compiled {
             }
         }
     }
+}
+
+/// The lists of a block that the emitter reads (`jit::Shape`), kept by the
+/// CPU from one compile to the next (3e DESIGN.md J11): once they have grown
+/// to the size of the blocks, a compile makes no heap call for them.
+#[derive(Default)]
+struct ShapeBuffers {
+    leaves: Vec<Vec<Slot>>,
+    accesses: Vec<jit::Effect>,
+    calls: Vec<jit::Effect>,
+}
+
+/// The first `len` lists of `lists`, empty, with the memory that they had.
+fn refill<T>(lists: &mut Vec<Vec<T>>, len: usize) -> &mut [Vec<T>] {
+    if lists.len() < len {
+        lists.resize_with(len, Vec::new);
+    }
+    let lists = &mut lists[..len];
+    for list in lists.iter_mut() {
+        list.clear();
+    }
+    lists
+}
+
+/// The first `len` effects of `effects`, empty, with the memory that their
+/// lists had.
+fn refill_effects(effects: &mut Vec<jit::Effect>, len: usize) -> &mut [jit::Effect] {
+    if effects.len() < len {
+        effects.resize_with(len, jit::Effect::default);
+    }
+    let effects = &mut effects[..len];
+    for effect in effects.iter_mut() {
+        effect.reads.clear();
+        effect.writes.clear();
+        effect.leave = None;
+        effect.direct = None;
+        effect.condition = None;
+    }
+    effects
 }
 
 /// The key of a context in the jump cache (3e DESIGN.md H6): every field,
@@ -3295,7 +3321,7 @@ impl Compiled {
             code: code.slot,
             code_value,
             result: result.slot,
-            cases: crate::flags::host_forms(condition),
+            cases: std::borrow::Cow::Borrowed(crate::flags::host_forms_of(condition)),
         })
     }
 
@@ -3725,6 +3751,8 @@ struct JitRun<'a> {
     chaining: &'a mut Chaining,
     /// Where the context of the run is, for a kick from another thread.
     seat: &'a jit::seat::Seat,
+    /// The lists that a compile hands to the emitter.
+    buffers: &'a mut ShapeBuffers,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -3752,6 +3780,7 @@ unsafe fn execute<M: Memory>(
         check,
         chaining,
         seat,
+        buffers,
     } = run;
     let Some(jit) = jit.as_mut() else {
         // SAFETY: the caller's promise.
@@ -3795,6 +3824,7 @@ unsafe fn execute<M: Memory>(
             }
             compiled.compile_code(
                 jit,
+                buffers,
                 state.pc(),
                 check > 0,
                 chaining.sites && !single,
@@ -4151,6 +4181,8 @@ pub struct Cpu<M> {
     pub jit_error: Option<String>,
     /// Chaining of compiled blocks (3e DESIGN.md H5, H6).
     chaining: Chaining,
+    /// The lists that a compile hands to the emitter (3e DESIGN.md J11).
+    shape_buffers: ShapeBuffers,
 }
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
@@ -4211,6 +4243,7 @@ impl<M: Memory> Cpu<M> {
                 mmu: 0,
                 seen: 0,
             },
+            shape_buffers: ShapeBuffers::default(),
         };
         let started = if jit_check_from_environment() {
             cpu.set_jit_check(true)
@@ -5166,6 +5199,7 @@ impl<M: Memory> Cpu<M> {
                         Some(lines) => &lines.seat,
                         None => &self.seat,
                     },
+                    buffers: &mut self.shape_buffers,
                 },
                 pending,
                 self.epoch,
@@ -5343,6 +5377,7 @@ impl<M: Memory> Cpu<M> {
                                 Some(lines) => &lines.seat,
                                 None => &self.seat,
                             },
+                            buffers: &mut self.shape_buffers,
                         },
                         pending,
                         self.epoch,

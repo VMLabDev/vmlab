@@ -270,6 +270,9 @@ pub struct Jit {
     /// as card J1 made them. For measurements before and after.
     pub host_flags: bool,
     pub stats: Stats,
+    /// The buffers of the emitter, kept from one block to the next (3e
+    /// DESIGN.md J11).
+    scratch: emit::Scratch,
 }
 
 impl Jit {
@@ -331,6 +334,7 @@ impl Jit {
             memory: Memory::Thunk,
             host_flags: true,
             stats: Stats::default(),
+            scratch: emit::Scratch::default(),
         })
     }
 
@@ -535,13 +539,27 @@ impl Jit {
     }
 
     fn compile_inner(&mut self, shape: &Shape) -> Result<Entry, Refused> {
-        let (asm, labels, fused, lazy) = emit::emit(
+        // The buffers of the emitter go back to the JIT also when it
+        // refuses the block.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = self.place(shape, &mut scratch);
+        self.scratch = scratch;
+        result
+    }
+
+    /// Emit `shape` with the buffers of `scratch` and put its code into the
+    /// region.
+    fn place(&mut self, shape: &Shape, scratch: &mut emit::Scratch) -> Result<Entry, Refused> {
+        let (fused, lazy) = emit::emit(
             shape,
             self.exit,
             self.features,
             self.defect,
             self.host_flags,
+            scratch,
         )?;
+        let asm = &scratch.asm;
+        let labels = &scratch.sites;
         let mut sites = [(0, 0); SITES];
         for (n, (jump, stub)) in labels.iter().enumerate() {
             let position = |label| {
@@ -565,8 +583,10 @@ impl Jit {
                 self.region.next(len).ok_or(Refused::Size)?
             }
         };
-        let code = asm.finish(base).ok_or(Refused::Size)?;
-        self.region.put(base, &code);
+        asm.finish_into(base, &mut scratch.code)
+            .ok_or(Refused::Size)?;
+        let code = &scratch.code;
+        self.region.put(base, code);
         self.stats.fused += fused;
         self.stats.lazy += lazy;
         Ok(Entry {

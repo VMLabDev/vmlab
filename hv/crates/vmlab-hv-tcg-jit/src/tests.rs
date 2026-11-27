@@ -1241,7 +1241,7 @@ fn lazy_conditions_run_their_forms_inline_and_call_for_other_kinds() {
                     code: 4,
                     code_value: 11,
                     result: 5,
-                    cases: vec![(9, test), (3, FlagTest::Table(0x0ff0))],
+                    cases: vec![(9, test), (3, FlagTest::Table(0x0ff0))].into(),
                 };
                 let calls = vec![Effect {
                     reads: vec![kind_word, 2, 3, 4],
@@ -1294,7 +1294,7 @@ fn a_lazy_condition_for_another_code_is_a_call() {
         code: 4,
         code_value: 12,
         result: 5,
-        cases: vec![(1, FlagTest::Always(true))],
+        cases: vec![(1, FlagTest::Always(true))].into(),
     };
     let block = Block {
         ops: vec![Op {
