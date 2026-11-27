@@ -1255,8 +1255,8 @@ def main(argv=None):
             try:
                 records = run_config(args, arch, smp, pin, version, commit, dirty, host)
                 for r in records:
-                    log(f"history: {r['workload']} median={r['median']}s "
-                        f"spread={r['spread']}s")
+                    log(f"history: {r['workload']} median={r['median']} {r['unit']} "
+                        f"spread={r['spread']} {r['unit']}")
             except lib.BackendUnsupported as skip:
                 log(f"SKIP {skip.backend} {arch} smp={smp}: {skip.reason}")
                 log("(no history recorded for this configuration)")
