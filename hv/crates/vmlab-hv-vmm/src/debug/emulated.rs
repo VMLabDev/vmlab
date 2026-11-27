@@ -66,6 +66,7 @@ pub(super) fn registers(state: &State) -> Aarch64Registers {
         fpcr: state.fpcr(),
         fpsr: state.fpsr(),
         system,
+        instructions: 0,
     }
 }
 
@@ -116,7 +117,9 @@ pub(super) fn set(state: &mut State, values: &BTreeMap<String, u64>) -> Result<(
 
 pub(super) fn read_registers(shared: &VmShared, id: u8) -> Result<Aarch64Registers> {
     let vcpu = vcpu(shared, id)?;
-    Ok(registers(&state(&vcpu)?))
+    let mut registers = registers(&state(&vcpu)?);
+    registers.instructions = vcpu.lock().instructions();
+    Ok(registers)
 }
 
 pub(super) fn set_registers(

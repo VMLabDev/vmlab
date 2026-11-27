@@ -76,6 +76,11 @@ pub struct Aarch64Registers {
     pub fpsr: u32,
     /// The stack pointers of each level and the system registers.
     pub system: BTreeMap<String, u64>,
+    /// The instructions that the vCPU has run since its process started.
+    /// Read only: `SetRegisters` does not name it. The boot MIPS of the
+    /// bench divide it by the time to agent ready.
+    #[serde(default)]
+    pub instructions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

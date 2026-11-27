@@ -1340,6 +1340,31 @@ RAM, and the files come through DMA.
   the DSDT of the capture, whatever functions the machine has: that is a
   finding for card C11, not changed here.
 
+The second matrix, at commit `f7346539` (the head of this card), measures
+the speed of each boot. The same `bench/run.py` command in two lanes of
+four cores (16-19 and 20-23); every 20 s the sampler turns on the debug log
+of `vmlab_hv_vmm::vcpu::emulated` for 1 s and reads the instruction count of
+each vCPU from its exception lines. MIPS is the sum over the vCPUs of the
+last count, divided by the time from the process start to that sample, so
+idle time is inside it, and a boot in emergency mode idles after it fails.
+Other cards ran one or two emulated aarch64 VMs on other cores of helios
+during the first runs (load average 11 to 15); Debian ran again at load 5.
+
+| Template | vCPUs | Result | MIPS | Instructions, over |
+|---|---|---|---|---|
+| alpine-3.23 | 1 | agent ready in 296 s | 50.3 | 14.86e9, 295 s |
+| alpine-3.23 | 2 | agent ready in 298 s | 51.1 | 15.08e9, 295 s |
+| debian-13 | 1 | emergency mode under load; agent ready in 274 s at load 5 | 25.8; 64.2 | 18.23e9, 708 s; 18.94e9, 295 s |
+| debian-13 | 2 | emergency mode under load; agent ready in 204 s at load 5 | 27.2; 89.1 | 19.45e9, 715 s; 18.79e9, 211 s |
+| fedora-44 | 1 | emergency mode | 43.8 | 31.33e9, 715 s |
+| fedora-44 | 2 | emergency mode | 52.2 | 37.35e9, 716 s |
+| ubuntu-24.04 | 1 | emergency mode; the agent answered from it at 522 s | 44.6 | 24.42e9, 547 s |
+| ubuntu-24.04 | 2 | agent ready in 341 s | 68.5 | 24.50e9, 358 s |
+
+An agent that answers from emergency mode does not count as a pass of S1.
+Debian's two results show how near its timeouts it runs: the load of other
+VMs on the host is enough to push it over them.
+
 ### kvm-unit-tests
 
 `just tcg-a64-kvm-unit-tests` builds kvm-unit-tests (commit `32f8ad45`, with
@@ -1483,10 +1508,13 @@ D13).
 
 ## Card C13 (2026-11-27)
 
-The four templates to agent ready (DESIGN.md P4, M6). The card is not
-complete: four of the eight boots reach agent ready inside 600 s, and the
-boot lockstep (O4) of Debian did not run. What stops the rest is the speed
-of the interpreter, not an instruction or a device that a boot misses.
+The four templates to agent ready (DESIGN.md P4, M6). The card lands what
+it found and fixed. Five of the eight boots reach agent ready inside 600 s
+on a quiet host, Debian among them, and the boot lockstep (O4) of Debian did
+not run. What stops the rest is the speed of the interpreter, not an
+instruction or a device that a boot misses. The boots that fail on speed and
+the O4 lockstep of Debian move to card C13b (decision of the overseer,
+2026-11-27): guest time stays real time and no guest timeout is lengthened.
 
 ### What the boots missed, and what changed
 
@@ -1574,9 +1602,11 @@ same results. `timer` gives the same results after the deadline exit above.
 ### What this card does not do
 
 - Fedora at 1 and 2 vCPUs and Ubuntu at 1 vCPU do not reach agent ready,
-  and Debian at 1 vCPU is near its device timeouts: the speed above.
+  and Debian at 1 and 2 vCPUs is near its device timeouts: the speed above.
+  These move to card C13b.
 - O4 for Debian did not run: at the 0.59 million instructions a second of
-  card C10 the 18e9 instructions of the boot take about 8.5 hours.
+  card C10 the 18e9 instructions of the boot take about 8.5 hours. It moves
+  to card C13b.
 - The S1 test of the aarch64 guest asset (`s1_aarch64.rs`, card C14) did
   not run: helios has no aarch64 guest asset.
 
@@ -1591,6 +1621,186 @@ same results. `timer` gives the same results after the deadline exit above.
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn.
+
+## S0: Debian boot profile (#1146)
+
+S1 lazy flags landed in `ab1dc54d` via PR #1031 and is included in this
+branch. The S0 function samples, block counts and ceilings below describe
+the **pre-S1 interpreter**. The S0 measurement binary was `2251fc8b`.
+
+The `boot_mips` row belongs to the aarch64 Debian 13 `vmlab-hv` boot
+suite. A run starts a fresh overlay, waits for the guest agent handshake,
+then issues `quit`. The VM emits the instruction count of every vCPU
+after joining its workers. The bench divides their sum by the monotonic
+wall time at the handshake. A small amount of guest execution can occur
+between the handshake and the quit request. A failed handshake or absent
+counter supplies no MIPS sample.
+
+```sh
+python3 hv/bench/run.py --backend vmlab-hv --arch aarch64 --guest debian-13 \
+  --suite boot --vcpus 2 --repeats 3 --cpus 24-27 --hv-bin /path/to/vmlab-hv
+```
+
+### Repeat measurements
+
+[Aarch64 history](../../bench/history/aarch64.jsonl) keeps the pre-S1 S0
+rows before the S1 comparison. Use the **87.92 MIPS** one-vCPU row
+(`ca5825bb`) as the post-S1 baseline. S1 measured **76.68 to 87.92 MIPS**
+(+14.7%) at one vCPU, using pin 16–19 and the debug-port count
+(`54317232` before S1). There is no post-S1 two-vCPU row. Measure that
+configuration on the relevant base commit before comparing future changes.
+
+S0's 62.87 MIPS and S1's 76.68 MIPS before row both predate lazy flags.
+They used different pins (16–17 and 16–19 respectively), and S0 measured
+under higher host load. S0's successful one-vCPU repeats started at
+one-minute load averages of 12.50–13.24, while the S1 before batch
+started at 10.19 and ended at 4.39. S0 counted at VM exit just after
+the handshake, while S1 read the paused vCPUs through the debug port.
+These differences confound the comparison, and the samples cannot
+isolate how much each contributed.
+
+At two vCPUs on the pre-S1 S0 build, the median was
+80.12 MIPS with block counting disabled and 74.89 MIPS with it enabled,
+with three boots per setting. One instrumented run took 350.74 s
+compared with 224.99 s for another, so the median difference does not
+isolate counter overhead.
+
+At one vCPU, three complete baseline boots pinned to CPUs 16–17 took
+285.53–296.45 s, with a median of 62.87 MIPS. One complete instrumented
+boot on that pin took 308.34 s (60.19 MIPS) and supplied the block counts.
+Other one-vCPU attempts hit the shared VM limit before launch or entered
+systemd emergency mode on the device timeout. Only complete boots enter
+the history. Guest time ran in real time with the standard timeouts.
+
+Flat CoreMark checked the same 245,425,680 instructions and guest
+checksums in each repeat. Three interleaved pairs pinned to CPUs 0–1
+gave median 111.12 MIPS on the initial boot-row build (`591d6274`) and
+120.07 MIPS on the build with the block counter code (`2251fc8b`).
+The initial build's 14.38 MIPS spread is larger than the median
+difference. Both builds used release optimization with line tables.
+Cargo updated the local lockfile to include the existing `flate2`
+dependency of `vmlab-hv-vmm` during the builds.
+
+### Function samples
+
+The one-vCPU column reuses the two windows of the
+[JIT design's W1 profile](../../docs/plans/phase-3e-aarch64-jit/DESIGN.md#w1-the-profile-measured)
+weighted by their sample counts. Those windows cover the busy part of a
+boot that did not reach agent ready. The two-vCPU run used Debian
+`13.20261001.0`, 2 GiB of RAM, two vCPUs pinned to logical CPUs 24–27 on
+helios, and the release binary of `2251fc8b` with line tables. It reached
+agent ready in 241.13 s at 77.17 MIPS (13.35 billion and 5.26 billion
+instructions on vCPU 0 and 1 respectively).
+
+The two-vCPU run used `bench/ipsample.c` with raw instruction pointer
+output and a `vcpu-*` thread filter. It requested user-space samples at
+1 kHz through `perf_event_open`, starting when the control socket
+appeared. `addr2line -f -i -C` resolved ELF offsets. The classifier used
+function names and inline callers where they identify a subsystem.
+Each sample is counted once. This measures on-CPU vCPU work. Idle time,
+kernel execution and time descheduled on the host are outside the profile.
+
+| Work | 1 vCPU, W1 (166,057 samples) | 2 vCPUs (342,753 samples) |
+|---|---:|---:|
+| Operation execution and dispatch, `step_unchecked`, `Compiled::run` | 38.33% | 32.25% |
+| Block loop, IRQ/FIQ, shootdown mail and PC translation, `run_inner`, `code_address` | 20.31% including cache | 15.58% |
+| Cache probe and code stamps, `usable`, `code_stamp` | included above | 7.35% |
+| State copies at block entry and exit, `Place::write` and `Place::read` | 3.57% | 9.73% |
+| RAM load path, `Side::load`, `GuestBus::read`, `copy_in` | 26.44% for RAM and other VMM frames combined | 5.37% |
+| RAM store path, `GuestBus::write`, ROM check, `copy_out_to` | included above | 3.67% |
+| Dirty callback and generation atomics, `WriteDiscard::mark_dirty`, `Stamps::wrote` | included above | 12.77% |
+| Global RAM transaction lock in store and exclusive accesses | one-vCPU branch bypasses lock | 3.44% |
+| TLB and page walks, `Tlb::lookup`, `Mmu::walk` | 6.04% including load/store dispatch | 1.92% |
+| Wide and exclusive access dispatch, `Compiled::access` | 0.28% for all effect dispatch | 0.65% |
+| Translation, decoder, lifter, IR and lowering | 1.03% | 0.41% |
+| Helpers, system registers and exceptions | 1.11% combined | 1.52% |
+| Other or unresolved | 2.85% | 5.36% |
+
+At two vCPUs the helpers account for 0.76% in vector/crypto functions,
+0.38% in common helper dispatch, 0.36% in system register/timer functions,
+and 0.02% in exception handling. The sampler attributed zero samples
+directly to a scalar FP helper. Other samples include 1.38% in outlined
+mutex routines whose callers were unavailable. The lock share attributable
+to guest RAM is therefore 3.44%, with a ceiling of 4.82% if all of those
+outlined mutex samples belong to it. The dirty callback with its SeqCst
+generation updates and the identified lock together account for 16.21%.
+The rest of the RAM store path accounts for 3.67%.
+
+### Counts per translated block
+
+Set `VMLAB_HV_BOOT_BLOCK_COUNTS=1` for the boot command to collect these
+counters. The VM prints totals per vCPU at exit. The first complete
+instrumented boot at each vCPU count supplied the totals below. The
+two-vCPU column sums the vCPUs before dividing by the number of blocks.
+
+| Counter | 1 vCPU, 492,167 blocks | 2 vCPUs, 711,911 blocks |
+|---|---:|---:|
+| Lowered operations per block | 13.961 | 14.224 |
+| Alignment guard operations per block | 3.326 | 3.398 |
+| Exit-only writeback operations per block | 0.938 | 0.966 |
+| LDP X instructions per block | 0.179 | 0.184 |
+| STP X instructions per block | 0.191 | 0.195 |
+
+The alignment count includes each alignment guard and its lowered scalar
+dependencies used exclusively by such guards. The exit writeback count
+includes lowered operations needed only to rebuild registers on a side
+exit. Values also used by a normal operation, the terminal writeback,
+the exception syndrome or an alignment guard are excluded. The LDP/STP
+counts include the offset, pre-indexed and post-indexed X register forms.
+These counts weight each translation once, including retranslations and
+single-instruction blocks. About 31% of the static operations are alignment
+or exit-writeback work. The profile gives no execution frequency for those
+operations.
+
+### Pre-S1 ceilings for remaining cards
+
+The ceilings below come from the pre-S1 profile. Lazy flags changed
+interpreter work, so current shares and relative gains require a new profile.
+The ceilings include all of the indicated measured functions, even
+where the planned change can remove only part of the work. They express
+shares of sampled boot CPU work under the measured guest workload. The
+two-vCPU wall-clock effect also depends on which vCPU delays agent readiness,
+how much work overlaps and whether faster execution changes the boot path.
+The ceilings overlap and should be recalculated after each change.
+
+For a generous wall-time budget at two vCPUs, the sampler's requested
+frequency gives about 343 vCPU-seconds over 241 s of elapsed time. The
+last column assumes that every saved vCPU-second shortens wall time by
+a full second at fixed guest work. It is a sizing estimate.
+
+| Card | Work included in the ceiling | 1 vCPU CPU share | 2 vCPU CPU share | 2 vCPU wall budget |
+|---|---|---:|---:|---:|
+| S3 TLB RAM access and unwatched stores | RAM load, RAM store, dirty stamps, TLB/page walks and the entire possible lock share. The W1 ceiling includes other VMM work. | 32.48% | 28.55% | 41% |
+| S4 alignment, exit writeback and pair accesses | All operations, wide access dispatch, RAM load/store paths and TLB work. The W1 ceiling uses its combined RAM/VMM class. Most of these paths survive S4. | 71.09% | 43.86% | 62% |
+| S5 cheaper block entry and chaining | The block loop, cache, register copies and all helper/system work. The W1 helper subtotal includes exceptions. | 24.99% | 34.16% | 49% |
+
+For S4, the static 31% operation share times the two-vCPU operation-loop
+share gives about 10% of sampled CPU work for guard and writeback
+operations if operation costs and execution frequency are uniform. The
+function profile does not distinguish those operations from other
+uses of the same opcodes. The effect of the pair fast path also depends
+on the proportion of X pairs that hit one page.
+
+The pre-S1 samples suggest investigating S3 first because the dirty callback
+and direct lock activity accounted for 16.21% of two-vCPU work. S4 can
+proceed alongside it, with the in-page pair path checked against the S3 TLB
+changes when they meet. Keep S5 on hold while the JIT's block chaining
+card (J4) is on schedule.
+
+### Behaviour checks
+
+On helios, `just tcg-a64-lockstep loadstore 1000 1` verified 52,390
+instructions, and `just tcg-a64-lockstep mmu 100000 1` verified 4,403,165.
+Both exited 0 with no differences. The counter unit test compares the
+same whole block with counting enabled and disabled, including an
+overwritten register and both X pair instructions.
+
+The kvm-unit-tests runner exited 0 at suite revision `32f8ad45`. Nine of
+eleven cases matched QEMU. As in C13, vmlab-hv passed the two ITARGETSR
+subtests that QEMU failed in both `gicv2-mmio` and `gicv2-mmio-3p`.
+
+No instruction semantics sources were consulted for S0. QEMU was used as
+a running oracle for lockstep and kvm-unit-tests.
 
 ## Card S2, #1143 (2026-11-27)
 
@@ -1686,8 +1896,11 @@ scalar loop 5 %, from 14 % and 10 % after the change of C13.
 
 `hv/bench/history/aarch64.jsonl` holds the rows of the three builds:
 `coremark_algorithms_1000` and `scalar_loop_300000000` of the interpreter,
-and `boot_to_agent_ready` and the new `boot_mips` of vmlab-hv, whose `env`
-keeps the counts of each repeat (`boot_counters`).
+and `boot_to_agent_ready` and `boot_mips` of vmlab-hv, whose `env` keeps
+the counts of each repeat (`boot_counters`). These rows were taken with this
+card's pause counters; since the merge with card #1142 the bench takes
+`boot_mips` from #1142's instruction counts, and the pause line of a vCPU
+(`parking`) remains for the translation counts.
 
 ### Equal behaviour
 
