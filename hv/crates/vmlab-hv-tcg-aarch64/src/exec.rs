@@ -2535,6 +2535,31 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_cpu_leaves_its_loop_when_its_timer_is_due() {
+        // The virtual timer is due one tick of a 1 GHz clock from now. A
+        // machine CPU leaves its loop within `CLOCK_BLOCKS` blocks, so that
+        // its owner raises the line. A CPU without lines runs its budget.
+        let budget = 30_000;
+        for machine in [true, false] {
+            let mut cpu = cpu(&LOOP);
+            cpu.state.set_x(1, budget);
+            cpu.clock = Clock::host(0, 1_000_000_000);
+            let timer = &mut cpu.state.system.timers[1];
+            timer.compare = cpu.clock.count() + 1;
+            timer.set_control(1);
+            if machine {
+                cpu.lines = Some(std::sync::Arc::new(Lines::default()));
+            }
+            assert_eq!(cpu.run(budget), Stop::Budget);
+            if machine {
+                assert!(cpu.instructions <= u64::from(CLOCK_BLOCKS) * 3, "{}", cpu.instructions);
+            } else {
+                assert_eq!(cpu.instructions, budget);
+            }
+        }
+    }
+
+    #[test]
     fn a_replaced_state_runs_on_caches_that_are_built_again() {
         let mut cpu = cpu(&LOOP);
         cpu.state.set_x(1, 1000);

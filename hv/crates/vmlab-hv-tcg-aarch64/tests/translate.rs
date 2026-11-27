@@ -694,6 +694,45 @@ fn an_address_that_maps_other_code_runs_the_other_code() {
     assert_eq!(machine.cpu.state.x(1), 6);
 }
 
+/// One page of code, mapped at two addresses and called at each. The block
+/// computes its PC-relative values from the PC it runs at, so one
+/// translation serves both addresses (card C13). With `copy`, the second
+/// address maps a copy of the page instead: other code, its own block.
+fn code_at_two_addresses(copy: bool) -> Machine {
+    const FIRST: u64 = VA + 0x2000;
+    const SECOND: u64 = VA + 0x5000;
+    // adr x4, . ; add x1, x1, #1 ; ret
+    const CALLED: [u32; 3] = [0x1000_0004, 0x9100_0421, asm::RET];
+    // blr x2 ; add x5, x4, #0 ; blr x6 ; hvc
+    let mut machine = Machine::new(&[asm::blr(2), asm::add(5, 4, 0), asm::blr(6), HVC]);
+    machine.map(FIRST, DATA | AF | READ_ONLY);
+    let second = if copy { OTHER } else { DATA };
+    machine.map(SECOND, second | AF | READ_ONLY);
+    for page in [DATA, second] {
+        machine
+            .cpu
+            .memory
+            .write(page, &asm::bytes(&CALLED))
+            .unwrap();
+    }
+    machine.cpu.state.set_x(2, FIRST);
+    machine.cpu.state.set_x(6, SECOND);
+    assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+    assert_eq!(machine.cpu.taken, None);
+    // Each call saw the address that it ran at, and returned after its call.
+    assert_eq!(machine.cpu.state.x(5), FIRST);
+    assert_eq!(machine.cpu.state.x(4), SECOND);
+    assert_eq!(machine.cpu.state.x(1), 2);
+    machine
+}
+
+#[test]
+fn one_translation_serves_code_at_two_addresses() {
+    let shared = code_at_two_addresses(false).cpu.translations;
+    let copied = code_at_two_addresses(true).cpu.translations;
+    assert_eq!(shared + 1, copied);
+}
+
 #[test]
 fn the_guest_takes_the_abort_and_returns_to_the_access() {
     // The handler makes the descriptor valid and returns: the store runs
