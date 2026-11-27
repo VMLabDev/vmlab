@@ -739,7 +739,7 @@ pub fn assemble(
     }
 
     // The PCI host. The firmware, or the kernel, places the BARs.
-    let pci_root = Arc::new(Mutex::new(PciRoot::q35(map::PCI_MMIO64_BASE)));
+    let pci_root = Arc::new(Mutex::new(PciRoot::virt(map::PCI_MMIO64_BASE)));
     pci_root
         .lock()
         .set_mmio64_window(map::PCI_MMIO64_BASE, map::PCI_MMIO64_SIZE);

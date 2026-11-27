@@ -179,6 +179,9 @@ pub struct PciRoot {
     slots: Vec<Option<Function>>,
     alloc: BarAllocator,
     firmware: bool,
+    /// An I/O BAR at port 0 decodes (the aarch64 `virt` machine, whose
+    /// firmware places the first I/O BAR there). Elsewhere 0 is unassigned.
+    io_at_zero: bool,
     mmio64_end: u64,
     // Cache decoded targets, never register values. Exact addresses retain
     // ROM/BAR overlap priority until a config or topology change invalidates it.
@@ -310,6 +313,7 @@ impl PciRoot {
             alloc: BarAllocator::new(mmio64_base),
             mmio64_end: mmio64_base + MMIO64_SIZE,
             firmware: false,
+            io_at_zero: false,
             mmio_cache: [None; 4],
         }
     }
@@ -320,6 +324,16 @@ impl PciRoot {
         Self {
             firmware: true,
             ..Self::new(mmio64_base)
+        }
+    }
+
+    /// The root of the aarch64 `virt` machine: a Q35 root whose I/O window
+    /// starts at port 0, which AAVMF gives to the first I/O BAR (QEMU's
+    /// `virt` decodes it there, read from its monitor).
+    pub fn virt(mmio64_base: u64) -> Self {
+        Self {
+            io_at_zero: true,
+            ..Self::q35(mmio64_base)
         }
     }
 
@@ -554,7 +568,7 @@ impl PciRoot {
         for bar in &func.bars {
             dev.set_bar_address(
                 bar.info.index,
-                bar_placement(self.firmware, func.command, bar),
+                bar_placement(self.firmware, self.io_at_zero, func.command, bar),
             );
         }
         if log::log_enabled!(target: "vmlab_hv_vmm::pci::bars", log::Level::Debug) {
@@ -736,7 +750,7 @@ impl PciRoot {
             for bar in &func.bars {
                 if matches!(bar.info.kind, BarKind::Io) == io
                     && !bar.sizing
-                    && bar.addr != 0
+                    && (bar.addr != 0 || io && self.io_at_zero)
                     && bar.addr <= addr
                     && addr - bar.addr < bar.info.size
                 {
@@ -811,7 +825,7 @@ impl PciRoot {
             for bar in &func.bars {
                 dev.set_bar_address(
                     bar.info.index,
-                    bar_placement(self.firmware, func.command, bar),
+                    bar_placement(self.firmware, self.io_at_zero, func.command, bar),
                 );
             }
         }
@@ -824,13 +838,12 @@ impl PciRoot {
 /// programs, with the BAR's decode bit of the command register clear. A
 /// function registers kernel-side decoding from this (queue doorbells, direct
 /// mappings), so it must not outlive what `decode_mmio` and `find_bar` decode.
-fn bar_placement(firmware: bool, command: u16, bar: &BarState) -> Option<u64> {
-    let enable = if matches!(bar.info.kind, BarKind::Io) {
-        1
-    } else {
-        2
-    };
-    (bar.addr != 0 && !bar.sizing && (!firmware || command & enable != 0)).then_some(bar.addr)
+/// Port 0 is an address only where `io_at_zero` says so.
+fn bar_placement(firmware: bool, io_at_zero: bool, command: u16, bar: &BarState) -> Option<u64> {
+    let io = matches!(bar.info.kind, BarKind::Io);
+    let enable = if io { 1 } else { 2 };
+    ((bar.addr != 0 || io && io_at_zero) && !bar.sizing && (!firmware || command & enable != 0))
+        .then_some(bar.addr)
 }
 
 fn bar_low_read(bar: &BarState) -> u32 {
@@ -1276,6 +1289,28 @@ mod tests {
         let device = device.lock();
         let (_, address) = device.placements.iter().rev().find(|p| p.0 == 0).unwrap();
         assert!(address.is_some());
+    }
+
+    #[test]
+    fn an_io_bar_at_port_zero_decodes_on_virt_and_not_on_q35() {
+        for (mut root, decodes) in [(PciRoot::virt(1 << 32), true), (PciRoot::q35(1 << 32), false)] {
+            let device = FakePci::new(vec![BarInfo {
+                index: 0,
+                size: 0x80,
+                kind: BarKind::Io,
+            }]);
+            root.add_device_at(1, 0, device.clone()).unwrap();
+            // AAVMF writes 0 to the BAR and enables I/O decode.
+            root.config_write(0, 1, 0, 16, &1u32.to_le_bytes());
+            root.config_write(0, 1, 0, 4, &1u16.to_le_bytes());
+            let mut bytes = [0; 2];
+            assert_eq!(root.dispatch_io_read(0x10, &mut bytes), decodes);
+            let placed = device.lock().placements.iter().rev().find(|p| p.0 == 0).unwrap().1;
+            assert_eq!(placed, decodes.then_some(0));
+            // With I/O decode off, port 0 is nothing on either root.
+            root.config_write(0, 1, 0, 4, &0u16.to_le_bytes());
+            assert!(!root.dispatch_io_read(0x10, &mut bytes));
+        }
     }
 
     #[test]
