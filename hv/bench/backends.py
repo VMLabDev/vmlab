@@ -318,6 +318,19 @@ class HvBackend:
     def agent_socket(self):
         return os.path.join(self.run_dir, "agent.sock")
 
+    def instructions(self, smp):
+        """The instructions that the emulated vCPUs have run (an aarch64
+        machine on the interpreter): pause, read each vCPU, resume."""
+        self.control.debug("pause")
+        try:
+            total = 0
+            for vcpu in range(smp):
+                response = self.control.debug("read_registers", vcpu=vcpu)
+                total += response["registers"]["instructions"]
+            return total
+        finally:
+            self.control.debug("detach", resume=True)
+
     def backend_version(self):
         return getattr(self, "hv_version_seen", "vmlab-hv (unlaunched)")
 
