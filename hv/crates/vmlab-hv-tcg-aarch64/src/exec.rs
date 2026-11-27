@@ -2434,15 +2434,13 @@ fn make_link(
             pc: target,
             key: from_key,
             code,
-        } => {
-            if target != pc || from_key != key || code != to.address {
-                chaining.mismatches += 1;
-                if chaining.mismatches <= 50 {
-                    eprintln!(
-                        "jit verify: the jump cache named {code:#x} for pc {target:#x} key {from_key:#x}; the loop runs {:#x} at pc {pc:#x} key {key:#x}, phys {:#x}, epoch {epoch}/{}, mmu {mmu}/{}/{}",
-                        to.address, block.phys, chaining.epoch, chaining.mmu, chaining.seen
-                    );
-                }
+        } if target != pc || from_key != key || code != to.address => {
+            chaining.mismatches += 1;
+            if chaining.mismatches <= 50 {
+                eprintln!(
+                    "jit verify: the jump cache named {code:#x} for pc {target:#x} key {from_key:#x}; the loop runs {:#x} at pc {pc:#x} key {key:#x}, phys {:#x}, epoch {epoch}/{}, mmu {mmu}/{}/{}",
+                    to.address, block.phys, chaining.epoch, chaining.mmu, chaining.seen
+                );
             }
         }
         _ => {}
