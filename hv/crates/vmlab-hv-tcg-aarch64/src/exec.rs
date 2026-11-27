@@ -2356,6 +2356,20 @@ impl Replay {
                 bytes(op.code),
                 frame[usize::from(op.b)].into(),
             ),
+            // A pair is one access of 16 bytes in the log, as
+            // `load_pair` and `store_pair` make it there.
+            Code::LoadPair => self
+                .load(exit, frame[usize::from(op.a)], 16)
+                .map(|value| {
+                    frame[usize::from(op.dst)] = value as u64;
+                    frame[usize::from(op.dst) + 1] = (value >> 64) as u64;
+                }),
+            Code::StorePair => self.store(
+                exit,
+                frame[usize::from(op.a)],
+                16,
+                u128::from(frame[usize::from(op.b)]) | u128::from(frame[usize::from(op.dst)]) << 64,
+            ),
             Code::Access => match accesses[op.imm as usize] {
                 Access16::Read {
                     address,
