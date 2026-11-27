@@ -405,6 +405,11 @@ impl Asm {
         self.op(None, true, &[0x85], b.0, Rm::Reg(a));
     }
 
+    /// `test a, b` with `a` a register or memory, of 64 bits or of 32.
+    pub fn test_rm(&mut self, a: Rm, b: Reg, wide: bool) {
+        self.op(None, wide, &[0x85], b.0, a);
+    }
+
     /// `test a32, b32`.
     pub fn test32(&mut self, a: Reg, b: Reg) {
         self.op(None, false, &[0x85], b.0, Rm::Reg(a));
@@ -644,6 +649,10 @@ mod tests {
                 });
                 add(format!("add {}, {text32}", NAMES32[d]), &|a| {
                     a.alu32(Alu::Add, dst, *mem)
+                });
+                add(format!("test {text}, {name}"), &|a| a.test_rm(*mem, dst, true));
+                add(format!("test {text32}, {}", NAMES32[d]), &|a| {
+                    a.test_rm(*mem, dst, false)
                 });
             }
             for value in [

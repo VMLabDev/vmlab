@@ -352,7 +352,25 @@ fn random_block(random: &mut Random, count: usize) -> Block {
                 // sometimes, and the select or the guard that reads it.
                 let mut x = any(random, &defined);
                 let mut y = any(random, &defined);
-                if random.below(2) == 0 {
+                let mut conjunction = false;
+                if random.below(4) == 0 {
+                    let and = frame.len() as Slot;
+                    frame.push(0);
+                    ops.push(Op {
+                        code: Code::And,
+                        aux: 0,
+                        dst: and,
+                        a: x,
+                        b: y,
+                        imm: if random.below(2) == 0 {
+                            u64::MAX
+                        } else {
+                            u64::from(u32::MAX)
+                        },
+                    });
+                    x = and;
+                    conjunction = true;
+                } else if random.below(2) == 0 {
                     let (sign, mask) = if random.below(2) == 0 {
                         (1u64 << 63, u64::MAX)
                     } else {
@@ -377,8 +395,12 @@ fn random_block(random: &mut Random, count: usize) -> Block {
                         *operand = flipped;
                     }
                 }
-                let code = [Code::Equal, Code::NotEqual, Code::Less, Code::LessEqual, Code::IsZero]
-                    [random.below(5) as usize];
+                let code = if conjunction {
+                    Code::IsZero
+                } else {
+                    [Code::Equal, Code::NotEqual, Code::Less, Code::LessEqual, Code::IsZero]
+                        [random.below(5) as usize]
+                };
                 let condition = frame.len() as Slot;
                 frame.push(0);
                 ops.push(Op {
@@ -562,8 +584,13 @@ fn comparisons_read_as_host_flags_give_what_the_interpreter_gives() {
     let mut random = Random(0x0e85_0001);
     let mut rounds = 0;
     for code in codes {
-        // 0: unsigned, 32 and 64: the operands flipped at that width.
-        for flip in [0u8, 32, 64] {
+        // 0: unsigned, 32 and 64: the operands flipped at that width, 2
+        // and 3: the conjunction of the operands at 64 and 32 bits compared
+        // with zero.
+        for flip in [0u8, 32, 64, 2, 3] {
+            if flip < 32 && flip != 0 && matches!(code, Code::Less | Code::LessEqual) {
+                continue;
+            }
             // 0: a select, 1 and 2: a guard that expects zero or not.
             for consumer in 0..3 {
                 // Which operands are constants.
@@ -583,7 +610,18 @@ fn comparisons_read_as_host_flags_give_what_the_interpreter_gives() {
                         let right = if constants & 2 != 0 { 4 } else { 2 };
                         let mut ops = Vec::new();
                         let (mut a, mut b) = (left, right);
-                        if flip != 0 {
+                        if flip == 2 || flip == 3 {
+                            ops.push(Op {
+                                code: Code::And,
+                                aux: 0,
+                                dst: 6,
+                                a: left,
+                                b: right,
+                                imm: if flip == 2 { u64::MAX } else { u64::from(u32::MAX) },
+                            });
+                            // Word 0 is the constant zero.
+                            (a, b) = (6, 0);
+                        } else if flip != 0 {
                             ops.push(Op {
                                 code: Code::Xor,
                                 aux: 0,

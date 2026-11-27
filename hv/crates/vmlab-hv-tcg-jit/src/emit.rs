@@ -325,12 +325,15 @@ enum Operand {
 
 /// A comparison that the operation after it reads as host flags (H8a):
 /// `cmp left, right` in 64 bits, or in 32 when not `wide`, then `cond`.
+/// With `test`, a comparison of `left AND right` with zero: `test left,
+/// right`.
 #[derive(Clone, Copy, Debug)]
 struct Fusion {
     left: Operand,
     right: Operand,
     cond: Cond,
     wide: bool,
+    test: bool,
 }
 
 impl Fusion {
@@ -394,9 +397,24 @@ fn fusions(
             right,
             cond,
             wide: true,
+            test: false,
         };
         let mut group = vec![i];
-        if matches!(op.code, Code::Less | Code::LessEqual)
+        let with_zero = match op.code {
+            Code::IsZero => true,
+            Code::Equal | Code::NotEqual => homes[usize::from(op.b)] == Home::Const(0),
+            _ => false,
+        };
+        if with_zero && let Some((x, y, wide, at)) = conjunction(ops, i, uses) {
+            fusion = Fusion {
+                left: Operand::Word(x),
+                right: Operand::Word(y),
+                cond,
+                wide,
+                test: true,
+            };
+            group.push(at);
+        } else if matches!(op.code, Code::Less | Code::LessEqual)
             && let Some((x, y, wide, flips)) = signed(ops, i, homes, uses)
         {
             fusion = Fusion {
@@ -408,6 +426,7 @@ fn fusions(
                     Cond::Le
                 },
                 wide,
+                test: false,
             };
             group.extend(flips);
         }
@@ -426,6 +445,26 @@ fn fusions(
         fused[j] = Some(fusion);
     }
     (fused, skip)
+}
+
+/// A comparison with zero at `i` of the result of an `And` just before it
+/// that nothing else reads, of 64 bits or of 32: the operands of the `And`,
+/// whether it is of 64 bits, and its place.
+fn conjunction(ops: &[Op], i: usize, uses: &[Vec<u32>]) -> Option<(Slot, Slot, bool, usize)> {
+    let at = i.checked_sub(1)?;
+    let def = ops[at];
+    if def.code != Code::And || def.dst != ops[i].a || uses[usize::from(def.dst)] != [i as u32] {
+        return None;
+    }
+    let wide = match def.imm {
+        u64::MAX => true,
+        0xffff_ffff => false,
+        _ => return None,
+    };
+    if [def.a, def.b].contains(&ops[i].dst) {
+        return None;
+    }
+    Some((def.a, def.b, wide, at))
 }
 
 /// A signed order at `i`: an unsigned order of two values whose sign bits
@@ -991,6 +1030,9 @@ impl Emitter<'_> {
     fn compare(&mut self, fusion: Fusion, left: Val, right: Val) -> Result<Cond, bool> {
         let wide = fusion.wide;
         let cond = fusion.cond;
+        if fusion.test {
+            return self.test_flags(fusion, left, right);
+        }
         let fits = |value: u64| !wide || i32::try_from(value as i64).is_ok();
         let cmp = |asm: &mut Asm, left: Reg, right: Rm| {
             if wide {
@@ -1048,6 +1090,31 @@ impl Emitter<'_> {
                 let right = self.rm(right, RCX);
                 cmp(&mut self.asm, left, right);
                 Ok(cond)
+            }
+        }
+    }
+
+    /// The flags of `test left, right` for a fused comparison of a
+    /// conjunction with zero. It uses RCX as its scratch, and no other.
+    fn test_flags(&mut self, fusion: Fusion, left: Val, right: Val) -> Result<Cond, bool> {
+        let wide = fusion.wide;
+        let test = |asm: &mut Asm, a: Rm, b: Reg| asm.test_rm(a, b, wide);
+        match (left, right) {
+            (Val::Imm(a), Val::Imm(b)) => {
+                let (_, zf, sf, _) = sub_flags(a & b, 0, wide);
+                Err(fusion.cond.holds(false, zf, sf, false))
+            }
+            (Val::Imm(value), other) | (other, Val::Imm(value)) => {
+                self.asm.mov_imm(RCX, value);
+                let other = self.rm(other, RCX);
+                test(&mut self.asm, other, RCX);
+                Ok(fusion.cond)
+            }
+            (left, right) => {
+                let left = self.reg(left, RCX);
+                let right = self.rm(right, RCX);
+                test(&mut self.asm, right, left);
+                Ok(fusion.cond)
             }
         }
     }
