@@ -1006,6 +1006,12 @@ struct Leave {
     /// The word of the address of an alignment fault.
     address: Option<Slot>,
     class: ExceptionClass,
+    /// A side exit of a superblock (3e DESIGN.md J14): the guard of a
+    /// conditional branch that the block went on after. Its instructions
+    /// are complete with the branch, its outputs are the registers after
+    /// it, and `at` is the other target of the branch. It ends the block as
+    /// its end does, with no exception.
+    side: bool,
 }
 
 /// Why an effect did not complete.
@@ -1045,6 +1051,21 @@ enum Halt {
     /// than one instruction. Nothing of the instruction is lost: the loop
     /// runs it alone and then drops the translated blocks.
     Retry,
+    /// The block left through a side exit of a superblock (3e DESIGN.md
+    /// J14): it ended there as at its end, with the PC at the other target
+    /// of the branch, and the loop runs no last instruction of it. `ended`
+    /// turns it into no halt.
+    Branch,
+}
+
+/// A halt as the loop takes it, and whether the block ran to its end, where
+/// the loop runs its last instruction: a side exit (J14) is the end of a
+/// run with no halt and no last instruction.
+fn ended(halt: Option<Halt>) -> (Option<Halt>, bool) {
+    match halt {
+        Some(Halt::Branch) => (None, false),
+        halt => (halt, true),
+    }
 }
 
 /// A block as the loop runs it: the pre-decoded form of `block`.
@@ -1065,6 +1086,8 @@ struct Compiled {
     generics: Vec<Generic>,
     accesses: Vec<Access16>,
     leaves: Vec<Leave>,
+    /// The side exits of a superblock (3e DESIGN.md J14), by their leave.
+    sides: Vec<jit::Side>,
     /// The words of the scalars. The constants are in place.
     frame: Vec<u64>,
     /// The helper calls (R10).
@@ -1157,6 +1180,8 @@ type ColdPath = (Vec<Op>, Vec<(Place, u32)>);
 struct Parts {
     accesses: Vec<Access16>,
     leaves: Vec<Leave>,
+    /// The side exits of a superblock, as the emitter takes them (J14).
+    sides: Vec<jit::Side>,
     calls: Vec<Call>,
     inputs: Vec<(Place, u32)>,
     op_counts: Option<Vec<usize>>,
@@ -1170,6 +1195,7 @@ impl Parts {
     fn clear(&mut self) {
         self.accesses.clear();
         self.leaves.clear();
+        self.sides.clear();
         self.calls.clear();
         self.inputs.clear();
         self.op_counts = None;
@@ -1585,6 +1611,10 @@ fn compile_with(
         };
         let payload = &block.exits[exit];
         let is_end = matches!(event, Event::Exit(_));
+        // The side exit of a superblock computes its writeback on the way
+        // too: it leaves to the next block as the end does, and compiled
+        // code writes its outputs itself (3e DESIGN.md J14).
+        let side = !is_end && matches!(payload.next, A64Next::Relative(_));
         // A store of 16 bytes whose value joins two words stores the two
         // words: the join is not computed (card S4).
         let pair = match event {
@@ -1609,7 +1639,7 @@ fn compile_with(
         };
         // Only the end computes its writeback on the way: an exit before it
         // computes what it needs when it is taken.
-        if is_end {
+        if is_end || side {
             push_exit_roots(payload, roots);
         }
         parts.emit(lowering, graph, seen, roots)?;
@@ -1632,6 +1662,36 @@ fn compile_with(
         }
         let leave = match leave_of[exit] {
             Some(leave) => leave,
+            None if side => {
+                let A64Next::Relative(distance) = payload.next else {
+                    return Err(host("a side exit without its target"));
+                };
+                let Some(distance) = graph.literal(distance) else {
+                    return Err(host("a side exit to a target that is not a constant"));
+                };
+                let leave = narrow(parts.leaves.len())?;
+                let skipped = instructions
+                    .checked_sub(payload.completed)
+                    .ok_or_else(|| host("a side exit after the end of its block"))?;
+                parts.sides.push(jit::Side {
+                    leave,
+                    outputs: outputs.clone(),
+                    distance: distance as u64,
+                    skipped,
+                });
+                parts.leaves.push(Leave {
+                    ops: Vec::new(),
+                    inputs: Vec::new(),
+                    outputs,
+                    at: distance as u64,
+                    completed: payload.completed,
+                    address: None,
+                    class: ExceptionClass::Undefined,
+                    side: true,
+                });
+                leave_of[exit] = Some(leave);
+                leave
+            }
             None => {
                 let A64Next::Exception {
                     class,
@@ -1653,6 +1713,7 @@ fn compile_with(
                     completed: payload.completed,
                     address: syndrome.first().map(|scalar| lowering.word(*scalar)),
                     class: *class,
+                    side: false,
                 });
                 leave_of[exit] = Some(leave);
                 leave
@@ -1801,6 +1862,7 @@ fn compile_with(
         generics: lowering.generics.clone(),
         accesses: parts.accesses.clone(),
         leaves: moved(&mut parts.leaves),
+        sides: moved(&mut parts.sides),
         frame: lowering.frame.clone(),
         calls: moved(&mut parts.calls),
         inputs: parts.inputs.clone(),
@@ -2376,6 +2438,7 @@ impl Compiled {
         state.set_pc(entry.wrapping_add(leave.at));
         let halt = match failed {
             Failed::Retry => Halt::Retry,
+            Failed::Guard if leave.side => Halt::Branch,
             Failed::Guard => Halt::Stop(host("a guard that names no exception")),
             Failed::Access(Fault::Abort(fault, address), write) => {
                 Halt::Raise(Exception::DataAbort {
@@ -3032,6 +3095,8 @@ fn same_end(a: &(u32, Option<Halt>), b: &(u32, Option<Halt>)) -> bool {
     a.0 == b.0
         && match (&a.1, &b.1) {
             (None, None) | (Some(Halt::Taken), Some(Halt::Taken)) => true,
+            // Compiled code leaves through a side exit as through its end.
+            (None | Some(Halt::Branch), None | Some(Halt::Branch)) => true,
             (Some(Halt::Retry), Some(Halt::Retry)) => true,
             (Some(Halt::Stop(a)), Some(Halt::Stop(b))) => a == b,
             (Some(Halt::Raise(a)), Some(Halt::Raise(b))) => a == b,
@@ -3047,6 +3112,7 @@ fn halt_text(done: &(u32, Option<Halt>)) -> String {
         Some(Halt::Taken) => "an exception taken".to_string(),
         Some(Halt::Raise(exception)) => format!("{exception:x?}"),
         Some(Halt::Retry) => "a store into translated code".to_string(),
+        Some(Halt::Branch) => "a side exit".to_string(),
     };
     format!("{} instructions, then {halt}", done.0)
 }
@@ -3208,6 +3274,7 @@ impl Compiled {
                 kind,
             }),
             memory: jit.memory(),
+            sides: &self.sides,
         };
         match jit.compile(&shape) {
             Ok(entry) => {
@@ -3367,7 +3434,10 @@ unsafe fn run_chained<M: Memory>(
     let state_pointer: *mut State = state;
     // SAFETY: as above.
     let frame = unsafe { (*first).frame.as_mut_ptr() };
-    let budget = budget.min(jit::seat::MOST) as i64;
+    // The count of a run is a `u32`: a run of more instructions counted
+    // `u32::MAX` for them, so a flat image of more than 2^32 instructions
+    // on one run lost the rest from its count (found by card J14).
+    let budget = budget.min(jit::seat::MOST).min(u64::from(u32::MAX)) as i64;
     let mut env = Env {
         state: state_pointer,
         memory,
@@ -3433,17 +3503,19 @@ unsafe fn run_chained<M: Memory>(
     // SAFETY: as above.
     let left = unsafe { jit::seat::left(context) };
     // SAFETY: as above. Only the budget is shared.
-    let (chained, hits, accesses, last) = unsafe {
+    let (chained, hits, accesses, last, refund) = unsafe {
         (
             (*context).chained,
             (*context).hits,
             (*context).accesses,
             (*context).block,
+            (*context).refund,
         )
     };
     // Every block head took its instructions from the budget, and gave them
-    // back when they did not fit.
-    let taken = u32::try_from(budget - left).unwrap_or(u32::MAX);
+    // back when they did not fit. A side exit of a superblock counts those
+    // after it apart, in `refund` (J14).
+    let taken = u32::try_from((budget - left).saturating_sub(refund as i64)).unwrap_or(u32::MAX);
     counts.chained += chained;
     counts.jump_hits += hits;
     counts.tlb_accesses += accesses;
@@ -3532,7 +3604,7 @@ unsafe fn run_chained<M: Memory>(
             // The head of `last` took all of its instructions.
             Ran {
                 count: taken.saturating_sub(last.instructions) + completed,
-                halt,
+                halt: ended(halt).0,
                 terminal: None,
                 pending: None,
             }
@@ -3894,6 +3966,10 @@ pub struct JitCounts {
     /// `Cpu::translations` and `Cpu::translation_ns`.
     pub translations: u64,
     pub translation_ns: u64,
+    /// The joins of superblocks and their side exits, as `Cpu::joins` and
+    /// `Cpu::side_exits` (3e DESIGN.md J14).
+    pub joins: u64,
+    pub side_exits: u64,
     /// Comparisons compiled as the host flags that the next operation
     /// reads, and lazy conditions compiled inline (3e DESIGN.md H8).
     pub fused: u64,
@@ -4000,6 +4076,7 @@ impl JitCounts {
             Some(Halt::Raise(_) | Halt::Taken) => self.exits_exception += 1,
             Some(Halt::Retry) => self.exits_retry += 1,
             Some(Halt::Stop(_)) => self.exits_stop += 1,
+            Some(Halt::Branch) => self.exits_end += 1,
         }
     }
 }
@@ -4051,8 +4128,9 @@ unsafe fn execute<M: Memory>(
     let Some(jit) = jit.as_mut() else {
         // SAFETY: the caller's promise.
         let (count, halt) = unsafe { (*block).run(state, memory, side) };
+        let (halt, end) = ended(halt);
         // SAFETY: as above.
-        let terminal = unsafe { (*block).terminal.map(|(_, trap)| trap) };
+        let terminal = unsafe { (*block).terminal.map(|(_, trap)| trap) }.filter(|_| end);
         return Ran {
             count,
             halt,
@@ -4128,10 +4206,11 @@ unsafe fn execute<M: Memory>(
             counts.checked_runs += 1;
             counts.checked_instructions += u64::from(count);
             counts.exit(&halt);
+            let (halt, end) = ended(halt);
             return Ran {
                 count,
                 halt,
-                terminal: compiled.terminal.map(|(_, trap)| trap),
+                terminal: compiled.terminal.map(|(_, trap)| trap).filter(|_| end),
                 pending: None,
             };
         }
@@ -4178,10 +4257,11 @@ unsafe fn execute<M: Memory>(
     let (count, halt) = compiled.run(state, memory, side);
     counts.interpreted_runs += 1;
     counts.interpreted_instructions += u64::from(count);
+    let (halt, end) = ended(halt);
     Ran {
         count,
         halt,
-        terminal: compiled.terminal.map(|(_, trap)| trap),
+        terminal: compiled.terminal.map(|(_, trap)| trap).filter(|_| end),
         pending: None,
     }
 }
@@ -4209,6 +4289,16 @@ fn switch(name: &str) -> bool {
 /// `VMLAB_HV_JIT_CHECK` asks for it too. A bare `Cpu::new`, as the tests and
 /// the tools of this crate build one, starts the JIT only when asked, so
 /// that a test of the interpreter stays one (3e DESIGN.md H2a).
+/// Whether `VMLAB_HV_JIT_SUPER` leaves superblocks on (3e DESIGN.md J14):
+/// `0`, `off` and `false` turn them off, anything else, or nothing, leaves
+/// them on.
+pub fn superblocks_from_environment() -> bool {
+    !matches!(
+        std::env::var("VMLAB_HV_JIT_SUPER").as_deref(),
+        Ok("0" | "off" | "false")
+    )
+}
+
 pub fn jit_from_environment() -> bool {
     switch("VMLAB_HV_JIT") || jit_check_from_environment()
 }
@@ -4463,7 +4553,19 @@ pub struct Cpu<M> {
     shape_buffers: ShapeBuffers,
     /// The buffers of a translation (3e DESIGN.md J11).
     translator: Translator,
+    /// Superblocks (3e DESIGN.md J14): while the JIT is on, a block goes on
+    /// at the target of a direct branch in its page. `VMLAB_HV_JIT_SUPER`
+    /// `0`, `off` or `false` turns them off.
+    superblocks: bool,
+    /// The joins that the translations made, and those of them with a side
+    /// exit (J14).
+    pub joins: u64,
+    pub side_exits: u64,
 }
+
+/// The most side exits of a superblock: each is a jump that can be linked,
+/// beside the two of the end of the block (3e DESIGN.md J14).
+const SIDE_EXITS: usize = jit::SITES - 2;
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
 pub const ZERO_BLOCK: usize = 64;
@@ -4529,6 +4631,9 @@ impl<M: Memory> Cpu<M> {
             },
             shape_buffers: ShapeBuffers::default(),
             translator: Translator::default(),
+            superblocks: superblocks_from_environment(),
+            joins: 0,
+            side_exits: 0,
         };
         let started = if jit_check_from_environment() {
             cpu.set_jit_check(true)
@@ -4564,6 +4669,16 @@ impl<M: Memory> Cpu<M> {
 
     pub fn jit_enabled(&self) -> bool {
         self.jit.is_some()
+    }
+
+    /// Turn superblocks on or off for the blocks translated from now on
+    /// (3e DESIGN.md J14). They are made only while the JIT is on.
+    pub fn set_superblocks(&mut self, on: bool) {
+        self.superblocks = on;
+    }
+
+    pub fn superblocks_enabled(&self) -> bool {
+        self.superblocks
     }
 
     /// Turn the chaining of compiled blocks on or off (3e DESIGN.md J4, a
@@ -4684,6 +4799,8 @@ impl<M: Memory> Cpu<M> {
         counts.machine = self.side.machine;
         counts.translations = self.translations;
         counts.translation_ns = self.translation_ns;
+        counts.joins = self.joins;
+        counts.side_exits = self.side_exits;
         counts
     }
 
@@ -5176,6 +5293,9 @@ impl<M: Memory> Cpu<M> {
         let mut count = 0;
         let mut ldp_x = 0;
         let mut stp_x = 0;
+        // The joins of a superblock, and those of them with a side exit.
+        let mut joins = 0u64;
+        let mut sides = 0usize;
         loop {
             let mut bytes = [0u8; 4];
             // A block stays inside one page, so one translation serves it.
@@ -5228,7 +5348,23 @@ impl<M: Memory> Cpu<M> {
                 Lifted::Branch => {
                     count += 1;
                     at = at.wrapping_add(4);
-                    break;
+                    // J14: a direct branch to a later place of the page goes
+                    // on in this block. Both targets stay inside the bytes
+                    // that the code stamp of the block covers, from its
+                    // entry to the end of its page.
+                    let room = 0x1000 - (pc & 0xfff);
+                    let joined = (self.superblocks && self.jit.is_some() && count < limit)
+                        .then(|| builder.join(|distance| distance < room, sides < SIDE_EXITS))
+                        .flatten();
+                    match joined {
+                        Some((target, side)) => {
+                            sides += usize::from(side);
+                            joins += 1;
+                            at = target;
+                            continue;
+                        }
+                        None => break,
+                    }
                 }
                 Lifted::Unsupported if count == 0 => {
                     let record = decode(word).map(|decoded| decoded.record);
@@ -5250,6 +5386,8 @@ impl<M: Memory> Cpu<M> {
             }
         }
         self.translations += 1;
+        self.joins += joins;
+        self.side_exits += sides as u64;
         self.side.mark_code(phys);
         let (mut block, spare) = builder.finish_keeping(at);
         self.translator.spare = spare;
@@ -5550,7 +5688,7 @@ impl<M: Memory> Cpu<M> {
         let (count, halt) = result?;
         self.instructions += u64::from(count);
         match halt {
-            None | Some(Halt::Taken) => Ok(()),
+            None | Some(Halt::Taken | Halt::Branch) => Ok(()),
             Some(Halt::Stop(stop)) => Err(stop),
             Some(Halt::Retry | Halt::Raise(_)) => Err(host(
                 "a block of one instruction left in a way that it cannot",
@@ -5711,7 +5849,8 @@ impl<M: Memory> Cpu<M> {
             unclocked += u64::from(count);
             left = left.saturating_sub(u64::from(count));
             match halt {
-                None => {}
+                // `execute` turns a side exit into no halt.
+                None | Some(Halt::Branch) => {}
                 Some(Halt::Taken) => left = left.saturating_sub(1),
                 Some(Halt::Stop(stop)) => return stop,
                 Some(Halt::Raise(_)) => return host("an exception that the loop did not take"),
@@ -6090,8 +6229,10 @@ mod tests {
         // The virtual timer is due 20 us from now on a 1 GHz clock, and the
         // budget takes some milliseconds. A machine CPU leaves its loop
         // within `CLOCK_BLOCKS` blocks of the deadline, so that its owner
-        // raises the line. A CPU without lines runs its budget.
-        let budget = 3_000_000;
+        // raises the line. A CPU without lines runs its budget. The budget
+        // is ten times what the loop runs in 300 us at the speed of its
+        // superblock (J14), 9,000 MIPS.
+        let budget = 30_000_000;
         for machine in [true, false] {
             let mut cpu = cpu(&LOOP);
             cpu.state.set_x(1, budget);

@@ -954,7 +954,9 @@ JIT_REPORT = re.compile(
     r"(?:; returns: (?P<jump_served>\d+) jump cache misses served in code, "
     r"(?P<returns_terminal>\d+) at a block that the loop ends, (?P<returns_done>\d+) with "
     r"nothing to chain to, (?P<returns_budget>\d+) at the budget, (?P<returns_kicked>\d+) "
-    r"kicked; (?P<jump_spaces>\d+) changes of the address space kept the jump cache)?")
+    r"kicked; (?P<jump_spaces>\d+) changes of the address space kept the jump cache)?"
+    # The superblocks of card J14, when the line has them.
+    r"(?:; superblocks: (?P<joins>\d+) joins, (?P<side_exits>\d+) side exits)?")
 
 
 def last_jit_report(run_dir):
