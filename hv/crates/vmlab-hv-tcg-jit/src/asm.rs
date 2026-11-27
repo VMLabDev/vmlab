@@ -219,6 +219,13 @@ impl Asm {
         self.labels[label.0] = Some((self.in_cold, at));
     }
 
+    /// Where `label` is in the finished code, from its start: the cold
+    /// section follows the hot one. `None`: a label that is not bound.
+    pub fn position(&self, label: Label) -> Option<usize> {
+        let (cold, offset) = self.labels[label.0]?;
+        Some(offset + if cold { self.hot.len() } else { 0 })
+    }
+
     /// The bytes of both sections, for the size of the finished code.
     pub fn len(&self) -> usize {
         self.hot.len() + self.cold.len()
@@ -333,6 +340,39 @@ impl Asm {
             self.byte(0xb8 | (dst.0 & 7));
             self.bytes(&value.to_le_bytes());
         }
+    }
+
+    /// A load of `bytes` (1, 2, 4 or 8) from `src`, zero-extended to 64
+    /// bits: `movzx eax, byte`, `movzx eax, word`, `mov eax, dword` or
+    /// `mov rax, qword`.
+    pub fn load_sized(&mut self, dst: Reg, src: Rm, bytes: u8) {
+        match bytes {
+            1 => self.op(None, false, &[0x0f, 0xb6], dst.0, src),
+            2 => self.op(None, false, &[0x0f, 0xb7], dst.0, src),
+            4 => self.op(None, false, &[0x8b], dst.0, src),
+            _ => self.op(None, true, &[0x8b], dst.0, src),
+        }
+    }
+
+    /// A store of the low `bytes` (1, 2, 4 or 8) of `src` to `dst`. A byte
+    /// of SPL, BPL, SIL or DIL takes a REX prefix.
+    pub fn store_sized(&mut self, dst: Rm, src: Reg, bytes: u8) {
+        match bytes {
+            1 => {
+                self.rex(false, src.0, dst, src.0 >= 4);
+                self.byte(0x88);
+                self.modrm(src.0, dst);
+            }
+            2 => self.op(Some(0x66), false, &[0x89], src.0, dst),
+            4 => self.op(None, false, &[0x89], src.0, dst),
+            _ => self.op(None, true, &[0x89], src.0, dst),
+        }
+    }
+
+    /// `test byte dst, value`.
+    pub fn test_byte_imm(&mut self, dst: Rm, value: u8) {
+        self.op(None, false, &[0xf6], 0, dst);
+        self.byte(value);
     }
 
     /// `mov qword dst, value`, the value sign-extended from 32 bits.
@@ -489,6 +529,11 @@ impl Asm {
         self.op(None, false, &[0xff], 4, Rm::Reg(target));
     }
 
+    /// `jmp qword [target]`, or `jmp target` with a register.
+    pub fn jmp_indirect(&mut self, target: Rm) {
+        self.op(None, false, &[0xff], 4, target);
+    }
+
     pub fn ret(&mut self) {
         self.byte(0xc3);
     }
@@ -538,6 +583,14 @@ mod tests {
     const NAMES32: [&str; 16] = [
         "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d",
         "r12d", "r13d", "r14d", "r15d",
+    ];
+    const NAMES16: [&str; 16] = [
+        "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w",
+        "r13w", "r14w", "r15w",
+    ];
+    const NAMES8: [&str; 16] = [
+        "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b",
+        "r13b", "r14b", "r15b",
     ];
 
     fn reg(n: usize) -> Reg {
@@ -656,6 +709,33 @@ mod tests {
                 add(format!("test {text32}, {}", NAMES32[d]), &|a| {
                     a.test_rm(*mem, dst, false)
                 });
+                let sized = |size: &str| text.replacen("qword", size, 1);
+                let (byte, word, dword) = (sized("byte"), sized("word"), sized("dword"));
+                let name32 = NAMES32[d];
+                add(format!("movzx {name32}, {byte}"), &|a| {
+                    a.load_sized(dst, *mem, 1)
+                });
+                add(format!("movzx {name32}, {word}"), &|a| {
+                    a.load_sized(dst, *mem, 2)
+                });
+                add(format!("mov {name32}, {dword}"), &|a| {
+                    a.load_sized(dst, *mem, 4)
+                });
+                add(format!("mov {name}, {text}"), &|a| {
+                    a.load_sized(dst, *mem, 8)
+                });
+                add(format!("mov {byte}, {}", NAMES8[d]), &|a| {
+                    a.store_sized(*mem, dst, 1)
+                });
+                add(format!("mov {word}, {}", NAMES16[d]), &|a| {
+                    a.store_sized(*mem, dst, 2)
+                });
+                add(format!("mov {dword}, {name32}"), &|a| {
+                    a.store_sized(*mem, dst, 4)
+                });
+                add(format!("mov {text}, {name}"), &|a| {
+                    a.store_sized(*mem, dst, 8)
+                });
             }
             for value in [
                 1u64,
@@ -745,6 +825,11 @@ mod tests {
                 a.alu_imm32(Alu::Cmp, *mem, 0x8000_0000)
             });
             add(format!("call {text}"), &|a| a.call_indirect(*mem));
+            add(
+                format!("test {}, 1", text.replacen("qword", "byte", 1)),
+                &|a| a.test_byte_imm(*mem, 1),
+            );
+            add(format!("jmp {text}"), &|a| a.jmp_indirect(*mem));
         }
         for (cond, text) in [
             (Cond::B, "b"),

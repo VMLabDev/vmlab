@@ -8,8 +8,14 @@
 //! `HVC` behind it, so an exception stops the run as a hypercall does, and
 //! a budget that ends a run that loops. The integer, branch, load and
 //! store, FP and AdvSIMD classes are in the streams: the inline forms of
-//! the emitter, its spills and guards, and the thunk with its loads,
-//! stores, accesses of 16 bytes, generic operations and helper calls.
+//! the emitter, its spills and guards, the loads and stores over its fast
+//! TLB with their misses, and the thunk with its accesses of 16 bytes,
+//! generic operations and helper calls.
+//!
+//! Every other round keeps the accesses on both sides, as the lockstep
+//! does, which compiles the blocks of the compiled side so that their hits
+//! of the fast TLB are kept too, and the two lists of accesses are
+//! compared.
 //!
 //! The rounds of `run_flags` are for the flags (card J5, H8): only the
 //! integer and branch classes, which hold every instruction that sets or
@@ -20,11 +26,15 @@
 //! `ci::check` runs a bounded number of rounds with a fixed seed (the test
 //! `tests/jit.rs`); `just tcg-a64-jit-diff` runs as many as it is asked.
 //!
+//! `Options` turn K3 on for the compiled side, which then checks each of
+//! its blocks against the interpreter as it runs, and put a defect into the
+//! emitter, which both proofs must catch (3e DESIGN.md J2).
+//!
 //! Sources read: none. This file holds no instruction semantics.
 
 use super::stream::Generator;
 use crate::FormatClass;
-use crate::exec::Cpu;
+use crate::exec::{Cpu, JitDefect};
 use crate::lift::{
     BRANCH_FORMATS, FP_FORMATS, IMMEDIATE_FORMATS, LOAD_STORE_FORMATS, REGISTER_FORMATS,
     SIMD_FORMATS,
@@ -55,6 +65,12 @@ pub struct Report {
     pub interpreted: u64,
     pub compiled_blocks: u64,
     pub refused_blocks: u64,
+    /// Runs of blocks that K3 checked.
+    pub checked_blocks: u64,
+    /// The inlined loads and stores of the compiled side, and those that
+    /// missed its fast TLB (3e DESIGN.md H7).
+    pub tlb_accesses: u64,
+    pub tlb_misses: u64,
     /// Comparisons compiled as host flags, and lazy conditions inline.
     pub fused: u64,
     pub lazy: u64,
@@ -99,10 +115,53 @@ fn formats() -> Vec<FormatClass> {
     .concat()
 }
 
-fn cpu(memory: FlatMemory, state: State, jit: bool) -> Result<Cpu<FlatMemory>, String> {
+/// The ways a CPU runs its blocks, for the tests that must hold on each
+/// (3e DESIGN.md K6): the interpreter, the JIT, and the JIT with K3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runner {
+    Interpreter,
+    Jit,
+    Checked,
+}
+
+impl Runner {
+    pub const ALL: [Runner; 3] = [Runner::Interpreter, Runner::Jit, Runner::Checked];
+
+    /// Make `cpu` run its blocks this way. Its translated blocks are
+    /// dropped when K3 turns on.
+    pub fn apply<M: vmlab_hv_tcg::Memory>(self, cpu: &mut Cpu<M>) {
+        let started = match self {
+            Runner::Interpreter => cpu.set_jit_check(false).and_then(|()| cpu.set_jit(false)),
+            Runner::Jit => cpu.set_jit_check(false).and_then(|()| cpu.set_jit(true)),
+            Runner::Checked => cpu.set_jit_check(true),
+        };
+        if let Err(error) = started {
+            panic!("the JIT does not start: {error}");
+        }
+        assert_eq!(cpu.jit_enabled(), self != Runner::Interpreter);
+    }
+}
+
+/// How the compiled side runs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// K3 checks every compiled block.
+    pub check: bool,
+    /// A defect in the emitter.
+    pub defect: JitDefect,
+}
+
+fn cpu(memory: FlatMemory, state: State, jit: Option<Options>) -> Result<Cpu<FlatMemory>, String> {
     let mut cpu = Cpu::new(memory, state);
-    cpu.set_jit(jit)
-        .map_err(|error| format!("the JIT does not start: {error}"))?;
+    let started = match jit {
+        Some(options) if options.check => cpu.set_jit_check(true),
+        Some(_) => cpu.set_jit(true),
+        None => cpu.set_jit(false).and_then(|()| cpu.set_jit_check(false)),
+    };
+    started.map_err(|error| format!("the JIT does not start: {error}"))?;
+    if let Some(options) = jit {
+        cpu.seed_jit_defect(options.defect);
+    }
     Ok(cpu)
 }
 
@@ -150,16 +209,26 @@ fn edge_registers(generator: &mut Generator) -> ([u64; 31], u64, u8) {
 
 /// Run `rounds` rounds from `seed`.
 pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
-    run_rounds(seed, rounds, false)
+    run_with(seed, rounds, Options::default())
 }
 
 /// Run `rounds` rounds of the flags from `seed`: the integer and branch
 /// classes on registers at the edges.
 pub fn run_flags(seed: u64, rounds: u64) -> Result<Report, Difference> {
-    run_rounds(seed, rounds, true)
+    run_rounds(seed, rounds, Options::default(), true)
 }
 
-fn run_rounds(seed: u64, rounds: u64, flags: bool) -> Result<Report, Difference> {
+/// Run `rounds` rounds from `seed`, the compiled side as `options` say.
+pub fn run_with(seed: u64, rounds: u64, options: Options) -> Result<Report, Difference> {
+    run_rounds(seed, rounds, options, false)
+}
+
+fn run_rounds(
+    seed: u64,
+    rounds: u64,
+    options: Options,
+    flags: bool,
+) -> Result<Report, Difference> {
     let mut generator = Generator::new(seed);
     let formats = if flags { flag_formats() } else { formats() };
     let mut report = Report::default();
@@ -216,11 +285,17 @@ fn run_rounds(seed: u64, rounds: u64, flags: bool) -> Result<Report, Difference>
         let mut reference = cpu(
             FlatMemory::new(RAM_BASE, bytes.clone()),
             state.clone(),
-            false,
+            None,
         )
         .map_err(difference)?;
         let mut compiled =
-            cpu(FlatMemory::new(RAM_BASE, bytes), state, true).map_err(difference)?;
+            cpu(FlatMemory::new(RAM_BASE, bytes), state, Some(options)).map_err(difference)?;
+        // Every other round keeps the accesses on both sides, as the
+        // lockstep does: the compiled code then keeps those of its hits
+        // (`jit::Memory::Logged`), and the two lists must be the same.
+        let logged = round % 2 == 1;
+        reference.log_accesses(logged);
+        compiled.log_accesses(logged);
         let expected = reference.run(BUDGET);
         let got = compiled.run(BUDGET);
         if format!("{got:?}") != format!("{expected:?}") {
@@ -241,6 +316,16 @@ fn run_rounds(seed: u64, rounds: u64, flags: bool) -> Result<Report, Difference>
                 (reference.instructions, reference.exceptions)
             )));
         }
+        let (ours, theirs) = (compiled.take_accesses(), reference.take_accesses());
+        if ours != theirs {
+            let at = ours.iter().zip(&theirs).position(|(a, b)| a != b);
+            return Err(difference(format!(
+                "the accesses differ{}: compiled {:x?}, the interpreter {:x?}",
+                at.map_or(String::new(), |at| format!(" first at {at}")),
+                at.map_or(&ours[..], |at| &ours[at..(at + 1).min(ours.len())]),
+                at.map_or(&theirs[..], |at| &theirs[at..(at + 1).min(theirs.len())]),
+            )));
+        }
         let (ours, theirs) = (compiled.memory.bytes(), reference.memory.bytes());
         if let Some(at) = ours.iter().zip(theirs).position(|(a, b)| a != b) {
             return Err(difference(format!(
@@ -256,6 +341,9 @@ fn run_rounds(seed: u64, rounds: u64, flags: bool) -> Result<Report, Difference>
         report.interpreted += jit.interpreted_instructions;
         report.compiled_blocks += jit.compiled;
         report.refused_blocks += jit.refused;
+        report.checked_blocks += jit.checked_runs;
+        report.tlb_accesses += jit.tlb_accesses;
+        report.tlb_misses += jit.tlb_misses;
         report.fused += jit.fused;
         report.lazy += jit.lazy;
     }
