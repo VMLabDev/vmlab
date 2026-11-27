@@ -5653,7 +5653,7 @@ impl<M: Memory> Cpu<M> {
         let (count, halt) = result?;
         self.instructions += u64::from(count);
         match halt {
-            None | Some(Halt::Taken) => Ok(()),
+            None | Some(Halt::Taken | Halt::Branch) => Ok(()),
             Some(Halt::Stop(stop)) => Err(stop),
             Some(Halt::Retry | Halt::Raise(_)) => Err(host(
                 "a block of one instruction left in a way that it cannot",
@@ -5814,7 +5814,8 @@ impl<M: Memory> Cpu<M> {
             unclocked += u64::from(count);
             left = left.saturating_sub(u64::from(count));
             match halt {
-                None => {}
+                // `execute` turns a side exit into no halt.
+                None | Some(Halt::Branch) => {}
                 Some(Halt::Taken) => left = left.saturating_sub(1),
                 Some(Halt::Stop(stop)) => return stop,
                 Some(Halt::Raise(_)) => return host("an exception that the loop did not take"),
