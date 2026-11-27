@@ -2422,6 +2422,17 @@ pub fn jit_from_environment() -> bool {
     )
 }
 
+/// Whether the JIT keeps the flags in host flags (3e DESIGN.md H8, card J5):
+/// on unless `VMLAB_HV_JIT_FLAGS` is `0`, `off` or `false`. Off, it compiles
+/// every comparison and lazy condition as card J1 did, for a measurement
+/// before and after.
+pub fn host_flags_from_environment() -> bool {
+    !matches!(
+        std::env::var("VMLAB_HV_JIT_FLAGS").as_deref(),
+        Ok("0" | "off" | "false")
+    )
+}
+
 /// The translated blocks of a CPU: an entry for each code address, picked
 /// by the low bits of the physical address, and a store of the blocks that
 /// lost their entry to other code. A kernel and its programs run more code than the entries
@@ -2636,7 +2647,13 @@ impl<M: Memory> Cpu<M> {
         if on == self.jit.is_some() {
             return Ok(());
         }
-        self.jit = if on { Some(jit::Jit::new()?) } else { None };
+        self.jit = if on {
+            let mut jit = jit::Jit::new()?;
+            jit.host_flags = host_flags_from_environment();
+            Some(jit)
+        } else {
+            None
+        };
         Ok(())
     }
 

@@ -109,6 +109,10 @@ pub struct Jit {
     enter: Enter,
     exit: u64,
     features: Features,
+    /// Compile comparisons as host flags and lazy conditions inline (H8).
+    /// Off: every comparison is a `setcc`, and every lazy condition a call,
+    /// as card J1 made them. For measurements before and after.
+    pub host_flags: bool,
     pub stats: Stats,
 }
 
@@ -162,6 +166,7 @@ impl Jit {
             enter,
             exit: base + exit_offset as u64,
             features,
+            host_flags: true,
             stats: Stats::default(),
         })
     }
@@ -193,7 +198,7 @@ impl Jit {
     }
 
     fn compile_inner(&mut self, shape: &Shape) -> Result<Entry, Refused> {
-        let (asm, fused, lazy) = emit::emit(shape, self.exit, self.features)?;
+        let (asm, fused, lazy) = emit::emit(shape, self.exit, self.features, self.host_flags)?;
         let len = asm.len();
         let base = match self.region.next(len) {
             Some(base) => base,

@@ -1460,9 +1460,15 @@ impl Emitter<'_> {
 }
 
 /// Emit the code of `shape`. `exit` is the address of the common exit of
-/// the trampoline. With the code: the count of comparisons that became host
-/// flags, and of lazy conditions that are inline.
-pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<(Asm, u64, u64), Refused> {
+/// the trampoline. `host_flags` turns on the forms of H8. With the code: the
+/// count of comparisons that became host flags, and of lazy conditions that
+/// are inline.
+pub fn emit(
+    shape: &Shape,
+    exit: u64,
+    features: Features,
+    host_flags: bool,
+) -> Result<(Asm, u64, u64), Refused> {
     let words = shape.frame.len();
     if words > i32::MAX as usize / 8 {
         return Err(Refused::Size);
@@ -1524,7 +1530,11 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<(Asm, u64, u
             *home = Home::Const(shape.frame[slot]);
         }
     }
-    let (fused, skip) = fusions(shape.ops, shape.leaves, &homes, &mut uses);
+    let (fused, skip) = if host_flags {
+        fusions(shape.ops, shape.leaves, &homes, &mut uses)
+    } else {
+        (vec![None; shape.ops.len()], vec![false; shape.ops.len()])
+    };
     let mut emitter = Emitter {
         asm: Asm::new(),
         words: homes
@@ -1570,7 +1580,7 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<(Asm, u64, u
                 .calls
                 .get(op.imm as usize)
                 .and_then(|call| call.condition.as_ref())
-                .filter(|lazy| emitter.lazy_fits(lazy, reads, writes)),
+                .filter(|lazy| host_flags && emitter.lazy_fits(lazy, reads, writes)),
             _ => None,
         };
         if let Some(lazy) = lazy {
