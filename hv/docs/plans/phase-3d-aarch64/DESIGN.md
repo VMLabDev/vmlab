@@ -266,7 +266,9 @@ timer.rs         the generic timer as a value with output lines
   block. 168 format classes cover the 2,332 records, because the tables
   already factor the variants (width, sign, opcode) into fields.
 - **G3b. Shared helpers keep it small.** `b.x(n)`, `b.sp()`, `b.add_with_carry`
-  (the one source of N, Z, C, V for ADD, SUB, CMP, CCMP and the rest),
+  (the source of N, Z, C, V for ADD, CCMP and the rest, and with
+  `b.subtract_with_flags`, which gives the same flags as one subtraction, for
+  SUB and CMP),
   `b.shift`, `b.extend`, `b.bitmask_immediate`, `b.address(mode)` for every
   addressing mode with writeback, `b.load` and `b.store`, `b.cond(cc)`.
 - **G3c. Flags are four one-bit slots.** A block that sets flags twice keeps

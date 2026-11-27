@@ -15,7 +15,15 @@
 //! events between it: loads, stores and guards, in the order of the
 //! instructions. Each event names an exit
 //! that holds the registers as they were before its instruction, so a failed
-//! access leaves the registers of that instruction untouched.
+//! access leaves the registers of that instruction untouched. What such an
+//! exit writes back is computed by operations of its own, which run only
+//! when the block leaves there (card S4).
+//!
+//! A block lifted for a context without `Context::strict` (the MMU on and
+//! SCTLR_EL1.A clear) checks no alignment before a load or a store. The
+//! access asks for the alignment of Device memory itself, on the slow path
+//! that a page of Device memory takes, and takes that fault where the
+//! alignment guard of a strict block takes it (`device_faults`).
 //!
 //! The exclusive monitor of a CPU is the address of its last exclusive
 //! load, the value that the load read, and the write generation of the
