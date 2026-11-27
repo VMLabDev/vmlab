@@ -132,6 +132,12 @@ pub struct Context {
     /// a register drops the top byte of its target in the half that has its
     /// bit set (card C8).
     pub tbi: u8,
+    /// Every access that is not aligned to its size faults: the MMU is off
+    /// (all memory is Device memory) or SCTLR_EL1.A is set. A block lifted
+    /// without it checks no alignment before an access, and the access
+    /// itself asks for the alignment of Device memory where its page is
+    /// Device memory (card S4).
+    pub strict: bool,
 }
 
 impl Context {
@@ -143,6 +149,14 @@ impl Context {
             (true, _) => slot::SP_EL2,
         }
     }
+}
+
+/// Whether an access that is not aligned to its size always faults under
+/// `sctlr`, the SCTLR_EL1 of the regime: the MMU is off, which makes all
+/// memory Device memory, or the A bit is set. What `Context::strict` holds,
+/// and what `Mmu::controls` says the same way.
+pub fn strict_alignment(sctlr: u64) -> bool {
+    sctlr & crate::sysreg::sctlr::M == 0 || sctlr & crate::sysreg::sctlr::A != 0
 }
 
 /// The state of one CPU. Every slot is a `u128`, so that the slot executor
@@ -189,6 +203,7 @@ impl State {
                 sp_sel: true,
                 fp: false,
                 tbi: 0,
+                strict: true,
             },
             daif: 0xf,
             il: false,
@@ -207,6 +222,7 @@ impl State {
         let fpen = (self.system.regs[reg::CPACR_EL1] >> 20) & 3;
         self.context.fp = fpen == 3 || (fpen == 1 && self.context.el != 0);
         self.context.tbi = crate::mmu::tbi_of_instructions(self.system.regs[reg::TCR_EL1]);
+        self.context.strict = strict_alignment(self.system.regs[reg::SCTLR_EL1]);
     }
 
     /// `address` as a PC: with TCR.TBI of its half set, the top byte is the
@@ -398,6 +414,7 @@ mod tests {
             sp_sel: true,
             fp: false,
             tbi: 0,
+            strict: true,
         };
         assert_eq!(context(0).sp_slot(), slot::SP_EL0);
         assert_eq!(context(2).sp_slot(), slot::SP_EL2);

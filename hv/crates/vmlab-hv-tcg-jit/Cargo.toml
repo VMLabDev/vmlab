@@ -1,0 +1,14 @@
+[package]
+name = "vmlab-hv-tcg-jit"
+description = "The x86-64 emitter for the pre-decoded block form: assembler, code region, trampoline, allocator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vmlab-hv-tcg-ir = { path = "../vmlab-hv-tcg-ir" }
+libc.workspace = true
+
+[lints]
+workspace = true

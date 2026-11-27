@@ -15,7 +15,15 @@
 //! events between it: loads, stores and guards, in the order of the
 //! instructions. Each event names an exit
 //! that holds the registers as they were before its instruction, so a failed
-//! access leaves the registers of that instruction untouched.
+//! access leaves the registers of that instruction untouched. What such an
+//! exit writes back is computed by operations of its own, which run only
+//! when the block leaves there (card S4).
+//!
+//! A block lifted for a context without `Context::strict` (the MMU on and
+//! SCTLR_EL1.A clear) checks no alignment before a load or a store. The
+//! access asks for the alignment of Device memory itself, on the slow path
+//! that a page of Device memory takes, and takes that fault where the
+//! alignment guard of a strict block takes it (`device_faults`).
 //!
 //! The exclusive monitor of a CPU is the address of its last exclusive
 //! load, the value that the load read, and the write generation of the
@@ -48,21 +56,22 @@
 //! lockstep of the cards C6 and C8 and the probe of the system registers).
 //! This file holds no other instruction semantics.
 
-use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
 use crate::mmu::{self, Kind, Miss, Mmu, Regime};
 use crate::shootdown::Invalidation;
-use crate::state::{Context, State, slot};
+use crate::state::{Context, State};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
+use vmlab_hv_tcg_ir::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
+use vmlab_hv_tcg_jit as jit;
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
@@ -715,6 +724,8 @@ enum Access16 {
         exclusive: bool,
         /// The access is made as EL0, whatever the level.
         unprivileged: bool,
+        /// The alignment that Device memory asks of it (`device_faults`).
+        device: u8,
         exit: u32,
     },
     Write {
@@ -724,19 +735,35 @@ enum Access16 {
         /// The word of the result of an exclusive store.
         exclusive: Option<Slot>,
         unprivileged: bool,
+        device: u8,
         exit: u32,
     },
 }
 
 /// The bit of `Op::aux` of a load or a store that is made as EL0.
 const UNPRIVILEGED: u8 = 0x80;
+/// The bits of `Op::aux` of a load or a store that hold the alignment that
+/// Device memory asks of it, less one: a mask of the low bits of the
+/// address (card S4).
+const DEVICE_MASK: u8 = 0x0f;
 
 /// Where a block can leave before its end.
 #[derive(Clone, Debug)]
 struct Leave {
+    /// The operations that compute what `outputs` needs and the block has
+    /// not computed when it leaves here. They run only when it does: the
+    /// path on which every access succeeds computes nothing for an exit
+    /// (card S4). Pure operations and helper calls.
+    ops: Vec<Op>,
+    /// Words of the frame, register slot: the inputs that only `ops` read,
+    /// copied in from the state, which a block changes only at its end.
+    inputs: Vec<(Place, u32)>,
     /// Register slot, words of the frame: copied out when the block leaves
-    /// here. The PC is one of them.
+    /// here.
     outputs: Vec<(u32, Place)>,
+    /// The distance in bytes from the entry of the block to the instruction
+    /// that did not complete: the PC when the block leaves here.
+    at: u64,
     /// The instructions of the block that are complete here.
     completed: u32,
     /// The word of the address of an alignment fault.
@@ -811,6 +838,16 @@ struct Compiled {
     /// The last instruction, when the loop runs it: its distance in bytes
     /// from the first, and what it does.
     terminal: Option<(u64, Trap)>,
+    /// The words of the next PC, and whether they hold its distance from
+    /// the PC at the entry (`A64Next::Relative`). The loop sets the PC from
+    /// them after the outputs.
+    next: Option<(Place, bool)>,
+    /// The compiled code of the block, when the JIT is on (3e DESIGN.md
+    /// J1). Code of an older generation of the region is none.
+    code: Option<jit::Entry>,
+    /// The emitter has no form for an operation of the block on this host:
+    /// it runs in the interpreter (H2b).
+    refused: bool,
 }
 
 /// The most arguments of a helper.
@@ -842,6 +879,10 @@ fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
         ScalarType::Integer => u128::MAX,
     }
 }
+
+/// The cold path of an exit: its operations and the inputs only they read
+/// (`Leave::ops`, `Leave::inputs`).
+type ColdPath = (Vec<Op>, Vec<(Place, u32)>);
 
 /// What `compile` gathers beside the operations of the block.
 #[derive(Default)]
@@ -901,6 +942,111 @@ impl Parts {
         }
         Ok(())
     }
+
+    /// The operations of the cold path of an exit: what `roots` need that
+    /// the block has not computed at this point. They go into a list of
+    /// their own, and `seen` is as it was after, so that the block still
+    /// computes each of them where it needs one.
+    fn emit_cold(
+        &mut self,
+        lowering: &mut Lowering,
+        graph: &Graph,
+        seen: &mut [bool],
+        roots: &[ScalarId],
+    ) -> Result<ColdPath, Stop> {
+        let scheduled = schedule::scalars(graph, roots, seen);
+        let main = std::mem::take(&mut lowering.ops);
+        let mut inputs = Vec::new();
+        let mut done = Ok(());
+        for &id in &scheduled {
+            match &graph.scalars[id].operation {
+                // A constant is in the frame from now on, for both paths.
+                Operation::Constant(value) => {
+                    lowering.constant(id, *value);
+                    continue;
+                }
+                Operation::Input(register) => match narrow(*register) {
+                    Ok(register) => inputs.push((lowering.place(id), register)),
+                    Err(stop) => done = Err(stop),
+                },
+                Operation::Effect(_) => {}
+                Operation::Call { helper, args } => {
+                    if args.len() > CALL_ARGUMENTS {
+                        done = Err(host("a helper with too many arguments"));
+                    } else {
+                        let call = Call {
+                            function: helper.0.function,
+                            args: args.iter().map(|arg| lowering.place(*arg)).collect(),
+                            results: vec![(lowering.place(id), result_mask(graph, id))],
+                        };
+                        if let Err(stop) = self.call(lowering, call) {
+                            done = Err(stop);
+                        }
+                    }
+                }
+                _ => lowering.scalar(graph, id),
+            }
+            if done.is_err() {
+                break;
+            }
+            seen[id] = false;
+        }
+        let cold = std::mem::replace(&mut lowering.ops, main);
+        done.map(|()| (cold, inputs))
+    }
+}
+
+/// Let the operations whose result of `w` bits needs only the low `w` bits
+/// of an operand read a truncated operand of one word whole, so that the
+/// truncation, a W register read from its X slot most of the time, is no
+/// operation of its own (card S4). The block form masks each result to its
+/// type, so the bits above `w` of an operand change nothing: `Add`, `Sub`,
+/// `Mul`, `And`, `Or`, `Xor`, and the value that `ShiftLeft` shifts.
+fn skip_truncations(graph: &mut Graph) {
+    use vmlab_hv_tcg_ir::native::{Binary, Unary};
+    // The scalar of one word whose low `width` bits `id` is, at the end of a
+    // chain of truncations.
+    let source = |graph: &Graph, mut id: ScalarId, width: u16| loop {
+        let (value, kept) = match graph.scalars[id].operation {
+            Operation::Slice {
+                value,
+                offset: 0,
+                width: kept,
+            }
+            | Operation::Unary(Unary::Truncate(kept), value) => (value, kept),
+            _ => return id,
+        };
+        if kept < width || !matches!(graph.scalars[value].ty, ScalarType::Bits(1..=64)) {
+            return id;
+        }
+        id = value;
+    };
+    for id in 0..graph.scalars.len() {
+        let ScalarType::Bits(width @ 1..=64) = graph.scalars[id].ty else {
+            continue;
+        };
+        let operation = match graph.scalars[id].operation {
+            Operation::Binary(
+                operation @ (Binary::Add
+                | Binary::Sub
+                | Binary::Mul
+                | Binary::And
+                | Binary::Or
+                | Binary::Xor),
+                left,
+                right,
+            ) => Operation::Binary(
+                operation,
+                source(graph, left, width),
+                source(graph, right, width),
+            ),
+            Operation::Binary(Binary::ShiftLeft, left, right) => {
+                Operation::Binary(Binary::ShiftLeft, source(graph, left, width), right)
+            }
+            _ => continue,
+        };
+        graph.scalars[id].operation = operation;
+    }
 }
 
 fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
@@ -911,7 +1057,7 @@ fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
         .map(|(_, scalar)| *scalar)
         .collect();
     match &exit.next {
-        A64Next::Pc(next) => roots.push(*next),
+        A64Next::Pc(next) | A64Next::Relative(next) => roots.push(*next),
         A64Next::Exception { syndrome, .. } => roots.extend(syndrome),
         A64Next::Trap { .. } => {}
     }
@@ -1006,6 +1152,7 @@ fn compile(
     mut block: BlockOf<A64Exit>,
     counts: Option<&mut BlockCounts>,
 ) -> Result<Compiled, Stop> {
+    skip_truncations(&mut block.graph);
     dce::prune_scalars(&mut block);
     let graph = &block.graph;
     let mut lowering = Lowering::new(graph).ok_or_else(|| host("a block with too many slots"))?;
@@ -1016,6 +1163,7 @@ fn compile(
     };
     let mut block_outputs = None;
     let mut terminal = None;
+    let mut next_pc = None;
     // The exits that events leave through, by their number in the block.
     let mut leave_of = vec![None; block.exits.len()];
     for event in &block.events {
@@ -1065,15 +1213,43 @@ fn compile(
             Event::Checkpoint(_) => return Err(host("an aarch64 block has no checkpoint")),
         };
         let payload = &block.exits[exit];
-        roots.extend(exit_roots(payload));
+        let is_end = matches!(event, Event::Exit(_));
+        // A store of 16 bytes whose value joins two words stores the two
+        // words: the join is not computed (card S4).
+        let pair = match event {
+            Event::WriteMemory {
+                value,
+                bytes: 16,
+                exclusive: false,
+                ..
+            } => match graph.scalars[*value].operation {
+                Operation::Concat {
+                    high,
+                    low,
+                    low_width: 64,
+                } if !lowering.place(high).wide && !lowering.place(low).wide => {
+                    roots.pop();
+                    roots.extend([low, high]);
+                    Some((lowering.word(low), lowering.word(high)))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        // Only the end computes its writeback on the way: an exit before it
+        // computes what it needs when it is taken.
+        if is_end {
+            roots.extend(exit_roots(payload));
+        }
         parts.emit(&mut lowering, graph, &mut seen, &roots)?;
         let mut outputs = Vec::new();
         for (register, scalar) in &payload.writeback.writes {
             outputs.push((narrow(*register)?, lowering.place(*scalar)));
         }
-        if let Event::Exit(_) = event {
+        if is_end {
             match payload.next {
-                A64Next::Pc(next) => outputs.push((slot::PC as u32, lowering.place(next))),
+                A64Next::Pc(next) => next_pc = Some((lowering.place(next), false)),
+                A64Next::Relative(next) => next_pc = Some((lowering.place(next), true)),
                 // The loop runs the last instruction, with the PC at it.
                 A64Next::Trap { pc, trap } => terminal = Some((pc, trap)),
                 A64Next::Exception { .. } => {
@@ -1086,12 +1262,22 @@ fn compile(
         let leave = match leave_of[exit] {
             Some(leave) => leave,
             None => {
-                let A64Next::Exception { class, syndrome } = &payload.next else {
+                let A64Next::Exception {
+                    class,
+                    syndrome,
+                    at,
+                } = &payload.next
+                else {
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let leave = narrow(parts.leaves.len())?;
+                let (ops, inputs) =
+                    parts.emit_cold(&mut lowering, graph, &mut seen, &exit_roots(payload))?;
                 parts.leaves.push(Leave {
+                    ops,
+                    inputs,
                     outputs,
+                    at: *at,
                     completed: payload.completed,
                     address: syndrome.first().map(|scalar| lowering.word(*scalar)),
                     class: *class,
@@ -1100,11 +1286,19 @@ fn compile(
                 leave
             }
         };
-        let unprivileged = matches!(
-            parts.leaves[leave as usize].class,
-            ExceptionClass::DataAbort { unprivileged: true }
-        );
-        let mode = if unprivileged { UNPRIVILEGED } else { 0 };
+        let (unprivileged, device) = match parts.leaves[leave as usize].class {
+            ExceptionClass::DataAbort {
+                unprivileged,
+                device,
+            } => (unprivileged, device),
+            _ => (false, 1),
+        };
+        if !device.is_power_of_two() || device > 16 {
+            return Err(host(
+                "an access whose Device alignment is not 1 to 16 bytes",
+            ));
+        }
+        let mode = (if unprivileged { UNPRIVILEGED } else { 0 }) | (device - 1);
         match event {
             Event::Guard {
                 condition,
@@ -1129,11 +1323,12 @@ fn compile(
                 ..
             } => {
                 let place = lowering.place(*result);
-                let code = match (*bytes, *exclusive || place.wide) {
-                    (1, false) => Code::Load1,
-                    (2, false) => Code::Load2,
-                    (4, false) => Code::Load4,
-                    (8, false) => Code::Load8,
+                let code = match (*bytes, *exclusive, place.wide) {
+                    (1, false, false) => Code::Load1,
+                    (2, false, false) => Code::Load2,
+                    (4, false, false) => Code::Load4,
+                    (8, false, false) => Code::Load8,
+                    (16, false, true) => Code::LoadPair,
                     _ => Code::Access,
                 };
                 let address = lowering.word(*address);
@@ -1145,11 +1340,12 @@ fn compile(
                         bytes: *bytes,
                         exclusive: *exclusive,
                         unprivileged,
+                        device,
                         exit: leave,
                     });
                     lowering.effect(code, 0, 0, 0, 0, index.into());
                 } else {
-                    lowering.effect(code, *bytes | mode, place.slot, address, 0, leave.into());
+                    lowering.effect(code, mode, place.slot, address, 0, leave.into());
                 }
             }
             Event::WriteMemory {
@@ -1165,6 +1361,7 @@ fn compile(
                     (2, false) => Code::Store2,
                     (4, false) => Code::Store4,
                     (8, false) => Code::Store8,
+                    (16, false) => Code::StorePair,
                     _ => Code::Access,
                 };
                 let at = lowering.word(*address);
@@ -1182,12 +1379,20 @@ fn compile(
                             }
                         },
                         unprivileged,
+                        device,
                         exit: leave,
                     });
                     lowering.effect(code, 0, 0, 0, 0, index.into());
+                } else if code == Code::StorePair {
+                    // The low word in `b`, the high one in `dst`.
+                    let (low, high) = pair.unwrap_or_else(|| {
+                        let place = lowering.place(*value);
+                        (place.slot, place.slot + 1)
+                    });
+                    lowering.effect(code, mode, high, at, low, leave.into());
                 } else {
                     let value = lowering.word(*value);
-                    lowering.effect(code, *bytes | mode, 0, at, value, leave.into());
+                    lowering.effect(code, mode, 0, at, value, leave.into());
                 }
             }
             Event::Call { .. } | Event::Exit(_) | Event::Checkpoint(_) => {}
@@ -1202,10 +1407,12 @@ fn compile(
     // The loop reads the words of an operation without a check.
     let words = lowering.frame.len();
     let generics = lowering.generics.len();
-    if !lowering
-        .ops
-        .iter()
-        .all(|op| block::op_in_frame(op, words, generics))
+    let in_frame = |op: &Op| block::op_in_frame(op, words, generics);
+    if !lowering.ops.iter().all(in_frame)
+        || !parts
+            .leaves
+            .iter()
+            .all(|leave| leave.ops.iter().all(in_frame))
     {
         return Err(host(
             "an operation of a block names a word outside its frame",
@@ -1226,6 +1433,9 @@ fn compile(
         inputs: parts.inputs,
         outputs,
         terminal,
+        next: next_pc,
+        code: None,
+        refused: false,
     })
 }
 
@@ -1249,11 +1459,13 @@ fn load<M: Memory, const N: usize>(
     let at = unsafe { block::word(frame, usize::from(op.a)) };
     let user = side.user || op.aux & UNPRIVILEGED != 0;
     // The common case: the TLB holds the page with the permission, nothing
-    // keeps the accesses, and the memory holds the address. A read that
-    // fails has changed nothing, and the general path reads again to say
-    // why.
+    // keeps the accesses, the memory holds the address, and the page is not
+    // Device memory or the address has the alignment that Device memory
+    // asks for. A read that fails has changed nothing, and the general path
+    // reads again to say why.
     if side.log.is_none()
-        && let Some((phys, _)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Read, user))
+        && let Some((phys, flags)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Read, user))
+        && (flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0)
     {
         let mut bytes = [0u8; 8];
         if memory.read(phys, &mut bytes[..N]).is_ok() {
@@ -1262,13 +1474,125 @@ fn load<M: Memory, const N: usize>(
             return Ok(());
         }
     }
+    let exit = op.imm as u32;
+    device_faults(side, memory, at, op.aux, Kind::Read).map_err(|failed| (exit, failed))?;
     match side.load(memory, at, N as u8, false, user) {
         Ok(value) => {
             frame[usize::from(op.dst)] = value as u64;
             Ok(())
         }
-        Err(fault) => Err((op.imm as u32, Failed::Access(fault, false))),
+        Err(fault) => Err((exit, Failed::Access(fault, false))),
     }
+}
+
+/// The alignment fault that Device memory asks for of an access at `va`
+/// whose `Op::aux` is `aux`, in a block lifted without `Context::strict`
+/// (card S4): where the address is not a multiple of that alignment and
+/// the page of its first byte is Device memory. It comes after the faults
+/// of the walk for the page and before its permissions, as the alignment
+/// guard of a strict block has it (`Side::unaligned_faults`).
+#[inline(always)]
+fn device_faults<M: Memory>(
+    side: &mut Side,
+    memory: &mut M,
+    va: u64,
+    aux: u8,
+    kind: Kind,
+) -> Result<(), Failed> {
+    let mask = aux & DEVICE_MASK;
+    if va & u64::from(mask) == 0 || !side.unaligned_faults(memory, va, kind, mask + 1) {
+        return Ok(());
+    }
+    let fault = Fault::Abort(mmu::Fault::ALIGNMENT, va);
+    Err(Failed::Access(fault, kind == Kind::Write))
+}
+
+/// A load of 16 bytes into two words, `dst` and the one after it: one TLB
+/// hit and two accesses of 8 bytes where the bytes are in one page. Two
+/// registers of a pair are two accesses of their own for the architecture,
+/// and the memory splits a load of 16 bytes from a device that way too.
+#[inline(always)]
+fn load_pair<M: Memory>(
+    op: &Op,
+    frame: &mut [u64],
+    memory: &mut M,
+    side: &mut Side,
+) -> Result<(), (u32, Failed)> {
+    // SAFETY: `compile` checked the words of every operation, and two words
+    // from `dst` for this one.
+    let at = unsafe { block::word(frame, usize::from(op.a)) };
+    let exit = op.imm as u32;
+    let user = side.user || op.aux & UNPRIVILEGED != 0;
+    if side.log.is_none()
+        && let Some((phys, flags)) = side.mmu.hit(at, 16, mmu::needed(Kind::Read, user))
+        && (flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0)
+    {
+        let (mut low, mut high) = ([0u8; 8], [0u8; 8]);
+        if memory.read(phys, &mut low).is_ok() {
+            // The first half is read. A load of the 16 bytes reads it the
+            // same way and fails the same way at the second.
+            memory
+                .read(phys + 8, &mut high)
+                .map_err(|error| (exit, Failed::Access(Fault::memory(error, at), false)))?;
+            // SAFETY: as above.
+            unsafe {
+                block::set_word(frame, usize::from(op.dst), u64::from_le_bytes(low));
+                block::set_word(frame, usize::from(op.dst) + 1, u64::from_le_bytes(high));
+            }
+            return Ok(());
+        }
+    }
+    device_faults(side, memory, at, op.aux, Kind::Read).map_err(|failed| (exit, failed))?;
+    match side.load(memory, at, 16, false, user) {
+        Ok(value) => {
+            frame[usize::from(op.dst)] = value as u64;
+            frame[usize::from(op.dst) + 1] = (value >> 64) as u64;
+            Ok(())
+        }
+        Err(fault) => Err((exit, Failed::Access(fault, false))),
+    }
+}
+
+/// A store of 16 bytes from two words, the low one in `b` and the high one
+/// in `dst`, as `load_pair` loads them.
+#[inline(always)]
+fn store_pair<M: Memory>(
+    op: &Op,
+    frame: &[u64],
+    memory: &mut M,
+    side: &mut Side,
+    single: bool,
+) -> Result<(), (u32, Failed)> {
+    // SAFETY: `compile` checked the words of every operation.
+    let (at, low, high) = unsafe {
+        (
+            block::word(frame, usize::from(op.a)),
+            block::word(frame, usize::from(op.b)),
+            block::word(frame, usize::from(op.dst)),
+        )
+    };
+    let exit = op.imm as u32;
+    let user = side.user || op.aux & UNPRIVILEGED != 0;
+    if side.exclusive.is_none()
+        && side.log.is_none()
+        && let Some((phys, flags)) = side.mmu.hit(at, 16, mmu::needed(Kind::Write, user))
+        && (flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0)
+        && !side.maybe_code(phys)
+        && memory.write(phys, &low.to_le_bytes()).is_ok()
+    {
+        // The first half is written, as a store of the 16 bytes writes it
+        // first and fails the same way at the second.
+        side.own_writes += 1;
+        memory
+            .write(phys + 8, &high.to_le_bytes())
+            .map_err(|error| (exit, Failed::Access(Fault::memory(error, at), true)))?;
+        side.own_writes += 1;
+        return Ok(());
+    }
+    device_faults(side, memory, at, op.aux, Kind::Write).map_err(|failed| (exit, failed))?;
+    let value = u128::from(low) | u128::from(high) << 64;
+    side.store(memory, at, 16, value, user, single)
+        .map_err(|refused| (exit, Failed::store(refused)))
 }
 
 /// A store of the low `N` bytes, 1 to 8, of one word.
@@ -1295,13 +1619,15 @@ fn store<M: Memory, const N: usize>(
     // changed nothing, and the general path writes again to say why.
     if side.exclusive.is_none()
         && side.log.is_none()
-        && let Some((phys, _)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Write, user))
+        && let Some((phys, flags)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Write, user))
+        && (flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0)
         && !side.maybe_code(phys)
         && memory.write(phys, &value.to_le_bytes()[..N]).is_ok()
     {
         side.own_writes += 1;
         return Ok(());
     }
+    device_faults(side, memory, at, op.aux, Kind::Write).map_err(|failed| (exit, failed))?;
     let value = u128::from(value) & bits_mask(N as u8);
     side.store(memory, at, N as u8, value, user, single)
         .map_err(|refused| (exit, Failed::store(refused)))
@@ -1320,7 +1646,10 @@ impl Compiled {
                 .leaves
                 .iter()
                 .map(|leave| {
-                    size_of::<Leave>() + leave.outputs.capacity() * size_of::<(u32, Place)>()
+                    size_of::<Leave>()
+                        + leave.ops.capacity() * size_of::<Op>()
+                        + leave.inputs.capacity() * size_of::<(Place, u32)>()
+                        + leave.outputs.capacity() * size_of::<(u32, Place)>()
                 })
                 .sum::<usize>()
             + self.frame.capacity() * size_of::<u64>()
@@ -1367,6 +1696,8 @@ impl Compiled {
             Code::Store2 => store::<M, 2>(op, frame, memory, side, single),
             Code::Store4 => store::<M, 4>(op, frame, memory, side, single),
             Code::Store8 => store::<M, 8>(op, frame, memory, side, single),
+            Code::LoadPair => load_pair(op, frame, memory, side),
+            Code::StorePair => store_pair(op, frame, memory, side, single),
             Code::Access => Self::access(accesses[op.imm as usize], frame, memory, side, single),
             Code::Call => {
                 Self::call(&calls[op.imm as usize], frame, state);
@@ -1448,10 +1779,13 @@ impl Compiled {
                 bytes,
                 exclusive,
                 unprivileged,
+                device,
                 exit,
             } => {
                 let at = frame[usize::from(address)];
                 let user = side.user || unprivileged;
+                device_faults(side, memory, at, device - 1, Kind::Read)
+                    .map_err(|failed| (exit, failed))?;
                 match side.load(memory, at, bytes, exclusive, user) {
                     Ok(value) => result.write(frame, value),
                     Err(fault) => return Err((exit, Failed::Access(fault, false))),
@@ -1463,11 +1797,14 @@ impl Compiled {
                 bytes,
                 exclusive,
                 unprivileged,
+                device,
                 exit,
             } => {
                 let at = frame[usize::from(address)];
                 let value = value.read(frame) & bits_mask(bytes);
                 let user = side.user || unprivileged;
+                device_faults(side, memory, at, device - 1, Kind::Write)
+                    .map_err(|failed| (exit, failed))?;
                 match exclusive {
                     None => side
                         .store(memory, at, bytes, value, user, single)
@@ -1487,11 +1824,32 @@ impl Compiled {
     /// Leave through `exit`, which `failed` asked for: the registers as they
     /// were before the instruction that could not complete.
     #[cold]
-    fn leave(&self, state: &mut State, exit: u32, failed: Failed) -> (u32, Option<Halt>) {
+    fn leave(&mut self, state: &mut State, exit: u32, failed: Failed) -> (u32, Option<Halt>) {
+        // No operation of a block writes the PC: it is the entry still.
+        let entry = state.pc();
         let leave = &self.leaves[exit as usize];
-        for (register, place) in &leave.outputs {
-            state.slots[*register as usize] = place.read(&self.frame);
+        let frame = &mut self.frame;
+        for (place, register) in &leave.inputs {
+            place.write(frame, state.slots[*register as usize]);
         }
+        for op in &leave.ops {
+            if op.code == Code::Call {
+                Self::call(&self.calls[op.imm as usize], frame, state);
+            // SAFETY: `compile` checked the operations of every exit as it
+            // checked those of the block.
+            } else if !unsafe { block::step_unchecked(op, frame, &self.generics) } {
+                return (
+                    0,
+                    Some(Halt::Stop(host(
+                        "an arithmetic operation outside its domain",
+                    ))),
+                );
+            }
+        }
+        for (register, place) in &leave.outputs {
+            state.slots[*register as usize] = place.read(frame);
+        }
+        state.set_pc(entry.wrapping_add(leave.at));
         let halt = match failed {
             Failed::Retry => Halt::Retry,
             Failed::Guard => Halt::Stop(host("a guard that names no exception")),
@@ -1517,7 +1875,6 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
-        let entry = state.pc();
         for (place, register) in &self.inputs {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
@@ -1525,6 +1882,7 @@ impl Compiled {
         // translated code, and the loop starts a new epoch after it.
         let single = self.instructions == 1;
         side.user = self.context.el == 0;
+        let mut failed = None;
         for op in &self.ops {
             if (op.code as u8) < FIRST_EFFECT {
                 // SAFETY: `compile` checked every operation against the
@@ -1551,12 +1909,28 @@ impl Compiled {
                 side,
                 single,
             );
-            if let Err((exit, failed)) = done {
-                return self.leave(state, exit, failed);
+            if let Err(failure) = done {
+                failed = Some(failure);
+                break;
             }
         }
+        if let Some((exit, failed)) = failed {
+            return self.leave(state, exit, failed);
+        }
+        // No operation of a block writes the PC: it is the entry still. It
+        // is read here and not before the operations, which keeps a
+        // register free in their loop.
+        let entry = state.pc();
         for (register, place) in &self.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
+        }
+        if let Some((place, relative)) = &self.next {
+            let value = place.read(&self.frame) as u64;
+            state.set_pc(if *relative {
+                entry.wrapping_add(value)
+            } else {
+                value
+            });
         }
         // The loop runs the last instruction with the PC at it.
         if let Some((distance, _)) = self.terminal {
@@ -1564,6 +1938,319 @@ impl Compiled {
         }
         (self.instructions, None)
     }
+}
+
+/// What the thunk of compiled code reaches: the parts of the block that it
+/// runs an effect with, and the CPU around it.
+struct Env<'a, M> {
+    ops: &'a [Op],
+    generics: &'a [Generic],
+    accesses: &'a [Access16],
+    calls: &'a [Call],
+    leaves: &'a [Leave],
+    frame: *mut u64,
+    words: usize,
+    state: *mut State,
+    memory: &'a mut M,
+    side: &'a mut Side,
+    single: bool,
+    /// Why the block left, when an effect did not complete.
+    failed: Option<(u32, Failed)>,
+    stop: Option<Stop>,
+}
+
+/// What the thunk returns when the block leaves.
+const THUNK_LEFT: u64 = 2;
+
+/// The thunk of compiled code (3e DESIGN.md J1): it runs the operation
+/// `index` of the block as the interpreter does. The emitter put every word
+/// that the operation reads into the frame, and reads what it writes from
+/// there.
+///
+/// # Safety
+/// `env` is the `Env<M>` of the block that runs, and `index` one of its
+/// operations, which `compile` checked against the frame.
+unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u64) -> u64 {
+    // SAFETY: the caller's promise. Compiled code holds no reference into
+    // the environment while it calls.
+    let env = unsafe { &mut *env.cast::<Env<M>>() };
+    let op = &env.ops[index as usize];
+    // SAFETY: the frame of the block, which nothing else touches while the
+    // thunk runs.
+    let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
+    if (op.code as u8) < FIRST_EFFECT {
+        // SAFETY: `compile` checked every operation against the frame and
+        // the generic operations of the block.
+        if unsafe { block::step_unchecked(op, frame, env.generics) } {
+            return 0;
+        }
+        env.stop = Some(host("an arithmetic operation outside its domain"));
+        return THUNK_LEFT;
+    }
+    // SAFETY: the state of the CPU, which compiled code does not touch
+    // while it calls.
+    let state = unsafe { &mut *env.state };
+    match Compiled::effect(
+        op,
+        frame,
+        env.accesses,
+        env.calls,
+        env.leaves,
+        state,
+        env.memory,
+        env.side,
+        env.single,
+    ) {
+        Ok(()) => 0,
+        Err(failed) => {
+            env.failed = Some(failed);
+            THUNK_LEFT
+        }
+    }
+}
+
+/// The words of a place.
+fn place_words(place: Place) -> impl Iterator<Item = Slot> {
+    std::iter::once(place.slot).chain(place.wide.then_some(place.slot + 1))
+}
+
+impl Compiled {
+    /// Compile the block, or mark it as one that the emitter refuses.
+    fn compile_code(&mut self, jit: &mut jit::Jit) {
+        // What a leave reads from the frame: its outputs, its address, and
+        // every word that its own operations read (card S4). A word that
+        // those operations compute first is in the list too, which costs a
+        // store of a stale value that they then overwrite.
+        let generics = &self.generics;
+        let calls_of = &self.calls;
+        let leaves: Vec<Vec<Slot>> = self
+            .leaves
+            .iter()
+            .map(|leave| {
+                let cold = leave.ops.iter().flat_map(|op| {
+                    let words: Vec<Slot> = match op.code {
+                        Code::Generic => generics[op.imm as usize]
+                            .args()
+                            .into_iter()
+                            .flat_map(place_words)
+                            .collect(),
+                        Code::Call => calls_of[op.imm as usize]
+                            .args
+                            .iter()
+                            .copied()
+                            .flat_map(place_words)
+                            .collect(),
+                        Code::Select => vec![op.a, op.b, op.imm as Slot],
+                        _ => vec![op.a, op.b],
+                    };
+                    words
+                });
+                leave
+                    .outputs
+                    .iter()
+                    .flat_map(|(_, place)| place_words(*place))
+                    .chain(leave.address)
+                    .chain(cold)
+                    .collect()
+            })
+            .collect();
+        let accesses: Vec<jit::Effect> = self
+            .accesses
+            .iter()
+            .map(|access| match *access {
+                Access16::Read {
+                    address,
+                    result,
+                    exit,
+                    ..
+                } => jit::Effect {
+                    reads: vec![address],
+                    writes: place_words(result).collect(),
+                    leave: Some(exit),
+                },
+                Access16::Write {
+                    address,
+                    value,
+                    exclusive,
+                    exit,
+                    ..
+                } => jit::Effect {
+                    reads: std::iter::once(address).chain(place_words(value)).collect(),
+                    writes: exclusive.into_iter().collect(),
+                    leave: Some(exit),
+                },
+            })
+            .collect();
+        let calls: Vec<jit::Effect> = self
+            .calls
+            .iter()
+            .map(|call| jit::Effect {
+                reads: call.args.iter().copied().flat_map(place_words).collect(),
+                writes: call
+                    .results
+                    .iter()
+                    .flat_map(|(place, _)| place_words(*place))
+                    .collect(),
+                leave: None,
+            })
+            .collect();
+        // The compiled code writes the next PC with the outputs, as it is
+        // in the frame: a distance from the entry is added after it runs.
+        let mut outputs = self.outputs.clone();
+        if let Some((place, _)) = self.next {
+            outputs.push((crate::state::slot::PC as u32, place));
+        }
+        let shape = jit::Shape {
+            ops: &self.ops,
+            generics: &self.generics,
+            frame: &self.frame,
+            accesses: &accesses,
+            calls: &calls,
+            leaves: &leaves,
+            inputs: &self.inputs,
+            outputs: &outputs,
+            instructions: self.instructions,
+        };
+        match jit.compile(&shape) {
+            Ok(entry) => self.code = Some(entry),
+            Err(_) => {
+                self.code = None;
+                self.refused = true;
+            }
+        }
+    }
+
+    /// Run the compiled code of the block. `None`: the budget did not hold
+    /// the block, and nothing ran.
+    fn run_code<M: Memory>(
+        &mut self,
+        entry: &jit::Entry,
+        jit: &jit::Jit,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+        budget: u64,
+    ) -> Option<(u32, Option<Halt>)> {
+        let pc = state.pc();
+        side.user = self.context.el == 0;
+        let state_pointer: *mut State = state;
+        let frame = self.frame.as_mut_ptr();
+        let mut env = Env {
+            ops: &self.ops,
+            generics: &self.generics,
+            accesses: &self.accesses,
+            calls: &self.calls,
+            leaves: &self.leaves,
+            frame,
+            words: self.frame.len(),
+            state: state_pointer,
+            memory,
+            side,
+            single: self.instructions == 1,
+            failed: None,
+            stop: None,
+        };
+        let mut context = jit::Context {
+            budget: budget.min(i64::MAX as u64) as i64,
+            thunk: thunk::<M>,
+            env: (&raw mut env).cast(),
+        };
+        // SAFETY: `entry` is current and was compiled from this block, whose
+        // frame and register slots are as large as its shape names. While
+        // the code runs, only it and the thunk touch the frame and the
+        // state, and the thunk reaches them through `env` alone.
+        let code = unsafe {
+            jit.enter(
+                entry,
+                &mut context,
+                (&raw mut (*state_pointer).slots).cast(),
+                frame,
+            )
+        };
+        let failed = env.failed.take();
+        let stop = env.stop.take();
+        match code {
+            jit::DONE => {
+                if let Some((_, true)) = self.next {
+                    state.set_pc(pc.wrapping_add(state.pc()));
+                }
+                // The loop runs the last instruction with the PC at it.
+                if let Some((distance, _)) = self.terminal {
+                    state.set_pc(pc.wrapping_add(distance));
+                }
+                Some((self.instructions, None))
+            }
+            jit::BUDGET => None,
+            _ => Some(match (failed, stop) {
+                (Some((exit, failed)), _) => self.leave(state, exit, failed),
+                (None, stop) => (
+                    0,
+                    Some(Halt::Stop(stop.unwrap_or_else(|| {
+                        host("compiled code left the block without a reason")
+                    }))),
+                ),
+            }),
+        }
+    }
+}
+
+/// What the JIT of a CPU did, for the bench rows and the debug log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitCounts {
+    /// Runs of compiled blocks, and their instructions.
+    pub compiled_runs: u64,
+    pub compiled_instructions: u64,
+    /// Runs of blocks in the interpreter while the JIT is on, and their
+    /// instructions: blocks that the emitter refused (H2b), and blocks that
+    /// the budget did not hold at their head.
+    pub interpreted_runs: u64,
+    pub interpreted_instructions: u64,
+    /// Blocks compiled and refused, the bytes of code, the resets of the
+    /// region and the host time of the compiles.
+    pub compiled: u64,
+    pub refused: u64,
+    pub bytes: u64,
+    pub resets: u64,
+    pub compile_ns: u64,
+}
+
+/// Run `block` on its compiled code when the JIT is on and takes it, else
+/// in the interpreter.
+fn execute<M: Memory>(
+    block: &mut Compiled,
+    state: &mut State,
+    memory: &mut M,
+    side: &mut Side,
+    jit: &mut Option<jit::Jit>,
+    counts: &mut JitCounts,
+    budget: u64,
+) -> (u32, Option<Halt>) {
+    let Some(jit) = jit.as_mut() else {
+        return block.run(state, memory, side);
+    };
+    if !block.refused && !block.code.is_some_and(|entry| jit.current(&entry)) {
+        block.compile_code(jit);
+    }
+    if let Some(entry) = block.code
+        && let Some(done) = block.run_code(&entry, jit, state, memory, side, budget)
+    {
+        counts.compiled_runs += 1;
+        counts.compiled_instructions += u64::from(done.0);
+        return done;
+    }
+    let done = block.run(state, memory, side);
+    counts.interpreted_runs += 1;
+    counts.interpreted_instructions += u64::from(done.0);
+    done
+}
+
+/// Whether `VMLAB_HV_JIT` turns the JIT on: `1`, `on` or `true`. It is off
+/// by default (3e DESIGN.md J1, H2e).
+pub fn jit_from_environment() -> bool {
+    matches!(
+        std::env::var("VMLAB_HV_JIT").as_deref(),
+        Ok("1" | "on" | "true")
+    )
 }
 
 /// The translated blocks of a CPU: an entry for each code address, picked
@@ -1717,6 +2404,12 @@ pub struct Cpu<M> {
     /// memory holds.
     epoch: u64,
     side: Side,
+    /// The JIT, when it is on (3e DESIGN.md J1).
+    jit: Option<jit::Jit>,
+    jit_counts: JitCounts,
+    /// Why the JIT that `VMLAB_HV_JIT` asked for could not start. The owner
+    /// of the CPU writes it to its log.
+    pub jit_error: Option<String>,
 }
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
@@ -1730,7 +2423,7 @@ impl<M: Memory> Cpu<M> {
     pub fn new(memory: M, state: State) -> Self {
         let generation = memory.generation();
         let side = Side::new(&state);
-        Self {
+        let mut cpu = Self {
             state,
             memory,
             irq: false,
@@ -1752,7 +2445,43 @@ impl<M: Memory> Cpu<M> {
             generation,
             epoch: 1,
             side,
+            jit: None,
+            jit_counts: JitCounts::default(),
+            jit_error: None,
+        };
+        if jit_from_environment()
+            && let Err(error) = cpu.set_jit(true)
+        {
+            cpu.jit_error = Some(error.to_string());
         }
+        cpu
+    }
+
+    /// Turn the JIT on or off. On: every block runs as compiled code where
+    /// the emitter takes it. Off: the code region is dropped.
+    pub fn set_jit(&mut self, on: bool) -> std::io::Result<()> {
+        if on == self.jit.is_some() {
+            return Ok(());
+        }
+        self.jit = if on { Some(jit::Jit::new()?) } else { None };
+        Ok(())
+    }
+
+    pub fn jit_enabled(&self) -> bool {
+        self.jit.is_some()
+    }
+
+    /// What the JIT did since the CPU was made.
+    pub fn jit_counts(&self) -> JitCounts {
+        let mut counts = self.jit_counts;
+        if let Some(jit) = &self.jit {
+            counts.compiled = jit.stats.compiled;
+            counts.refused = jit.stats.refused;
+            counts.bytes = jit.stats.bytes;
+            counts.resets = jit.stats.resets;
+            counts.compile_ns = jit.stats.compile_ns;
+        }
+        counts
     }
 
     /// The physical address of the virtual address `va`, when it has one,
@@ -2334,6 +3063,9 @@ impl<M: Memory> Cpu<M> {
     /// registers, at the start of `run` and `step`: the owner of the CPU can
     /// have changed either.
     fn check_generation(&mut self) {
+        // The owner can have written SCTLR_EL1 without `State::refresh`.
+        self.state.context.strict =
+            crate::state::strict_alignment(self.state.system.regs[reg::SCTLR_EL1]);
         self.side.mmu.sync(&self.state);
         self.settle();
     }
@@ -2459,7 +3191,15 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return Err(host("the block cache lost a block"));
         };
-        let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+        let (count, halt) = execute(
+            block,
+            &mut self.state,
+            &mut self.memory,
+            &mut self.side,
+            &mut self.jit,
+            &mut self.jit_counts,
+            u64::MAX,
+        );
         // The loop runs the last instruction at the PC that the block left.
         let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
         Ok((count, self.finish(halt, terminal)))
@@ -2552,7 +3292,15 @@ impl<M: Memory> Cpu<M> {
                 && let Some(block) = self.blocks.entries[index].as_mut()
                 && u64::from(block.instructions) <= left
             {
-                let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+                let (count, halt) = execute(
+                    block,
+                    &mut self.state,
+                    &mut self.memory,
+                    &mut self.side,
+                    &mut self.jit,
+                    &mut self.jit_counts,
+                    left,
+                );
                 let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
                 (count, self.finish(halt, terminal))
             } else {
@@ -2622,6 +3370,7 @@ impl<M: Memory> Cpu<M> {
 mod tests {
     use super::*;
     use crate::flags;
+    use crate::state::slot;
     use vmlab_hv_tcg::FlatMemory;
 
     const BASE: u64 = 0x4000_0000;
@@ -2683,8 +3432,11 @@ mod tests {
         assert_eq!(counts.blocks, 1);
         assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
         assert_eq!(counts.alignment_operations, 6);
-        // The discarded add restores X4. Each access also has its own fault PC.
-        assert_eq!(counts.exit_writeback_operations, 3);
+        // The discarded add restores X4, on the cold path of the exits
+        // only: no operation of the block serves an exit (card S4). The
+        // fault PC of an access is no operation: the exit carries its
+        // distance from the entry (#1143).
+        assert_eq!(counts.exit_writeback_operations, 0);
     }
 
     #[test]

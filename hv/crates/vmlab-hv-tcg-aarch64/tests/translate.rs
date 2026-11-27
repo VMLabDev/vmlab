@@ -137,6 +137,11 @@ fn sttr(rt: u32, rn: u32) -> u32 {
     0xf800_0800 | rn << 5 | rt
 }
 
+/// `ADD Xd, Xn, #imm12`.
+fn add_x(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0x9100_0000 | imm12 << 10 | rn << 5 | rd
+}
+
 #[test]
 fn a_load_and_a_store_go_through_the_tables() {
     let mut machine = Machine::new(&[ldr(1, 0), str(1, 2), HVC]);
@@ -325,6 +330,130 @@ fn alignment_faults_in_device_memory_and_with_sctlr_a() {
         machine.cpu.state.set_x(0, VA + 3);
         machine.cpu.step().unwrap();
         assert_eq!(machine.abort(), Some((VA + 3, esr)));
+    }
+}
+
+/// `SUBS Xd, Xn, Xm`, `SUB Wd, Wn, Wm`, and `LDP` and `STP` of two X
+/// registers at `[Xn]`.
+fn subs(rd: u32, rn: u32, rm: u32) -> u32 {
+    0xeb00_0000 | rm << 16 | rn << 5 | rd
+}
+
+fn sub_w(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x4b00_0000 | rm << 16 | rn << 5 | rd
+}
+
+fn ldp(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xa940_0000 | rt2 << 10 | rn << 5 | rt
+}
+
+fn stp(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xa900_0000 | rt2 << 10 | rn << 5 | rt
+}
+
+#[test]
+fn an_access_late_in_a_block_leaves_with_the_registers_before_it() {
+    // One block: add x3, x3, #1 ; subs x4, x3, x5 ; sub w6, w3, w5 ;
+    // ldr x1, [x0] ; hvc. The load is not aligned: it faults in Device
+    // memory and with SCTLR_EL1.A, which the block checks before it, and
+    // not in Normal memory (card S4). Where it faults, the three
+    // instructions before it are written back and the load is not.
+    for (attribute, strict, faults) in [(0u64, false, false), (1, false, true), (0, true, true)] {
+        let mut machine = Machine::new(&[
+            add_x(3, 3, 1),
+            subs(4, 3, 5),
+            sub_w(6, 3, 5),
+            ldr(1, 0),
+            HVC,
+        ]);
+        machine.map(VA, DATA | AF | NO_EXECUTE | attribute << 2);
+        if strict {
+            machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::A;
+        }
+        machine
+            .cpu
+            .memory
+            .write(DATA + 3, &0x1122_3344_5566_7788u64.to_le_bytes())
+            .unwrap();
+        let state = &mut machine.cpu.state;
+        state.set_x(0, VA + 3);
+        state.set_x(1, 0x77);
+        state.set_x(3, 10);
+        state.set_x(5, 20);
+        assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        let case = format!("attribute {attribute} strict {strict}");
+        let state = &machine.cpu.state;
+        assert_eq!(state.x(3), 11, "{case}");
+        assert_eq!(state.x(4), 11u64.wrapping_sub(20), "{case}");
+        assert_eq!(state.x(6), 0xffff_fff7, "{case}");
+        if faults {
+            assert_eq!(machine.abort(), Some((VA + 3, 0x9600_0021)), "{case}");
+            assert_eq!(state.system.regs[sysreg::reg::ELR_EL1], CODE + 12, "{case}");
+            // N set, Z, C and V clear: 11 - 20 borrows.
+            assert_eq!(
+                state.system.regs[sysreg::reg::SPSR_EL1] >> 28,
+                0b1000,
+                "{case}"
+            );
+            assert_eq!(state.x(1), 0x77, "{case}");
+        } else {
+            assert_eq!(machine.cpu.exceptions, 0, "{case}");
+            assert_eq!(state.cpsr() >> 28, 0b1000, "{case}");
+            assert_eq!(state.x(1), 0x1122_3344_5566_7788, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_pair_of_x_registers_is_one_access() {
+    // stp x1, x2, [x0] ; ldp x3, x4, [x0] ; hvc, in Normal memory, aligned
+    // and not.
+    for offset in [0x10, 0x4] {
+        let mut machine = Machine::new(&[stp(1, 2, 0), ldp(3, 4, 0), HVC]);
+        machine.map(VA, DATA | AF | NO_EXECUTE);
+        let state = &mut machine.cpu.state;
+        state.set_x(0, VA + offset);
+        state.set_x(1, 0x0102_0304_0506_0708);
+        state.set_x(2, 0x1112_1314_1516_1718);
+        assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        assert_eq!(machine.cpu.exceptions, 0);
+        assert_eq!(machine.word(DATA + offset), 0x0102_0304_0506_0708);
+        assert_eq!(machine.word(DATA + offset + 8), 0x1112_1314_1516_1718);
+        let state = &machine.cpu.state;
+        assert_eq!(
+            (state.x(3), state.x(4)),
+            (0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
+        );
+    }
+    // A pair that crosses into a page without a translation: the fault
+    // names the first byte of that page, and no register is written.
+    let mut machine = Machine::new(&[add_x(5, 5, 1), ldp(3, 4, 0), HVC]);
+    machine.map(VA, DATA | AF | NO_EXECUTE);
+    machine.cpu.state.set_x(0, VA + 0xff8);
+    machine.cpu.state.set_x(3, 0x33);
+    assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+    assert_eq!(machine.abort(), Some((VA + 0x1000, 0x9600_0007)));
+    let state = &machine.cpu.state;
+    assert_eq!((state.x(3), state.x(5)), (0x33, 1));
+    // In Device memory a pair asks for the alignment of one register: a
+    // store at 8 bytes writes, and one at 4 faults before it writes.
+    for (offset, faults) in [(8, false), (4, true)] {
+        let mut machine = Machine::new(&[stp(1, 2, 0), HVC]);
+        machine.map(VA, DATA | AF | NO_EXECUTE | 1 << 2);
+        machine.cpu.state.set_x(0, VA + offset);
+        machine.cpu.state.set_x(1, 0xaa);
+        machine.cpu.state.set_x(2, 0xbb);
+        assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        if faults {
+            assert_eq!(machine.abort(), Some((VA + offset, 0x9600_0061)));
+            assert_eq!(machine.word(DATA + offset), 0);
+        } else {
+            assert_eq!(machine.cpu.exceptions, 0);
+            assert_eq!(
+                (machine.word(DATA + offset), machine.word(DATA + offset + 8)),
+                (0xaa, 0xbb)
+            );
+        }
     }
 }
 
@@ -731,6 +860,78 @@ fn one_translation_serves_code_at_two_addresses() {
     let shared = code_at_two_addresses(false).cpu.translations;
     let copied = code_at_two_addresses(true).cpu.translations;
     assert_eq!(shared + 1, copied);
+}
+
+#[test]
+fn a_shared_block_computes_its_page_and_its_link_from_the_pc_it_runs_at() {
+    // One page of code at two addresses in two pages, called at each:
+    // ADRP, BL and the PC of the return all come from the PC at the entry
+    // of the one block.
+    const FIRST: u64 = VA + 0x2000;
+    const SECOND: u64 = VA + 0x5000;
+    // adrp x7, . ; mov x9, x30 ; bl +8 ; hvc ; mov x10, x30 ; ret x9
+    const CALLED: [u32; 6] = [
+        0x9000_0007,
+        0xaa1e_03e9,
+        0x9400_0002,
+        HVC,
+        0xaa1e_03ea,
+        0xd65f_0120,
+    ];
+    // blr x2 ; mov x11, x7 ; mov x12, x10 ; blr x6 ; hvc
+    let program = [asm::blr(2), 0xaa07_03eb, 0xaa0a_03ec, asm::blr(6), HVC];
+    for step in [false, true] {
+        let mut machine = Machine::new(&program);
+        machine.map(FIRST, DATA | AF | READ_ONLY);
+        machine.map(SECOND, DATA | AF | READ_ONLY);
+        machine
+            .cpu
+            .memory
+            .write(DATA, &asm::bytes(&CALLED))
+            .unwrap();
+        machine.cpu.state.set_x(2, FIRST);
+        machine.cpu.state.set_x(6, SECOND);
+        if step {
+            for _ in 0..14 {
+                machine.cpu.step().unwrap();
+            }
+        } else {
+            assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        }
+        assert_eq!(machine.cpu.taken, None);
+        let x = |n| machine.cpu.state.x(n);
+        assert_eq!((x(11), x(12)), (FIRST, FIRST + 12), "stepped: {step}");
+        assert_eq!((x(7), x(10)), (SECOND, SECOND + 12), "stepped: {step}");
+    }
+}
+
+#[test]
+fn a_write_to_shared_code_reaches_it_at_every_address() {
+    // The page of the data runs at two addresses and is written at a third.
+    // The block of the first call serves the second address too, until the
+    // store changes its code: the second call runs the new code.
+    const ADD_1: u32 = 0x9100_0421;
+    const ADD_2: u32 = 0x9100_0821;
+    const FIRST: u64 = VA + 0x2000;
+    const SECOND: u64 = VA + 0x5000;
+    // blr x2 ; str w3, [x0] ; blr x6 ; hvc
+    let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(6), HVC]);
+    machine.map(VA, DATA | AF | NO_EXECUTE);
+    machine.map(FIRST, DATA | AF | READ_ONLY);
+    machine.map(SECOND, DATA | AF | READ_ONLY);
+    machine
+        .cpu
+        .memory
+        .write(DATA, &asm::bytes(&[ADD_1, asm::RET]))
+        .unwrap();
+    machine.cpu.state.set_x(0, VA);
+    machine.cpu.state.set_x(2, FIRST);
+    machine.cpu.state.set_x(3, u64::from(ADD_2));
+    machine.cpu.state.set_x(6, SECOND);
+    assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+    assert_eq!(machine.cpu.taken, None);
+    // One from the first call, two from the second.
+    assert_eq!(machine.cpu.state.x(1), 3);
 }
 
 #[test]
