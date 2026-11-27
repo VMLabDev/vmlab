@@ -943,7 +943,12 @@ JIT_REPORT = re.compile(
     # What the CPUs of a machine told each other (card J7), when the line has it.
     r"(?:; machine: (?P<exclusive_loads>\d+) exclusive loads, (?P<exclusive_stores>\d+) "
     r"exclusive stores, (?P<code_mails>\d+) code mails, (?P<code_pages>\d+) code pages, "
-    r"(?P<wait_ms>\d+) ms waiting)?")
+    r"(?P<wait_ms>\d+) ms waiting)?"
+    # The compiles by cause and the translations (card J11), when the line has them.
+    r"(?:; compiles: (?P<compiles_first>\d+) first, (?P<compiles_region>\d+) after a drop of "
+    r"the region, (?P<compiles_invalidated>\d+) after an invalidation, (?P<compiles_evicted>\d+) "
+    r"after an eviction, (?P<memory_resets>\d+) drops for the memory; translations: "
+    r"(?P<translations>\d+) blocks, (?P<translation_ms>\d+) ms)?")
 
 
 def last_jit_report(run_dir):

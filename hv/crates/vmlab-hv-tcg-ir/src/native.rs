@@ -270,9 +270,26 @@ fn type_range(ty: ScalarType) -> Option<Range> {
 }
 
 impl Graph {
-    pub fn retain(&mut self, keep: &[bool]) -> Vec<ScalarId> {
+    /// Empty the graph, keeping the memory of its tables.
+    pub fn clear(&mut self) {
+        self.scalars.clear();
+        self.interned.clear();
         self.aliases.clear();
-        let mut mapping = vec![usize::MAX; self.scalars.len()];
+    }
+
+    pub fn retain(&mut self, keep: &[bool]) -> Vec<ScalarId> {
+        let mut mapping = Vec::new();
+        self.retain_into(keep, &mut mapping);
+        mapping
+    }
+
+    /// `retain`, with the new number of each scalar in `mapping`, and the
+    /// scalars moved down in place: no heap call once `mapping` and the
+    /// tables have grown (3e DESIGN.md J11).
+    pub fn retain_into(&mut self, keep: &[bool], mapping: &mut Vec<ScalarId>) {
+        self.aliases.clear();
+        mapping.clear();
+        mapping.resize(self.scalars.len(), usize::MAX);
         let mut next = 0;
         for (id, retain) in keep.iter().enumerate() {
             if *retain {
@@ -280,13 +297,15 @@ impl Graph {
                 next += 1;
             }
         }
-        self.scalars = std::mem::take(&mut self.scalars)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(id, mut scalar)| {
-                if !keep[id] {
-                    return None;
-                }
+        // A scalar names only scalars before it, which have their new
+        // numbers already, and it moves to a place at or before its own.
+        let mut next = 0;
+        for (id, retain) in keep.iter().enumerate().take(self.scalars.len()) {
+            if !*retain {
+                continue;
+            }
+            {
+                let scalar = &mut self.scalars[id];
                 match &mut scalar.operation {
                     Operation::Refine(value)
                     | Operation::Unary(_, value)
@@ -314,15 +333,16 @@ impl Graph {
                     }
                     _ => {}
                 }
-                Some(scalar)
-            })
-            .collect();
+            }
+            self.scalars.swap(next, id);
+            next += 1;
+        }
+        self.scalars.truncate(next);
         self.interned.clear();
         for (id, scalar) in self.scalars.iter().enumerate() {
             self.interned
                 .insert((scalar.ty, scalar.range, scalar.operation.clone()), id);
         }
-        mapping
     }
 
     fn insert(&mut self, ty: ScalarType, range: Option<Range>, operation: Operation) -> ScalarId {

@@ -183,6 +183,14 @@ pub fn host_forms(condition: u8) -> Vec<(u64, FlagTest)> {
     forms
 }
 
+/// `host_forms` of each condition, made once: a block borrows them and makes
+/// no heap call for them (3e DESIGN.md J11).
+pub fn host_forms_of(condition: u8) -> &'static [(u64, FlagTest)] {
+    static FORMS: std::sync::OnceLock<Vec<Vec<(u64, FlagTest)>>> = std::sync::OnceLock::new();
+    let forms = FORMS.get_or_init(|| (0..16).map(host_forms).collect());
+    &forms[usize::from(condition & 15)]
+}
+
 fn helper_nzcv(args: &[u128]) -> u128 {
     nzcv(args[0] as u8, args[1] as u64, args[2] as u64).into()
 }
