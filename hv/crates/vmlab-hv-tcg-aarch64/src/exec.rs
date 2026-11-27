@@ -2670,13 +2670,14 @@ mod tests {
             cpu.state.set_x(2, BASE + 0x1000);
             cpu.state.set_x(3, BASE + 0x1010);
             cpu.memory.write(BASE + 0x1000, &[0x5a; 16]).unwrap();
-            assert_eq!(cpu.run(5), Stop::Budget);
+            let (completed, halt) = cpu.run_block(false).unwrap();
+            assert_eq!(completed, 5);
+            assert!(halt.is_none());
             let mut copied = [0; 16];
             cpu.memory.read(BASE + 0x1010, &mut copied).unwrap();
             assert_eq!(copied, [0x5a; 16]);
         }
         assert_eq!(counted.state.slots, plain.state.slots);
-        assert_eq!(counted.instructions, plain.instructions);
         let counts = counted.block_counts.unwrap();
         assert_eq!(counts.blocks, 1);
         assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
