@@ -125,6 +125,20 @@ class JitReportTests(unittest.TestCase):
         self.assertEqual((report["links"], report["unlinks"], report["fills"], report["clears"]),
                          (9, 2, 5, 40))
 
+    def test_a_report_with_the_flushes_of_the_fast_tlb(self):
+        line = ('{"level":"INFO","message":"vcpu 0: JIT: 1000 instructions, 7 of them in the '
+                'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
+                '0 resets of the region, 3 ms of compiling; fast TLB: 900 accesses, 12 misses, '
+                '4 flushes, 6 scans, 2 ms flushing; machine: 40 exclusive loads, 38 exclusive '
+                'stores, 5 code mails, 7 code pages, 2 ms waiting"}\n')
+        with tempfile.TemporaryDirectory() as run_dir:
+            with open(Path(run_dir) / "stderr.log", "w") as log:
+                log.write(line)
+            report = lib.last_jit_report(run_dir)
+        self.assertEqual((report["tlb_accesses"], report["tlb_misses"], report["tlb_flushes"],
+                          report["tlb_scans"], report["tlb_flush_ms"]), (900, 12, 4, 6, 2))
+        self.assertEqual(report["exclusive_loads"], 40)
+
     def test_a_report_with_what_the_cpus_of_a_machine_told_each_other(self):
         line = ('{"level":"INFO","message":"vcpu 1: JIT: 1000 instructions, 7 of them in the '
                 'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
