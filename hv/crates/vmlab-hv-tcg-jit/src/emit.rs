@@ -1946,6 +1946,11 @@ fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
     })
 }
 
+/// The code of a block, the labels of the jumps that chain and of their
+/// stubs, the count of comparisons that became host flags, and the count of
+/// lazy conditions that are inline.
+pub type Emitted = (Asm, Vec<(Label, Label)>, u64, u64);
+
 /// Emit the code of `shape`. `exit` is the address of the common exit of
 /// the trampoline. `host_flags` turns on the forms of H8. With the code, the
 /// labels of the jumps that chain and of their stubs, in the order of their
@@ -1957,7 +1962,7 @@ pub fn emit(
     features: Features,
     defect: Defect,
     host_flags: bool,
-) -> Result<(Asm, Vec<(Label, Label)>, u64, u64), Refused> {
+) -> Result<Emitted, Refused> {
     let Analysis {
         mut uses,
         effects,
