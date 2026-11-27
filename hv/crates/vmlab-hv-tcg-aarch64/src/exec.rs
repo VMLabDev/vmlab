@@ -1608,6 +1608,10 @@ pub struct Cpu<M> {
     pub again_same: u64,
     pub again_other: u64,
     pub stale: u64,
+    pub ops_total: u64,
+    pub generic_total: u64,
+    pub effect_total: u64,
+    pub instr_total: u64,
     seen: FastMap<(u64, Context), u64>,
     /// The host time that the translations took, in nanoseconds.
     pub translation_ns: u64,
@@ -1656,6 +1660,10 @@ impl<M: Memory> Cpu<M> {
             again_same: 0,
             again_other: 0,
             stale: 0,
+            ops_total: 0,
+            generic_total: 0,
+            effect_total: 0,
+            instr_total: 0,
             seen: FastMap::default(),
             translation_ns: 0,
             unknown: std::collections::BTreeSet::new(),
@@ -2222,6 +2230,11 @@ impl<M: Memory> Cpu<M> {
         let mut compiled =
             compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
         compiled.stamp = self.memory.code_stamp(phys, count.max(1) as usize * 4);
+        self.ops_total += compiled.ops.len() as u64;
+        self.generic_total += compiled.ops.iter().filter(|op| op.code == Code::Generic).count() as u64;
+        self.effect_total += compiled.ops.iter().filter(|op| op.code as u8 >= block::FIRST_EFFECT).count() as u64;
+        self.instr_total += u64::from(count) + 2 * (compiled.inputs.len() + compiled.outputs.len()) as u64 * 0;
+        let _ = &compiled.inputs;
         compiled.epoch = self.epoch;
         Ok(compiled)
     }
