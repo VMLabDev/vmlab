@@ -4,10 +4,10 @@
 //! operations.
 
 use super::*;
+use crate::asm::Cond;
 use emit::THUNK_ACCESS;
 use std::sync::atomic::AtomicU32;
 use tlb::FastTlb;
-use crate::asm::Cond;
 use vmlab_hv_tcg_ir::block::{Code, Op, Place, Slot, op_in_frame, step_unchecked};
 
 /// The guest memory of the tests: `PAGES` pages at the virtual address

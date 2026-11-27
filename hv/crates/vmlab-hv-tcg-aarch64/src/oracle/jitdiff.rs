@@ -223,12 +223,7 @@ pub fn run_with(seed: u64, rounds: u64, options: Options) -> Result<Report, Diff
     run_rounds(seed, rounds, options, false)
 }
 
-fn run_rounds(
-    seed: u64,
-    rounds: u64,
-    options: Options,
-    flags: bool,
-) -> Result<Report, Difference> {
+fn run_rounds(seed: u64, rounds: u64, options: Options, flags: bool) -> Result<Report, Difference> {
     let mut generator = Generator::new(seed);
     let formats = if flags { flag_formats() } else { formats() };
     let mut report = Report::default();

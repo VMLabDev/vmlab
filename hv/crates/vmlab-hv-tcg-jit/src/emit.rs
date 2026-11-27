@@ -1268,7 +1268,6 @@ impl Emitter<'_> {
         self.define(op.dst, &all, at);
     }
 
-
     /// The words that a stub puts into the frame: those of `reads`, from
     /// where they are now. The code changes no register but RDX.
     fn home_all(&mut self, reads: &[Slot]) {
