@@ -107,12 +107,7 @@ impl Stamps {
                 // Only a write makes an odd word even, so an exchange that
                 // fails found it even already.
                 ended |= word
-                    .compare_exchange(
-                        now,
-                        now.wrapping_add(1),
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
+                    .compare_exchange(now, now.wrapping_add(1), Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok();
             }
         }

@@ -4582,7 +4582,8 @@ impl<M: Memory> Cpu<M> {
         // page when its code is read. A page that this CPU holds code of
         // was told before.
         if self.side.shootdown.is_some() && !self.side.holds_code(phys) {
-            self.side.broadcast(Some(Invalidation::CodePage(phys & !0xfff)));
+            self.side
+                .broadcast(Some(Invalidation::CodePage(phys & !0xfff)));
         }
         let stamp = self.memory.code_stamp(phys, self.stamp_len(phys));
         let mut builder = Builder::new(context, pc);

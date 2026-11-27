@@ -640,10 +640,17 @@ fn count_on_two_cpus(jit: bool) {
         u32::from_le_bytes(bytes)
     };
     assert_eq!(word(DATA), 0, "the lock is free");
-    assert_eq!(word(DATA + 0x40), 2 * ROUNDS as u32, "under the lock, jit {jit}");
-    assert_eq!(word(DATA + 0x80), 2 * ROUNDS as u32, "exclusive increments, jit {jit}");
+    assert_eq!(
+        word(DATA + 0x40),
+        2 * ROUNDS as u32,
+        "under the lock, jit {jit}"
+    );
+    assert_eq!(
+        word(DATA + 0x80),
+        2 * ROUNDS as u32,
+        "exclusive increments, jit {jit}"
+    );
 }
-
 
 /// `LDR Xt, [Xn]`.
 fn ldr64(rt: u32, rn: u32) -> u32 {
@@ -698,32 +705,32 @@ fn a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored() {
     let bus = GuestBus::new(memory.clone(), host_with_latch(), 2).unwrap();
     assert!(bus.writes_straight());
     let writer = [
-        asm::add(3, 3, 1),    // 0 the next round
-        and_low16(7, 3),      // 1
-        orr64(8, 6, 7, 5),    // 2 movz x1, #round
-        str32(8, 4, 0),       // 3 into the function
-        str64(3, 10),         // 4 publish the round
-        ldr64(9, 11),         // 5 wait for its acknowledgement
-        cmp64(9, 3),          // 6
-        b_cond(true, -2),     // 7
-        cmp64(3, 14),         // 8
-        b_cond(true, -9),     // 9
-        asm::hvc(0),          // 10
+        asm::add(3, 3, 1), // 0 the next round
+        and_low16(7, 3),   // 1
+        orr64(8, 6, 7, 5), // 2 movz x1, #round
+        str32(8, 4, 0),    // 3 into the function
+        str64(3, 10),      // 4 publish the round
+        ldr64(9, 11),      // 5 wait for its acknowledgement
+        cmp64(9, 3),       // 6
+        b_cond(true, -2),  // 7
+        cmp64(3, 14),      // 8
+        b_cond(true, -9),  // 9
+        asm::hvc(0),       // 10
     ];
     let runner = [
-        ldr64(5, 10),         // 0 wait for a round
-        cmp64(5, 12),         // 1
-        b_cond(false, -2),    // 2
-        orr64(12, 31, 5, 0),  // 3
-        asm::blr(2),          // 4 the function
-        and_low16(13, 5),     // 5
-        cmp64(1, 13),         // 6
-        b_cond(true, 5),      // 7 old code ran
-        str64(5, 11),         // 8 acknowledge
-        cmp64(5, 14),         // 9
-        b_cond(true, -10),    // 10
-        asm::hvc(0),          // 11
-        asm::hvc(1),          // 12
+        ldr64(5, 10),        // 0 wait for a round
+        cmp64(5, 12),        // 1
+        b_cond(false, -2),   // 2
+        orr64(12, 31, 5, 0), // 3
+        asm::blr(2),         // 4 the function
+        and_low16(13, 5),    // 5
+        cmp64(1, 13),        // 6
+        b_cond(true, 5),     // 7 old code ran
+        str64(5, 11),        // 8 acknowledge
+        cmp64(5, 14),        // 9
+        b_cond(true, -10),   // 10
+        asm::hvc(0),         // 11
+        asm::hvc(1),         // 12
     ];
     for (at, words) in [
         (WRITER, &writer[..]),
