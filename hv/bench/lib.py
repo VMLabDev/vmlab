@@ -948,7 +948,13 @@ JIT_REPORT = re.compile(
     r"(?:; compiles: (?P<compiles_first>\d+) first, (?P<compiles_region>\d+) after a drop of "
     r"the region, (?P<compiles_invalidated>\d+) after an invalidation, (?P<compiles_evicted>\d+) "
     r"after an eviction, (?P<memory_resets>\d+) drops for the memory; translations: "
-    r"(?P<translations>\d+) blocks, (?P<translation_ms>\d+) ms)?")
+    r"(?P<translations>\d+) blocks, (?P<translation_ms>\d+) ms)?"
+    # The returns to the loop by reason, and the jump cache kept across a new
+    # address space (card J10), when the line has them.
+    r"(?:; returns: (?P<jump_served>\d+) jump cache misses served in code, "
+    r"(?P<returns_terminal>\d+) at a block that the loop ends, (?P<returns_done>\d+) with "
+    r"nothing to chain to, (?P<returns_budget>\d+) at the budget, (?P<returns_kicked>\d+) "
+    r"kicked; (?P<jump_spaces>\d+) changes of the address space kept the jump cache)?")
 
 
 def last_jit_report(run_dir):

@@ -164,12 +164,14 @@ impl Region {
 
     /// The generation of the code written now: that of the part it goes
     /// into.
+    #[inline]
     pub fn generation(&self) -> u64 {
         self.generations[self.current]
     }
 
     /// The generation of the code at `address`, a byte of the executable
     /// view after the floor. `None`: another address.
+    #[inline]
     pub fn generation_of(&self, address: u64) -> Option<u64> {
         let offset = usize::try_from(address.checked_sub(self.exec as u64)?).ok()?;
         self.part_of(offset).map(|index| self.generations[index])
@@ -264,6 +266,7 @@ impl Region {
     }
 
     /// Whether `address` is inside the executable view.
+    #[inline]
     pub fn contains(&self, address: u64) -> bool {
         let start = self.exec as u64;
         (start..start + self.len as u64).contains(&address)
