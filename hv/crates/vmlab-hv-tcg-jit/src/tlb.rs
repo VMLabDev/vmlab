@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn an_empty_entry_matches_no_address() {
         let tlb = FastTlb::new();
-        for va in [0, u64::MAX, u64::MAX & !0xfff, u64::MAX - 7] {
+        for va in [0, u64::MAX, !0xfff, u64::MAX - 7] {
             for bytes in [1u8, 2, 4, 8] {
                 assert!(tlb.lookup(0, false, va, bytes).is_none());
                 assert!(tlb.lookup(1, true, va, bytes).is_none());
