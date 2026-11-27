@@ -133,11 +133,22 @@ impl FwCfg {
     /// Register the firmware inputs of an aarch64 `virt` machine. The files
     /// get the selectors that QEMU gives them: directory order from 0x20.
     pub fn for_virt(memory: GuestMemory, platform: &crate::virt::Platform) -> Result<Self, String> {
+        Self::for_virt_files(memory, platform, crate::virt::files(platform)?)
+    }
+
+    /// As `for_virt`, with `files` in place of the generated ones, in
+    /// directory order: the boot lockstep gives its follower the files of
+    /// its leader.
+    pub fn for_virt_files(
+        memory: GuestMemory,
+        platform: &crate::virt::Platform,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<Self, String> {
         let mut device = Self::new(memory);
         for (key, data) in crate::virt::numeric_items(platform)? {
             device.add_numeric(key, data)?;
         }
-        for (name, data) in crate::virt::files(platform)? {
+        for (name, data) in files {
             device.add_file(&name, data, false)?;
         }
         Ok(device)
@@ -315,6 +326,46 @@ impl BusDevice for FwCfg {
                 self.state.dma_address = 0;
                 self.dma(address);
             }
+            _ => {}
+        }
+    }
+}
+
+/// The size of the register block of [`FwCfgMmio`].
+pub const MMIO_SIZE: u64 = 0x18;
+
+/// fw_cfg as a memory-mapped device, as the aarch64 `virt` machine has it:
+/// the data register at 0 (a read of any width takes that many bytes of the
+/// item), the selector at 8 and the DMA address at 16, both big-endian.
+pub struct FwCfgMmio(pub FwCfg);
+
+impl FwCfgMmio {
+    /// Put the item stream back to where a reset leaves it.
+    pub fn rewind(&mut self) {
+        self.0.select(0);
+        self.0.state.dma_address = 0;
+    }
+}
+
+impl BusDevice for FwCfgMmio {
+    fn read(&mut self, offset: u64, data: &mut [u8]) {
+        data.fill(0);
+        let len = data.len() as u64;
+        if offset.checked_add(len).is_some_and(|end| end <= 8) {
+            self.0.stream_read(data);
+        } else if offset >= 16 && offset.checked_add(len).is_some_and(|end| end <= 24) {
+            // A read of the DMA register gives the signature.
+            let signature = b"QEMU CFG";
+            let at = offset as usize - 16;
+            data.copy_from_slice(&signature[at..at + data.len()]);
+        }
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        match (offset, data.len()) {
+            (8, 2) => self.0.select(u16::from_be_bytes(data.try_into().unwrap())),
+            // The DMA register sits at 4 of the port block: 16 here.
+            (16, 8) | (16, 4) | (20, 4) => self.0.write(offset - 12, data),
             _ => {}
         }
     }

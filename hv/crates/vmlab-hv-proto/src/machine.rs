@@ -408,6 +408,9 @@ pub enum Machine {
     Microvm,
     Q35,
     Pc,
+    /// The aarch64 `virt` machine: a GICv2, a PL011, fw_cfg over MMIO, two
+    /// flash banks and a generic PCIe host.
+    Virt,
 }
 
 impl Machine {
@@ -454,6 +457,9 @@ impl PitTicks {
 pub enum FirmwareKind {
     Seabios,
     Ovmf,
+    /// The UEFI firmware of an aarch64 `virt` machine, in its two flash
+    /// banks: `code` and `vars`.
+    Aavmf,
 }
 
 /// Bus-zero BDF. Range and collision checks belong to machine validation.

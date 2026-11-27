@@ -1,5 +1,6 @@
-//! The KVM virtual machine: guest memory, vCPU threads, the I/O buses, the
-//! machine model, the control server and snapshot orchestration.
+//! The virtual machine: guest memory, vCPU threads on KVM or on the
+//! emulator, the I/O buses, the machine models, the control server and
+//! snapshot orchestration.
 
 pub mod a20;
 pub mod acpi;
@@ -35,6 +36,7 @@ pub mod snapshot;
 pub mod vcpu;
 mod vdisplay;
 mod vfio;
+pub mod virt;
 pub mod vm;
 
 #[cfg(test)]

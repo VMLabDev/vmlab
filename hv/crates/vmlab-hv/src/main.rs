@@ -110,6 +110,8 @@ mod macos_hwref;
 mod pc_acceptance;
 #[cfg(test)]
 mod pc_hwref;
+#[cfg(test)]
+mod virt_acceptance;
 
 /// Raise the soft descriptor limit to the hard one. A guest GPU resource
 /// holds host descriptors for as long as the guest keeps it, and a guest may

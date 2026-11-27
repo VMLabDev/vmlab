@@ -73,8 +73,8 @@ fn internal(error: impl std::fmt::Display) -> (ErrorCode, String) {
 pub(crate) fn handle(shared: &Arc<VmShared>, request: DebugRequest) -> Outcome {
     if !shared
         .kvm
-        .kvm
-        .check_extension(kvm_ioctls::Cap::SetGuestDebug)
+        .get()
+        .is_some_and(|kvm| kvm.kvm.check_extension(kvm_ioctls::Cap::SetGuestDebug))
     {
         return Outcome::Error {
             code: ErrorCode::Unsupported,

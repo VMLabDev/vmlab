@@ -150,6 +150,29 @@ impl State {
     }
 }
 
+/// A unix socket as the host end of a serial port, for a UART model other
+/// than the 16550A: what the guest sends goes to the client of the socket,
+/// and what the client sends is there for `read`. Without a client the
+/// output is dropped, as on a cable that nobody holds.
+pub struct HostSocket(Arc<Mutex<SocketBackend>>);
+
+impl HostSocket {
+    /// Bind the socket. An existing path is an error and is never replaced.
+    pub fn bind(path: &Path) -> io::Result<Self> {
+        Ok(Self(Arc::new(Mutex::new(SocketBackend::bind(path)?))))
+    }
+
+    /// Where the UART writes.
+    pub fn output(&self) -> SerialOut {
+        SerialOut::new(Box::new(socket::SocketOut(self.0.clone())))
+    }
+
+    /// Take bytes that the client sent, without waiting: how many.
+    pub fn read(&self, bytes: &mut [u8]) -> usize {
+        self.0.lock().read_input(bytes)
+    }
+}
+
 /// One 16550A UART on an eight-byte port-I/O window.
 pub struct Serial {
     id: String,
