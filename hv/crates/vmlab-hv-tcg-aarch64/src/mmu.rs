@@ -512,8 +512,9 @@ impl From<Fault> for Miss {
     }
 }
 
-/// Log2 of the entries of the TLB of a regime.
-const TLB_BITS: u32 = 10;
+/// Log2 of the entries of the TLB of a regime. 2,048 entries of 40 bytes
+/// are 80 KiB, which a host core keeps in its L2 cache.
+const TLB_BITS: u32 = 11;
 
 /// The bits of a page number that an invalidation by address names: the
 /// address bits 55 to 12.
@@ -525,6 +526,9 @@ pub struct Mmu {
     tlbs: [Tlb; REGIMES],
     controls: Controls,
     asid: u16,
+    /// What the memory named its host pages when the entries took theirs
+    /// (`Memory::host_mapping`).
+    mapping: Option<(u64, u64)>,
 }
 
 impl Mmu {
@@ -534,6 +538,19 @@ impl Mmu {
             tlbs: [Tlb::new(TLB_BITS)],
             controls,
             asid: controls.asid(),
+            mapping: None,
+        }
+    }
+
+    /// Drop every entry when the memory names other host pages than those
+    /// that the entries keep: an owner can put another memory under the CPU
+    /// between two runs.
+    #[inline]
+    pub fn sync_memory<M: Memory>(&mut self, memory: &M) {
+        let mapping = memory.host_mapping();
+        if mapping != self.mapping {
+            self.flush();
+            self.mapping = mapping;
         }
     }
 
@@ -595,6 +612,17 @@ impl Mmu {
             .then_some((entry.phys | offset, entry.flags as u8))
     }
 
+    /// The entry of the page of `va` when it has one of the bits `need`, the
+    /// access stays inside the page and the page is RAM that the host
+    /// reaches straight (`Entry::host`).
+    #[inline(always)]
+    pub fn hit_host(&self, va: u64, bytes: u64, need: u8) -> Option<&Entry> {
+        let entry = self.tlbs[0].lookup(va >> PAGE_BITS, self.asid)?;
+        let offset = va & 0xfff;
+        (entry.host != 0 && entry.flags as u8 & need != 0 && offset + bytes <= 0x1000)
+            .then_some(entry)
+    }
+
     /// The translation of the page of `va`, from the TLB or from a walk,
     /// without a permission check. A walk that succeeds fills the TLB.
     /// `kind` says whether `va` is an instruction address.
@@ -623,9 +651,18 @@ impl Mmu {
             });
         }
         let translation = self.walk(memory, va, execute)?;
+        // The entry keeps the host page only for the memory that the
+        // entries were synchronised with.
+        let host = if memory.host_mapping() == self.mapping {
+            memory.host_page(translation.page & !0xfff)
+        } else {
+            None
+        };
         self.tlbs[0].insert(Entry {
             page: va >> PAGE_BITS,
             phys: translation.page,
+            host: host.map_or(0, |page| page.base),
+            watch: host.map_or(0, |page| page.watch),
             asid: self.asid,
             span: translation.span,
             // The level of the descriptor rides above the permissions.
