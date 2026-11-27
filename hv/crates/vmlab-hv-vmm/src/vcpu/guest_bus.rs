@@ -77,6 +77,8 @@ struct Region {
 // SAFETY: `bitmap` points into a region that `Shared::memory` keeps alive,
 // and `WriteDiscard` is `Sync`. `host` is a plain address.
 unsafe impl Send for Region {}
+// SAFETY: as for `Send`: the only pointer is to a `Sync` value that lives
+// as long as the region.
 unsafe impl Sync for Region {}
 
 /// Copy `bytes.len()` bytes of guest RAM at the host address `from`. An
@@ -87,7 +89,7 @@ unsafe impl Sync for Region {}
 /// `from` and the bytes after it are inside a live mapping of guest RAM.
 #[inline(always)]
 unsafe fn copy_in(from: usize, bytes: &mut [u8]) {
-    let aligned = from % bytes.len().max(1) == 0;
+    let aligned = from.is_multiple_of(bytes.len().max(1));
     // SAFETY: the caller's promise. Other threads (devices, CPUs) can write
     // the same RAM, so the access is volatile, as vm-memory's are.
     unsafe {
@@ -121,7 +123,7 @@ unsafe fn copy_in(from: usize, bytes: &mut [u8]) {
 /// RAM.
 #[inline(always)]
 unsafe fn copy_out_to(to: usize, bytes: &[u8]) {
-    let aligned = to % bytes.len().max(1) == 0;
+    let aligned = to.is_multiple_of(bytes.len().max(1));
     // SAFETY: the caller's promise, as in `copy_in`.
     unsafe {
         match (bytes.len(), aligned) {
