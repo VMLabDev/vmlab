@@ -149,12 +149,21 @@ impl Place {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Kind {
+/// What a generic operation computes, for an emitter that has inline forms
+/// of some of them (3e DESIGN.md J6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
     Unary(Unary),
     Binary(Binary),
-    Slice { offset: u16 },
-    Concat { low_width: u16 },
+    /// `(a >> offset) & mask`.
+    Slice {
+        offset: u16,
+    },
+    /// `((a << low_width) | b) & mask`.
+    Concat {
+        low_width: u16,
+    },
+    /// `b` where `a` is not zero, else the third operand.
     Select,
 }
 
@@ -170,6 +179,33 @@ pub struct Generic {
 }
 
 impl Generic {
+    /// A generic operation as the lowering makes one: for the tests of an
+    /// emitter, which build blocks without a graph.
+    pub fn new(kind: Kind, ty: ScalarType, mask: u128, args: [Place; 3], dst: Place) -> Self {
+        Self {
+            kind,
+            ty,
+            mask,
+            args,
+            dst,
+        }
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// The type of the result.
+    pub fn ty(&self) -> ScalarType {
+        self.ty
+    }
+
+    /// The mask of the result of every kind but a binary operation, which
+    /// masks by its type.
+    pub fn mask(&self) -> u128 {
+        self.mask
+    }
+
     /// The words that the operation reads: its three operands, of which
     /// those it does not use are the word 0.
     pub fn args(&self) -> [Place; 3] {

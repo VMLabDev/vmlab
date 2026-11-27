@@ -2237,3 +2237,93 @@ subtests that fail on QEMU, as in card C13.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn. QEMU ran as the black box of the lockstep and of
   kvm-unit-tests only.
+
+## Card J6, #1157 (2026-11-27)
+
+The remaining forms of the JIT (3e DESIGN.md J6): no block of a boot runs
+in the interpreter for a missing form any more. The measured rows are in J6
+of the design.
+
+### What the emitter has now
+
+- `RBIT` (`Code::ReverseBits`) inline on every x86-64 host: the bits of
+  each byte swapped in halves of 1, 2 and 4 bits, then `bswap`. It was the
+  one form that the boots of J1 to J4 refused (361 blocks of the string
+  functions of the kernel and glibc).
+- The generic operations of two words that a block makes most, inline,
+  each value in two registers: `And`, `Or`, `Xor`, `Add` and `Sub` of a
+  bitvector (`adc`, `sbb` for the high word), `Equal`, `NotEqual`, `Slice`,
+  `Concat`, `BitNot`, `Truncate` and `Select`. The other kinds (a multiply,
+  a shift, a division of two words, a value of the type `Integer`) stay
+  calls of the thunk, which is no fallback of the block.
+- `LoadPair` and `StorePair` (every access of 16 bytes that is not
+  exclusive: `LDP`, `STP` of X registers and the Q forms) inline over the
+  fast TLB. A pair is looked up as an access of 8 bytes and misses at the
+  last 8 bytes of its page, so its two words are two accesses of 8 bytes of
+  the host in one page. `load_pair` and `store_pair` fill the fast TLB
+  where `load` and `store` do. A watched page and a kept access (`LOGGED`)
+  see one access of 16 bytes, as the interpreter logs it.
+- A direct System V call of each helper kind (H12): `Effect::direct` names
+  a function of the thunk's type, and the code calls it in place of the
+  thunk. `pure_call` runs a `HelperFn::Pure`, `ordered_call` a
+  `HelperFn::Ordered` with the state, which it reads from the first field
+  of `Env` (now `repr(C)`).
+- Shared interfaces changed: `vmlab_hv_tcg_ir::block::Kind` is public, with
+  `Generic::kind`, `ty`, `mask` and `Generic::new`; `jit::Effect` has the
+  field `direct`; `asm::Alu` has `Adc` and `Sbb`.
+- Not done: the eager write-back of H3, which the card leaves optional. It
+  was neither built nor measured.
+- A host without `lzcnt`, `bmi1` or `popcnt` still refuses the blocks that
+  count bits (`Features`). Helios and every host of the bench have them.
+
+### Equal behaviour
+
+- K1, the O3 lockstep with the JIT on (`VMLAB_HV_JIT=1 just
+  tcg-a64-lockstep <group> 100000 1`, seed 1, 100,000 a class) at
+  `078143df`, no difference in any, and no refused block in any that
+  prints the counts of the JIT (all but `loadstore`): `c1` 1,439,552
+  instructions (the integer group, with `RBIT`), `fp` 1,600,956, `simd`
+  4,702,716, `crypto` 700,320 (the helper calls, now direct), `system`
+  14,143,360 (with the exceptions), and `loadstore` 5,227,771 in
+  2,980,742 rounds (the pairs, inline).
+- K2 (`just tcg-a64-jit-diff 300000 3e0001`) at `078143df`: 300,000
+  rounds, 2,792,656 instructions, 665,512 blocks compiled, none refused, no
+  difference.
+- K3 on a Debian 13 boot at `078143df` (`VMLAB_HV_JIT_CHECK=1`,
+  `VMLAB_HV_JIT_CHECK_RUNS=1000`, the bench, cores 16 to 19): agent ready
+  after 144.2 s with no difference; 137.3 million checked runs (658.5
+  million instructions) up to the last counter line, at 18.0e9
+  instructions; no block refused.
+- The fallback count (H2b) of the boots with the JIT on is zero: J6 of the
+  design. Fedora 44 at one vCPU did not reach agent ready in either of two
+  runs of this card or in the run of `next` beside the first: each fell into
+  emergency mode on a 90 s device timeout (`boot-efi.mount`, `boot.mount`),
+  as card #1048 found for Fedora at 1 and 2 vCPUs. Its counts are those of
+  29e9 to 31e9 instructions, past the kernel and into systemd, of the 30.7e9
+  that a whole boot runs (3d:M2).
+- `just ci::check` at `078143df`: exit 0.
+
+### Tests
+
+- `vmlab-hv-tcg-jit`: `every_inline_form_computes_what_the_interpreter_computes`
+  takes `ReverseBits`; `every_generic_form_computes_what_the_interpreter_computes`
+  (20,000 single generic operations of one and two words, the inline kinds
+  and some through the thunk); the random blocks of
+  `random_blocks_spill_call_and_leave_as_the_interpreter_does` and
+  `inlined_loads_and_stores_leave_what_the_interpreter_leaves` have generic
+  operations of two words, outputs of two words, pairs at addresses that
+  hit, miss, cross a page and leave the memory, and helper calls of which
+  half are direct; `a_direct_call_runs_its_function_and_not_the_thunk`;
+  `adc` and `sbb` against `llvm-mc`.
+- `tests/jit.rs` (K2, K3 on the streams) runs over the new forms.
+
+### Sources read for this card
+
+- The state of `vmlab-hv-tcg-jit`, of `vmlab-hv-tcg-ir::block`, of this
+  crate and of the bench. The Intel 64 and IA-32 Architectures Software
+  Developer's Manual, volume 2, for `ADC`, `SBB`, `BSWAP` and `CMOVcc`, and
+  the System V AMD64 ABI for the direct call.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the oracle of K1.

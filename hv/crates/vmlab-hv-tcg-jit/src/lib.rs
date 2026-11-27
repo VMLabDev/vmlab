@@ -6,10 +6,11 @@
 //! - `asm`: the assembler.
 //! - `region`: the code memory, one `memfd` mapped twice (H13d, Q3).
 //! - `emit`: the one-pass allocator with its spill (H3), the inline forms of
-//!   the operations of one word, the guards and their stubs (H9), the
-//!   inlined loads and stores of 1 to 8 bytes over the fast TLB (H7), the
-//!   flags of H8 (a comparison as host flags, and the inline forms of a lazy
-//!   condition), and the thunk through which every other effect runs.
+//!   the operations of one word and of the common ones of two words, the
+//!   guards and their stubs (H9), the inlined loads and stores of 1 to 16
+//!   bytes over the fast TLB (H7), the flags of H8 (a comparison as host
+//!   flags, and the inline forms of a lazy condition), the direct calls of
+//!   helpers (H12), and the thunk through which every other effect runs.
 //! - `tlb`: the layout of the fast TLB and its fill and flush (H7).
 //! - `perf`: the perf map (H13e), which names each block for `perf`.
 //! - The trampoline here (H4): `enter` saves the registers that the System V
