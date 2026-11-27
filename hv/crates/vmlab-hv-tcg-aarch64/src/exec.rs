@@ -5359,8 +5359,9 @@ mod tests {
     /// that the waiting CPU takes then ends its chained run, so that the
     /// next run empties the jump cache; without one the run goes on. The
     /// other CPU is a thread that answers the mailbox: it posts
-    /// `TLBI VMALLE1IS` while the store waits, waits until it was taken,
-    /// and then takes the code mail.
+    /// `TLBI VMALLE1IS` while the store waits, with the kick of the post
+    /// sent to another seat, waits until it was taken, and then takes the
+    /// code mail.
     #[test]
     fn a_tlbi_taken_while_a_store_waits_ends_the_chained_run() {
         use crate::shootdown::{Invalidation, Shootdown};
@@ -5387,6 +5388,11 @@ mod tests {
                         std::hint::spin_loop();
                     }
                     if tlbi {
+                        // The post kicks the seat of the CPU too, and so
+                        // ends its run by itself. Without that kick only
+                        // the thunk sees the invalidation (a kick can be
+                        // lost, J7a).
+                        shootdown.seat(0, &Arc::new(jit::seat::Seat::new()));
                         shootdown.post(1, Invalidation::All);
                         while shootdown.has_mail(0) {
                             std::hint::spin_loop();
