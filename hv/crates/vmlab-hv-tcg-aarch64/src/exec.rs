@@ -76,7 +76,7 @@ const CACHE_ENTRIES: usize = 1 << 14;
 /// The heap bytes of the young generation of the store of a cache: the
 /// blocks that a block of another PC took the entry of (`Cache`). The old
 /// generation holds as much again at most.
-const SPARE_BYTES: usize = 64 << 20;
+const SPARE_BYTES: usize = 256 << 20;
 
 /// The pages that hold translated code are a bit set over the low bits of
 /// the page number. Two pages with the same low bits share a bit, which
