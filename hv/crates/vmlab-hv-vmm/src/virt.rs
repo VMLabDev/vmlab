@@ -774,13 +774,17 @@ pub fn assemble(
         // Pin INTA of a slot is one of the four lines of the host, by the
         // slot (the `interrupt-map` of the device tree).
         let line = map::PCI_INTX_SPI + u32::from(slot) % 4;
+        // QEMU's virt presents a virtio function on its root bus as a
+        // transitional one (1af4:1000 to 1af4:103f, with an I/O BAR, read
+        // from its monitor). AAVMF's driver of a modern-only function wants
+        // a subsystem ID of 0x40 or more, so it would bind none of ours.
         Ok((
             slot,
             function,
             PciWiring {
                 msi: msi.clone(),
                 intx: Some(spi(line)),
-                transitional: false,
+                transitional: true,
                 msix_vectors: vectors,
                 doorbells: None,
             },
