@@ -356,13 +356,7 @@ extern "sysv64" fn fold<const N: usize>(a: u64, b: u64, c: u64, d: u64, e: u64, 
 /// The address of `fold` for `count` words.
 fn fold_of(count: usize) -> u64 {
     let functions: [RegisterFn; 7] = [
-        fold::<0>,
-        fold::<1>,
-        fold::<2>,
-        fold::<3>,
-        fold::<4>,
-        fold::<5>,
-        fold::<6>,
+        fold::<0>, fold::<1>, fold::<2>, fold::<3>, fold::<4>, fold::<5>, fold::<6>,
     ];
     functions[count] as usize as u64
 }

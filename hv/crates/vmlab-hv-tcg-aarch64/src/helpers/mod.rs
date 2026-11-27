@@ -10,6 +10,8 @@ pub mod softfloat;
 /// The function that compiled code calls with the words of the arguments
 /// of `helper` in registers, for the helpers that have one (3e DESIGN.md
 /// J13): each operation of `crypto`.
-pub fn in_registers_of(helper: &vmlab_hv_tcg_ir::native::Helper) -> Option<vmlab_hv_tcg_jit::RegisterFn> {
+pub fn in_registers_of(
+    helper: &vmlab_hv_tcg_ir::native::Helper,
+) -> Option<vmlab_hv_tcg_jit::RegisterFn> {
     crypto::in_registers_of(helper)
 }

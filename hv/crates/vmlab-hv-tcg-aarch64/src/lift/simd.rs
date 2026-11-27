@@ -215,7 +215,11 @@ fn inline_word(b: &mut Builder, code: Code, bits: u32, x: ScalarId, y: ScalarId)
     let tops = b.imm(64, top);
     match code.op {
         Op::Add | Op::Sub if bits == 64 => {
-            let operation = if code.op == Op::Add { Binary::Add } else { Binary::Sub };
+            let operation = if code.op == Op::Add {
+                Binary::Add
+            } else {
+                Binary::Sub
+            };
             b.binary(64, operation, x, y)
         }
         // The lanes without their top bits, which cannot carry out of the
@@ -240,7 +244,11 @@ fn inline_word(b: &mut Builder, code: Code, bits: u32, x: ScalarId, y: ScalarId)
             b.binary(64, Binary::Xor, difference, borrow)
         }
         Op::CmEq | Op::CmTst => {
-            let operation = if code.op == Op::CmEq { Binary::Xor } else { Binary::And };
+            let operation = if code.op == Op::CmEq {
+                Binary::Xor
+            } else {
+                Binary::And
+            };
             let t = b.binary(64, operation, x, y);
             // The top bit of a lane: set when some bit of the lane is.
             let low = b.binary(64, Binary::And, t, rest);
