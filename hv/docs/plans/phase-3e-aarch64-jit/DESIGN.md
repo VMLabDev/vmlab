@@ -36,7 +36,8 @@ description.
   to 160 µs to compile a block, our emitter 0.2 to 1.1 µs. Cranelift's code is
   8 to 53 % faster on a block alone. Chaining and lazy flags are worth more
   than that (1.25 to 2.1 times and 1.2 to 1.7 times) and do not depend on the
-  back end. This changes D5, so it is question Q1 for the operator.
+  back end. This changes D5. The operator decided it on 2026-11-27 (Q1): our
+  own emitter.
 - **What the JIT can reach.** *Est.*: 250 to 450 MIPS on a boot and 1,500 to
   3,000 MIPS on CoreMark after cards J1 to J7. The first useful bar (T1, about
   150 MIPS on a boot) is inside that. D1 on a boot (the boot time of QEMU) is
@@ -119,8 +120,8 @@ that". 150 MIPS is 2.8 times the measured 54, which gives a margin over the
 factor of two. At 150 MIPS the largest boot (Fedora, 30.7e9 instructions) is
 205 s of execution.
 
-At T1 the JIT is on by default for `accel: tcg` on aarch64 (Q2), and card C13
-of 3d can be accepted.
+At T1 the JIT is on by default for `accel: tcg` on aarch64 (decided by the
+operator, Q2), and card C13 of 3d can be accepted.
 
 ### T2. The bar of D1
 
@@ -177,14 +178,14 @@ Read with these facts:
 
 | Class | A JIT removes | A JIT does not remove |
 |---|---|---|
-| W1a | The fetch and dispatch of every operation, and the frame: an operation is one to three host instructions on host registers. Lazy flags (card #1142) remove flag operations that nothing reads, and compiled code turns a compare and a branch into `cmp` and `jcc` (H8). | The operations themselves. |
+| W1a, W1k | The fetch and dispatch of every operation, and the frame: an operation is one to three host instructions on host registers. Lazy flags (card #1142) remove flag operations that nothing reads, and compiled code turns a compare and a branch into `cmp` and `jcc` (H8). | The operations themselves. |
 | W1b | Chaining (H5) and the jump cache (H6) take the lookup away for most block exits. The validity check (`usable`) goes, because invalidation becomes eager (H11). | One check of the budget per block (H10). A lookup for a jump cache miss. |
 | W1c, W1d, W1e | The inlined TLB lookup (H7) reaches host memory in about 10 host instructions. The path through `GuestBus` runs only on a miss, on MMIO and on a page that holds code. | TLB misses and MMIO. |
 | W1f | Registers are read from the state at first use and written at exits. | |
 | W1g, W1h, W1i, W1j, W1l | Nothing. Translation gets 0.2 to 1.1 µs longer per block (B1). | Page walks, translation, FP and vector helpers through SoftFloat, exception entry and return, device models. |
 
-The classes that a JIT can attack are 93 % of the kernel and user space
-samples. The rest is 7 %, and it is the limit: if the 93 % cost nothing, a
+The classes that a JIT can attack (W1a to W1f and W1k) are 93.0 % of the
+kernel and user space samples. The rest (W1g to W1j and W1l) is 7.0 %, and it is the limit: if the 93 % cost nothing, a
 boot would run 14 times faster than today (about 770 MIPS). R1 follows from
 this.
 
@@ -291,7 +292,7 @@ second tier over O3 for the hottest regions, if the numbers of card J9 ask for
 it. It is not needed for T1.
 
 This replaces "Cranelift trace JIT" in D5 for aarch64, and by Y1 for riscv64.
-The operator decides it: Q1.
+The operator decided it on 2026-11-27 (Q1): O3.
 
 ## 4. The shape
 
@@ -515,7 +516,7 @@ a `memcpy` loop of glibc) before a card is written.
   where the vCPU runs. No page is writable and executable in one mapping.
   `mprotect` around each compile is rejected: two system calls cost more than
   the compile. A single mapping with all three rights is simpler and weaker.
-  The operator decides: Q3.
+  The operator decided on 2026-11-27 (Q3): the double mapping.
 - **H13e.** A perf map file (`/tmp/perf-<pid>.map`) names each compiled block
   by its guest PC, behind a switch, as D2 asks.
 
@@ -708,22 +709,24 @@ for card #1142. J6 and J7 follow J3 and J4.
 
 ## Questions for the operator
 
-Each is proposed on card #1145. The design above is written on the
-recommendation.
+Operator answers, 2026-11-27, on card #1145 (questions 6, 7 and 8). Each
+takes the recommendation, so the design above stands as written. The question
+texts on the card quote the first spike run (Cranelift 0.123.23: 25 to 160 µs,
+6 to 54 %, 39 crates). This document holds the run on Cranelift 0.138.0.
 
-- **Q1. The back end.** D5 says Cranelift. This design recommends our own
-  x86-64 emitter (O3) for aarch64 and, through the shared crate, for riscv64
-  (Y1). Options: (1) our own emitter, with Cranelift kept as a possible later
-  tier for hot regions if J9 asks for it. (2) Cranelift as D5 says, which
-  adds a tiering card before J1 and makes T1 later. (3) Both from the start.
-  Recommendation: 1.
-- **Q2. When the JIT is on by default.** Options: (1) At T1, when the four
-  templates boot with margin, with D1 tracked by the bench and decided in J9.
-  (2) Only when D1 is met. Recommendation: 1. Card C13 of 3d and the switch
-  of vmlab to vmlab-hv for aarch64 (3d:P4) wait for T1 in both cases.
-- **Q3. Memory rights of compiled code.** Options: (1) A double mapping, never
-  writable and executable in one view (H13d). (2) One mapping with read,
-  write and execute, which is simpler. Recommendation: 1.
+- **Q1. The back end: OUR OWN EMITTER.** The JIT of aarch64 and, through the
+  shared crate, of riscv64 (Y1) is our own x86-64 emitter (O3). Cranelift
+  stays possible later as a tier for hot regions if card J9 asks for it. The
+  options not taken: Cranelift as D5 said, with a tiering card before J1, and
+  both from the start.
+- **Q2. When the JIT is on by default: AT T1.** D1 stays the tracked bar, and
+  card J9 measures it and plans the rest. The option not taken: only when D1
+  is met. Card C13 of 3d and the switch of vmlab to vmlab-hv for aarch64
+  (3d:P4) wait for T1.
+- **Q3. Memory rights of compiled code: THE DOUBLE MAPPING.** A `memfd`
+  mapped twice, one view readable and writable for the emitter and one view
+  readable and executable for the vCPU (H13d). The option not taken: one
+  mapping with read, write and execute.
 
 ## How to measure again
 
