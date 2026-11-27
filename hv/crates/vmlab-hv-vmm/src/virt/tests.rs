@@ -358,3 +358,244 @@ fn a_kernel_with_the_arm64_header_is_loaded_where_it_asks() {
     assert_eq!(super::kernel_offset(&image), 0x20_0000);
     assert_eq!(super::kernel_offset(&image[..0x20]), 0x8_0000);
 }
+
+/// `MSR`s of the counting guest: TPIDR_EL1, CNTV_CVAL_EL0 and CNTV_CTL_EL0.
+const TPIDR_EL1: u16 = 0xc684;
+const CNTV_CVAL_EL0: u16 = 0xdf1a;
+const CNTV_CTL_EL0: u16 = 0xdf19;
+/// The word that the counting guest counts in.
+const COUNTER: u64 = map::RAM_BASE + 0x10_0000;
+
+/// A machine whose one CPU arms its virtual timer, so that its line is high
+/// at the GIC, and then counts in RAM for ever, with the count also in
+/// TPIDR_EL1. Its vmstate disk is a qcow2 file in `dir`.
+fn counting(dir: &Path) -> (crate::vm::Vm, Vec<std::sync::Arc<parking_lot::Mutex<crate::vcpu::emulated::EmulatedVcpu>>>) {
+    let mut words = asm::load(1, COUNTER).to_vec();
+    words.extend(asm::load(4, 1));
+    words.extend([asm::msr(CNTV_CVAL_EL0, 4), asm::msr(CNTV_CTL_EL0, 4)]);
+    words.extend([
+        ldr64(3, 1),
+        asm::add(3, 3, 1),
+        str64(3, 1),
+        asm::msr(TPIDR_EL1, 3),
+        asm::b(-4),
+    ]);
+    let desc = description(dir, 1, kernel(dir, &words));
+    let parts = super::assemble(&desc, &NoDevices, super::Options::default()).unwrap();
+    let path = dir.join("vmstate.qcow2");
+    vmlab_disk::ops::create_qcow2(&path, 16 << 20, None, None).unwrap();
+    let image: crate::factory::SharedImage = std::sync::Arc::new(parking_lot::Mutex::new(
+        vmlab_disk::open(&path, vmlab_disk::Format::Qcow2, false).unwrap(),
+    ));
+    let registry = parts.shared.snapshot_registry().unwrap();
+    parts
+        .shared
+        .set_snapshot_registry(std::sync::Arc::new(crate::snapshot::SnapshotRegistry {
+            digest: registry.digest,
+            disks: vec![crate::snapshot::DiskNode {
+                id: "vmstate".into(),
+                writable: true,
+                vmstate: true,
+                image,
+            }],
+            nodes: Vec::new(),
+        }));
+    let vcpus = parts.vcpus.clone();
+    let numbered = parts
+        .vcpus
+        .into_iter()
+        .enumerate()
+        .map(|(id, vcpu)| (id as u8, vcpu))
+        .collect();
+    let vm = crate::vm::Vm::from_emulated(parts.shared, numbered, parts.ram).unwrap();
+    (vm, vcpus)
+}
+
+fn count(handle: &crate::vm::VmHandle) -> u64 {
+    use vm_memory::Bytes;
+    handle
+        .shared()
+        .ram()
+        .unwrap()
+        .mem
+        .read_obj::<u64>(vm_memory::GuestAddress(COUNTER))
+        .unwrap()
+}
+
+/// Wait until the guest counted past `at`.
+fn counted_past(handle: &crate::vm::VmHandle, at: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while count(handle) <= at {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the guest does not count: {} after {at}",
+            count(handle)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn cpu_state(
+    vcpu: &parking_lot::Mutex<crate::vcpu::emulated::EmulatedVcpu>,
+) -> vmlab_hv_tcg_aarch64::State {
+    use crate::vcpu::VcpuBackend;
+    match vcpu.lock().state().unwrap() {
+        crate::vcpu::VcpuState::Aarch64(state) => *state,
+        crate::vcpu::VcpuState::X86 { .. } => unreachable!(),
+    }
+}
+
+fn gic_state(handle: &crate::vm::VmHandle) -> Vec<u8> {
+    use vmlab_hv_devices::Snapshot;
+    handle.shared().virt.get().unwrap().gic.lock().save_state().unwrap()
+}
+
+/// D13 on an emulated machine: a load puts RAM, the CPU with its system
+/// registers and timers, and the GIC back to the save, keeps the run state
+/// of the save, and the CPU runs on from there on caches that it built
+/// again.
+#[test]
+fn a_snapshot_of_an_emulated_machine_brings_its_cpu_gic_timer_and_ram_back() {
+    use vmlab_hv_proto::control::RunState;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut vm, vcpus) = counting(dir.path());
+    let handle = vm.handle();
+    vm.start();
+    counted_past(&handle, 1000);
+    handle.pause().unwrap();
+    let at_save = count(&handle);
+    let cpu_at_save = cpu_state(&vcpus[0]);
+    let gic_at_save = gic_state(&handle);
+    // The pause can fall between the store and the MSR.
+    let tpidr = cpu_at_save.system.regs[vmlab_hv_tcg_aarch64::sysreg::index("TPIDR_EL1")];
+    assert!(
+        tpidr == at_save || tpidr + 1 == at_save,
+        "TPIDR_EL1 {tpidr} follows the count {at_save}"
+    );
+    assert_eq!(cpu_at_save.system.timers[1].compare, 1);
+    crate::snapshot::save(&handle, "counted").unwrap();
+    assert_eq!(handle.status(), RunState::Paused);
+
+    handle.resume().unwrap();
+    counted_past(&handle, at_save + 100_000);
+    crate::snapshot::load(&handle, "counted").unwrap();
+    // The save was of a paused machine.
+    assert_eq!(handle.status(), RunState::Paused);
+    assert_eq!(count(&handle), at_save);
+    assert_eq!(
+        super::snapshot::SavedCpu::of(&cpu_state(&vcpus[0])),
+        super::snapshot::SavedCpu::of(&cpu_at_save)
+    );
+    assert_eq!(gic_state(&handle), gic_at_save);
+    assert_eq!(vcpus[0].lock().cpu().tlb_entries(), 0);
+
+    // The CPU runs on from the save.
+    handle.resume().unwrap();
+    counted_past(&handle, at_save + 1000);
+    handle.quit();
+    vm.wait();
+}
+
+/// A load of a name that no disk has, and a load of a snapshot that is
+/// not of this machine, change nothing.
+#[test]
+fn a_snapshot_that_does_not_fit_the_emulated_machine_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut vm, _vcpus) = counting(dir.path());
+    let handle = vm.handle();
+    vm.start();
+    counted_past(&handle, 10);
+    assert!(
+        crate::snapshot::load(&handle, "none")
+            .unwrap_err()
+            .is_not_found()
+    );
+    crate::snapshot::save(&handle, "kept").unwrap();
+    crate::snapshot::delete(&handle, "kept").unwrap();
+    assert!(crate::snapshot::load(&handle, "kept").is_err());
+    let at = count(&handle);
+    counted_past(&handle, at + 10);
+    handle.quit();
+    vm.wait();
+}
+
+/// The debug port of an emulated machine: pause, the registers, a step,
+/// a write of a register that the CPU runs on, memory by virtual address,
+/// and a detach that resumes.
+#[test]
+fn the_debug_port_reads_steps_and_writes_an_emulated_cpu() {
+    use vmlab_hv_proto::control::{Outcome, RunState};
+    use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut vm, _vcpus) = counting(dir.path());
+    let handle = vm.handle();
+    vm.start();
+    counted_past(&handle, 100);
+    let debug = |request| match crate::debug::handle(handle.shared(), request) {
+        Outcome::Debug { response } => response,
+        other => panic!("{other:?}"),
+    };
+    let DebugResponse::Status { status } = debug(DebugRequest::Pause) else {
+        panic!()
+    };
+    assert_eq!(status.state, RunState::Paused);
+    assert_eq!(status.vcpus, vec![0]);
+    let read = |debug: &dyn Fn(DebugRequest) -> DebugResponse| {
+        let DebugResponse::Aarch64Registers { registers, .. } =
+            debug(DebugRequest::ReadRegisters { vcpu: 0 })
+        else {
+            panic!()
+        };
+        registers
+    };
+    let before = read(&debug);
+    assert_eq!(before.x[1], COUNTER);
+    // EL1 with SP_EL1 and every interrupt masked.
+    assert_eq!(before.cpsr & 0x3cf, 0x3c5);
+    let DebugResponse::Status { status } = debug(DebugRequest::Step { vcpu: 0 }) else {
+        panic!()
+    };
+    assert_eq!(status.state, RunState::Paused);
+    let stop = status.stop.unwrap();
+    let after = read(&debug);
+    assert_eq!(stop.pc, after.pc);
+    assert_ne!(after.pc, before.pc);
+
+    // The count goes on from a value that the debugger wrote: step to the
+    // load, then set X3 after it.
+    let mut steps = 0;
+    while read(&debug).pc != KERNEL + 4 * 10 {
+        debug(DebugRequest::Step { vcpu: 0 });
+        steps += 1;
+        assert!(steps < 8, "the loop has five instructions");
+    }
+    debug(DebugRequest::Step { vcpu: 0 });
+    debug(DebugRequest::SetRegisters {
+        vcpu: 0,
+        values: [("x3".to_string(), 1 << 40)].into(),
+    });
+    for _ in 0..3 {
+        debug(DebugRequest::Step { vcpu: 0 });
+    }
+    assert_eq!(count(&handle), (1 << 40) + 1);
+    let DebugResponse::Memory { data } = debug(DebugRequest::ReadMemory {
+        space: AddressSpace::Virtual { vcpu: 0 },
+        address: COUNTER,
+        length: 8,
+    }) else {
+        panic!()
+    };
+    assert_eq!(data, ((1u64 << 40) + 1).to_le_bytes());
+    assert!(matches!(
+        crate::debug::handle(
+            handle.shared(),
+            DebugRequest::ReadRegisters { vcpu: 1 }
+        ),
+        Outcome::Error { .. }
+    ));
+    debug(DebugRequest::Detach { resume: true });
+    assert_eq!(handle.status(), RunState::Running);
+    counted_past(&handle, (1 << 40) + 100);
+    handle.quit();
+    vm.wait();
+}

@@ -17,6 +17,7 @@
 
 pub mod fdt;
 pub mod psci;
+mod snapshot;
 pub mod tree;
 
 use std::sync::{Arc, OnceLock};
@@ -135,6 +136,14 @@ impl MachineClock {
                 .saturating_add(state.2.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         }
         state.0 = running;
+        state.2 = Instant::now();
+    }
+
+    /// Put the time back to `ns`, as a snapshot restore does. The clock
+    /// goes on from there when it runs.
+    fn set_now_ns(&self, ns: u64) {
+        let mut state = self.state.lock();
+        state.1 = ns;
         state.2 = Instant::now();
     }
 
@@ -926,6 +935,11 @@ pub fn assemble(
 impl Virt {
     pub(crate) fn vcpus(&self) -> usize {
         self.vcpus.len()
+    }
+
+    /// The backend of the vCPU `id`, for the debug port.
+    pub(crate) fn vcpu(&self, id: u8) -> Option<Arc<Mutex<EmulatedVcpu>>> {
+        self.vcpus.get(usize::from(id)).cloned()
     }
 
     pub(crate) fn powered(&self, id: u8) -> bool {

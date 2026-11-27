@@ -270,3 +270,165 @@ fn aavmf_reaches_the_uefi_shell() {
 fn aavmf_reaches_the_uefi_shell_with_two_cpus() {
     aavmf_reaches_the_shell(2);
 }
+
+/// The word that the counting guest of the snapshot tests counts in.
+const COUNTER: u64 = vmlab_hv_firmware::virt::map::RAM_BASE + 0x10_0000;
+
+/// A kernel that counts in `COUNTER` for ever.
+fn counting_kernel(dir: &Path) -> PathBuf {
+    use vmlab_hv_tcg_aarch64::oracle::asm;
+    let mut words = asm::load(1, COUNTER).to_vec();
+    // ldr x3, [x1] ; add x3, x3, #1 ; str x3, [x1] ; b loop
+    words.extend([0xf940_0023, asm::add(3, 3, 1), 0xf900_0023, asm::b(-3)]);
+    let kernel = dir.join("kernel");
+    std::fs::write(&kernel, asm::bytes(&words)).unwrap();
+    kernel
+}
+
+fn ok(outcome: Outcome) {
+    assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
+}
+
+impl Machine {
+    fn debug(
+        &mut self,
+        request: vmlab_hv_proto::debug::DebugRequest,
+    ) -> vmlab_hv_proto::debug::DebugResponse {
+        match self.client.call(Control::Debug { request }).unwrap() {
+            Outcome::Debug { response } => response,
+            other => panic!("{other:?}: {}", self.diagnostics()),
+        }
+    }
+
+    /// The count of the guest. The machine is paused.
+    fn count(&mut self) -> u64 {
+        use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+        let DebugResponse::Memory { data } = self.debug(DebugRequest::ReadMemory {
+            space: AddressSpace::Physical,
+            address: COUNTER,
+            length: 8,
+        }) else {
+            panic!("no memory")
+        };
+        u64::from_le_bytes(data.try_into().unwrap())
+    }
+
+    /// Run the guest a while and pause it: the count then.
+    fn run_a_while(&mut self) -> u64 {
+        ok(self.client.call(Control::Resume).unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        ok(self.client.call(Control::Pause).unwrap());
+        self.count()
+    }
+
+    fn quit(mut self) {
+        ok(self.client.call(Control::Quit).unwrap());
+        let status = self.process.wait().unwrap();
+        assert!(status.success(), "{status}: {}", self.diagnostics());
+    }
+}
+
+/// D13 at S1 on an emulated aarch64 machine: an online snapshot over the
+/// control socket brings the guest back to its moment, in the same process
+/// and in a new one on the same disk; an offline snapshot of the disk is
+/// refused as a load, and the machine runs on.
+#[test]
+fn snapshots_of_an_emulated_aarch64_machine_online_and_offline() {
+    use vmlab_hv_proto::control::{ErrorCode, RunState};
+    use vmlab_hv_proto::debug::{DebugRequest, DebugResponse};
+    let dir = tempfile::Builder::new()
+        .prefix("hv-virt-snap-")
+        .tempdir()
+        .unwrap();
+    let disk = dir.path().join("disk0.qcow2");
+    vmlab_disk::ops::create_qcow2(&disk, 16 << 20, None, None).unwrap();
+    // An offline snapshot, as vmlab takes one of a stopped machine.
+    vmlab_disk::ops::snapshot_create(&disk, "offline").unwrap();
+    let kernel = counting_kernel(dir.path());
+    let mut desc = description(
+        dir.path(),
+        1,
+        64,
+        serde_json::json!({"kind": "kernel", "kernel": kernel, "initrd": null, "cmdline": ""}),
+    );
+    desc["disks"] = serde_json::json!([{
+        "id": "disk0", "path": disk, "format": "qcow2", "read_only": false, "vmstate": true,
+    }]);
+
+    let mut machine = Machine::start(dir.path(), &desc);
+    let at_save = machine.run_a_while();
+    assert!(at_save > 0, "the guest did not count: {}", machine.diagnostics());
+    ok(machine
+        .client
+        .call(Control::SnapshotSave {
+            name: "online".into(),
+        })
+        .unwrap());
+    let later = machine.run_a_while();
+    assert!(later > at_save);
+    ok(machine
+        .client
+        .call(Control::SnapshotLoad {
+            name: "online".into(),
+        })
+        .unwrap());
+    let Outcome::Ok { status } = machine.client.call(Control::Status).unwrap() else {
+        panic!()
+    };
+    assert_eq!(status, Some(RunState::Paused));
+    assert_eq!(machine.count(), at_save);
+    let DebugResponse::Aarch64Registers { registers, .. } =
+        machine.debug(DebugRequest::ReadRegisters { vcpu: 0 })
+    else {
+        panic!("no aarch64 registers")
+    };
+    assert_eq!(registers.x[1], COUNTER);
+    // It runs on from the save.
+    assert!(machine.run_a_while() > at_save);
+
+    // The offline snapshot has no machine state: the load is refused, and
+    // the machine is as it was.
+    let refused = machine
+        .client
+        .call(Control::SnapshotLoad {
+            name: "offline".into(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            &refused,
+            Outcome::Error { code: ErrorCode::SnapshotIncompatible, message } if message.contains("offline")
+        ),
+        "{refused:?}"
+    );
+    assert!(machine.run_a_while() > at_save);
+    machine.quit();
+
+    let snapshots = vmlab_disk::ops::snapshot_list(&disk).unwrap();
+    let size = |name: &str| {
+        snapshots
+            .iter()
+            .find(|snapshot| snapshot.name == name)
+            .map(|snapshot| snapshot.vm_state_size)
+    };
+    assert_eq!(size("offline"), Some(0));
+    assert!(size("online").unwrap() > 0);
+
+    // A new process loads the online snapshot.
+    let mut machine = Machine::start(dir.path(), &desc);
+    ok(machine
+        .client
+        .call(Control::SnapshotLoad {
+            name: "online".into(),
+        })
+        .unwrap());
+    assert_eq!(machine.count(), at_save);
+    assert!(machine.run_a_while() > at_save);
+    ok(machine
+        .client
+        .call(Control::SnapshotDelete {
+            name: "online".into(),
+        })
+        .unwrap());
+    machine.quit();
+}
