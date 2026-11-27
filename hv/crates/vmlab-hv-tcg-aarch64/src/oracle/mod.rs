@@ -15,6 +15,7 @@ pub mod asm;
 pub mod boot;
 pub mod corpus;
 pub mod follow;
+pub mod jitdiff;
 pub mod leader;
 pub mod rsp;
 pub mod stream;

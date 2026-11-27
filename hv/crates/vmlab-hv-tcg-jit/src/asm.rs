@@ -625,41 +625,49 @@ mod tests {
         let intel = ["-triple=x86_64", "-x86-asm-syntax=intel", "-output-asm-variant=1"];
         // A jump is printed relative to its own address by the
         // disassembler, so each case is placed at 0x1000 and decoded alone.
+        // A relative jump is not assembled: Intel syntax reads its number
+        // as a memory operand. Its mnemonic and its displacement are
+        // compared.
+        let is_jump = |text: &str| text.starts_with('j') && text.ends_with("0x2000");
         let mut source = String::from(".intel_syntax noprefix\n");
         let mut bytes = String::new();
         for (code, text) in &cases {
-            source.push_str(text);
-            source.push('\n');
+            if !is_jump(text) {
+                source.push_str(text);
+                source.push('\n');
+            }
             for byte in code {
                 bytes.push_str(&format!("0x{byte:02x} "));
             }
             bytes.push('\n');
         }
-        let Some(expected) = llvm_mc(&intel, &source) else {
+        let Some(assembled) = llvm_mc(&intel, &source) else {
             eprintln!("llvm-mc is not installed: the encodings were not compared");
             return;
         };
-        let expected = instructions(&expected);
+        let mut assembled = instructions(&assembled).into_iter();
         let mut disassemble = intel.to_vec();
         disassemble.push("--disassemble");
         let got = instructions(&llvm_mc(&disassemble, &bytes).expect("llvm-mc ran before"));
-        assert_eq!(expected.len(), cases.len(), "llvm-mc read every case");
         let mut wrong = Vec::new();
         for (index, (code, text)) in cases.iter().enumerate() {
             let line = got.get(index).map(String::as_str).unwrap_or("<none>");
-            // A relative jump decodes as its displacement.
-            let want = &expected[index];
-            let same = if want.starts_with('j') && !want.contains("ptr") && code.len() >= 5 {
+            if is_jump(text) {
+                // Printed as the displacement from the next instruction.
                 let displacement = 0x2000i64 - (0x1000 + code.len() as i64);
-                line.split_whitespace().next() == want.split_whitespace().next()
-                    && line.ends_with(&displacement.to_string())
+                if line.split_whitespace().next() != text.split_whitespace().next()
+                    || !line.ends_with(&displacement.to_string())
+                {
+                    wrong.push(format!("{text}: {code:02x?} decodes as {line:?}"));
+                }
             } else {
-                line == want
-            };
-            if !same {
-                wrong.push(format!("{text}: {code:02x?} decodes as {line:?}, not {want:?}"));
+                let want = assembled.next().expect("llvm-mc read every case");
+                if line != want {
+                    wrong.push(format!("{text}: {code:02x?} decodes as {line:?}, not {want:?}"));
+                }
             }
         }
+        assert!(assembled.next().is_none(), "llvm-mc read one line per case");
         assert_eq!(got.len(), cases.len(), "one instruction per case: {wrong:#?}");
         assert!(wrong.is_empty(), "{} of {}: {wrong:#?}", wrong.len(), cases.len());
     }
