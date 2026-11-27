@@ -1148,7 +1148,8 @@ fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
 /// (`Leave::ops`, `Leave::inputs`).
 type ColdPath = (Vec<Op>, Vec<(Place, u32)>);
 
-/// What `compile` gathers beside the operations of the block.
+/// What `compile` gathers beside the operations of the block. The block
+/// takes a copy of each list of its own size.
 #[derive(Default)]
 struct Parts {
     accesses: Vec<Access16>,
@@ -1156,6 +1157,36 @@ struct Parts {
     calls: Vec<Call>,
     inputs: Vec<(Place, u32)>,
     op_counts: Option<Vec<usize>>,
+    /// The scalars that one `emit` or `emit_cold` schedules, and the inputs
+    /// of a cold path while they are gathered.
+    scheduled: Vec<ScalarId>,
+    cold_inputs: Vec<(Place, u32)>,
+}
+
+impl Parts {
+    fn clear(&mut self) {
+        self.accesses.clear();
+        self.leaves.clear();
+        self.calls.clear();
+        self.inputs.clear();
+        self.op_counts = None;
+    }
+}
+
+/// The buffers of a translation, which the CPU keeps from one block to the
+/// next (3e DESIGN.md J11): the block that the lifter fills, the lowering
+/// and what `compile` gathers. Once they have grown to the size of the
+/// blocks, a translation makes heap calls only for the lists that the block
+/// it makes keeps.
+#[derive(Default)]
+struct Translator {
+    block: BlockOf<A64Exit>,
+    prune: dce::PruneBuffers,
+    lowering: Lowering,
+    parts: Parts,
+    seen: Vec<bool>,
+    leave_of: Vec<Option<u32>>,
+    roots: Vec<ScalarId>,
 }
 
 impl Parts {
@@ -1177,7 +1208,21 @@ impl Parts {
         seen: &mut [bool],
         roots: &[ScalarId],
     ) -> Result<(), Stop> {
-        for id in schedule::scalars(graph, roots, seen) {
+        let mut scheduled = std::mem::take(&mut self.scheduled);
+        scheduled.clear();
+        schedule::scalars_into(graph, roots, seen, &mut scheduled);
+        let done = self.emit_scheduled(lowering, graph, &scheduled);
+        self.scheduled = scheduled;
+        done
+    }
+
+    fn emit_scheduled(
+        &mut self,
+        lowering: &mut Lowering,
+        graph: &Graph,
+        scheduled: &[ScalarId],
+    ) -> Result<(), Stop> {
+        for &id in scheduled {
             let before = lowering.ops.len();
             match &graph.scalars[id].operation {
                 Operation::Constant(value) => lowering.constant(id, *value),
@@ -1219,9 +1264,14 @@ impl Parts {
         seen: &mut [bool],
         roots: &[ScalarId],
     ) -> Result<ColdPath, Stop> {
-        let scheduled = schedule::scalars(graph, roots, seen);
-        let main = std::mem::take(&mut lowering.ops);
-        let mut inputs = Vec::new();
+        let mut scheduled = std::mem::take(&mut self.scheduled);
+        scheduled.clear();
+        schedule::scalars_into(graph, roots, seen, &mut scheduled);
+        // The cold operations go after those of the block, and then into a
+        // list of their own size.
+        let main = lowering.ops.len();
+        let mut inputs = std::mem::take(&mut self.cold_inputs);
+        inputs.clear();
         let mut done = Ok(());
         for &id in &scheduled {
             match &graph.scalars[id].operation {
@@ -1257,8 +1307,11 @@ impl Parts {
             }
             seen[id] = false;
         }
-        let cold = std::mem::replace(&mut lowering.ops, main);
-        done.map(|()| (cold, inputs))
+        let cold = lowering.ops.split_off(main);
+        let cold_inputs = inputs.clone();
+        self.cold_inputs = inputs;
+        self.scheduled = scheduled;
+        done.map(|()| (cold, cold_inputs))
     }
 }
 
@@ -1316,18 +1369,19 @@ fn skip_truncations(graph: &mut Graph) {
 }
 
 fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
-    let mut roots: Vec<ScalarId> = exit
-        .writeback
-        .writes
-        .iter()
-        .map(|(_, scalar)| *scalar)
-        .collect();
+    let mut roots = Vec::new();
+    push_exit_roots(exit, &mut roots);
+    roots
+}
+
+/// `exit_roots`, appended to `roots`.
+fn push_exit_roots(exit: &A64Exit, roots: &mut Vec<ScalarId>) {
+    roots.extend(exit.writeback.writes.iter().map(|(_, scalar)| *scalar));
     match &exit.next {
         A64Next::Pc(next) | A64Next::Relative(next) => roots.push(*next),
         A64Next::Exception { syndrome, .. } => roots.extend(syndrome),
         A64Next::Trap { .. } => {}
     }
-    roots
 }
 
 /// Static operation counts summed over translations, including retranslations.
@@ -1411,6 +1465,7 @@ impl BlockCounts {
     }
 }
 
+#[cfg(test)]
 fn compile(
     phys: u64,
     context: Context,
@@ -1418,35 +1473,77 @@ fn compile(
     mut block: BlockOf<A64Exit>,
     counts: Option<&mut BlockCounts>,
 ) -> Result<Compiled, Stop> {
+    compile_with(
+        phys,
+        context,
+        instructions,
+        &mut block,
+        &mut Translator::default(),
+        counts,
+    )
+}
+
+/// Lower `block`, which the lifter made, into the block that the loop runs,
+/// with the buffers of `translator` (3e DESIGN.md J11). `block` is pruned in
+/// place.
+fn compile_with(
+    phys: u64,
+    context: Context,
+    instructions: u32,
+    block: &mut BlockOf<A64Exit>,
+    translator: &mut Translator,
+    counts: Option<&mut BlockCounts>,
+) -> Result<Compiled, Stop> {
     skip_truncations(&mut block.graph);
-    dce::prune_scalars(&mut block);
+    dce::prune_scalars_with(block, &mut translator.prune);
+    let block = &*block;
     let graph = &block.graph;
-    let mut lowering = Lowering::new(graph).ok_or_else(|| host("a block with too many slots"))?;
-    let mut seen = vec![false; graph.scalars.len()];
-    let mut parts = Parts {
-        op_counts: counts.as_ref().map(|_| vec![0; graph.scalars.len()]),
-        ..Parts::default()
-    };
+    let Translator {
+        lowering,
+        parts,
+        seen,
+        leave_of,
+        roots,
+        ..
+    } = translator;
+    lowering
+        .reset(graph)
+        .ok_or_else(|| host("a block with too many slots"))?;
+    seen.clear();
+    seen.resize(graph.scalars.len(), false);
+    parts.clear();
+    parts.op_counts = counts.as_ref().map(|_| vec![0; graph.scalars.len()]);
     let mut block_outputs = None;
     let mut terminal = None;
     let mut next_pc = None;
     // The exits that events leave through, by their number in the block.
-    let mut leave_of = vec![None; block.exits.len()];
+    leave_of.clear();
+    leave_of.resize(block.exits.len(), None);
     for event in &block.events {
         if block_outputs.is_some() {
             return Err(host("an event after the exit of a block"));
         }
-        let (exit, mut roots) = match event {
+        roots.clear();
+        let exit = match event {
             Event::Guard {
                 condition, exit, ..
-            } => (*exit, vec![*condition]),
-            Event::ReadMemory { address, error, .. } => (*error, vec![*address]),
+            } => {
+                roots.push(*condition);
+                *exit
+            }
+            Event::ReadMemory { address, error, .. } => {
+                roots.push(*address);
+                *error
+            }
             Event::WriteMemory {
                 address,
                 value,
                 error,
                 ..
-            } => (*error, vec![*address, *value]),
+            } => {
+                roots.extend([*address, *value]);
+                *error
+            }
             // An ordered helper call, after what its arguments need. It
             // leaves through no exit.
             Event::Call {
@@ -1460,7 +1557,7 @@ fn compile(
                 {
                     return Err(host("an ordered call of a helper that is not one"));
                 }
-                parts.emit(&mut lowering, graph, &mut seen, args)?;
+                parts.emit(lowering, graph, seen, args)?;
                 for result in results {
                     seen[*result] = true;
                 }
@@ -1473,10 +1570,10 @@ fn compile(
                         .map(|result| (lowering.place(*result), result_mask(graph, *result)))
                         .collect(),
                 };
-                parts.call(&mut lowering, call)?;
+                parts.call(lowering, call)?;
                 continue;
             }
-            Event::Exit(exit) => (*exit, Vec::new()),
+            Event::Exit(exit) => *exit,
             Event::Checkpoint(_) => return Err(host("an aarch64 block has no checkpoint")),
         };
         let payload = &block.exits[exit];
@@ -1506,10 +1603,10 @@ fn compile(
         // Only the end computes its writeback on the way: an exit before it
         // computes what it needs when it is taken.
         if is_end {
-            roots.extend(exit_roots(payload));
+            push_exit_roots(payload, roots);
         }
-        parts.emit(&mut lowering, graph, &mut seen, &roots)?;
-        let mut outputs = Vec::new();
+        parts.emit(lowering, graph, seen, roots)?;
+        let mut outputs = Vec::with_capacity(payload.writeback.writes.len());
         for (register, scalar) in &payload.writeback.writes {
             outputs.push((narrow(*register)?, lowering.place(*scalar)));
         }
@@ -1538,8 +1635,9 @@ fn compile(
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let leave = narrow(parts.leaves.len())?;
-                let (ops, inputs) =
-                    parts.emit_cold(&mut lowering, graph, &mut seen, &exit_roots(payload))?;
+                roots.clear();
+                push_exit_roots(payload, roots);
+                let (ops, inputs) = parts.emit_cold(lowering, graph, seen, roots)?;
                 parts.leaves.push(Leave {
                     ops,
                     inputs,
@@ -1685,19 +1783,20 @@ fn compile(
             "an operation of a block names a word outside its frame",
         ));
     }
+    // The block takes lists of its own size, and the buffers keep theirs.
     Ok(Compiled {
         phys,
         context,
         stamp: None,
         epoch: 0,
         instructions,
-        ops: lowering.ops,
-        generics: lowering.generics,
-        accesses: parts.accesses,
-        leaves: parts.leaves,
-        frame: lowering.frame,
-        calls: parts.calls,
-        inputs: parts.inputs,
+        ops: lowering.ops.clone(),
+        generics: lowering.generics.clone(),
+        accesses: parts.accesses.clone(),
+        leaves: parts.leaves.drain(..).collect(),
+        frame: lowering.frame.clone(),
+        calls: parts.calls.drain(..).collect(),
+        inputs: parts.inputs.clone(),
         outputs,
         terminal,
         next: next_pc,
@@ -4183,6 +4282,8 @@ pub struct Cpu<M> {
     chaining: Chaining,
     /// The lists that a compile hands to the emitter (3e DESIGN.md J11).
     shape_buffers: ShapeBuffers,
+    /// The buffers of a translation (3e DESIGN.md J11).
+    translator: Translator,
 }
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
@@ -4244,6 +4345,7 @@ impl<M: Memory> Cpu<M> {
                 seen: 0,
             },
             shape_buffers: ShapeBuffers::default(),
+            translator: Translator::default(),
         };
         let started = if jit_check_from_environment() {
             cpu.set_jit_check(true)
@@ -4878,7 +4980,13 @@ impl<M: Memory> Cpu<M> {
                 .broadcast(Some(Invalidation::CodePage(phys & !0xfff)));
         }
         let stamp = self.memory.code_stamp(phys, self.stamp_len(phys));
-        let mut builder = Builder::new(context, pc);
+        // The lifter fills the block of the translation before, which the
+        // translator keeps (3e DESIGN.md J11).
+        let mut builder = Builder::with_block(
+            std::mem::take(&mut self.translator.block),
+            context,
+            pc,
+        );
         let mut at = pc;
         let mut count = 0;
         let mut ldp_x = 0;
@@ -4958,14 +5066,18 @@ impl<M: Memory> Cpu<M> {
         }
         self.translations += 1;
         self.side.mark_code(phys);
-        let mut compiled = compile(
+        let mut block = builder.finish(at);
+        let compiled = compile_with(
             phys,
             context,
             count,
-            builder.finish(at),
+            &mut block,
+            &mut self.translator,
             self.block_counts.as_mut(),
-        )
-        .map_err(Refused::Stop)?;
+        );
+        block.clear();
+        self.translator.block = block;
+        let mut compiled = compiled.map_err(Refused::Stop)?;
         if let Some(counts) = &mut self.block_counts {
             counts.ldp_x += ldp_x;
             counts.stp_x += stp_x;

@@ -219,6 +219,9 @@ pub struct Builder {
     /// The flags as the block set them last. `None`: the block has not set
     /// them, and they are in the flag slots.
     flags: Option<Flags>,
+    /// The writes of an exit while they are gathered: an exit holds a copy
+    /// of its own size (3e DESIGN.md J11).
+    gathered: Vec<(usize, ScalarId)>,
 }
 
 /// The alignment that Device memory asks of a load or a store of a register
@@ -234,8 +237,16 @@ fn total(value: Option<ScalarId>) -> ScalarId {
 
 impl Builder {
     pub fn new(context: Context, pc: u64) -> Self {
+        Self::with_block(BlockOf::default(), context, pc)
+    }
+
+    /// A builder that fills `block`, which is empty: the block of an earlier
+    /// translation, cleared, whose lists keep their memory (3e DESIGN.md
+    /// J11).
+    pub fn with_block(block: BlockOf<A64Exit>, context: Context, pc: u64) -> Self {
+        debug_assert!(block.events.is_empty() && block.graph.scalars.is_empty());
         Self {
-            block: BlockOf::default(),
+            block,
             current: [None; slot::COUNT],
             written: [false; slot::COUNT],
             context,
@@ -254,6 +265,7 @@ impl Builder {
             aligned: Vec::new(),
             unprivileged: false,
             flags: None,
+            gathered: Vec::new(),
         }
     }
 
@@ -1087,7 +1099,8 @@ impl Builder {
         current: [Option<ScalarId>; slot::COUNT],
         written: [bool; slot::COUNT],
     ) -> Vec<(usize, ScalarId)> {
-        let mut writes = Vec::new();
+        let mut writes = std::mem::take(&mut self.gathered);
+        writes.clear();
         for slot in 0..slot::COUNT {
             let Some(value) = current[slot] else {
                 continue;
@@ -1101,7 +1114,9 @@ impl Builder {
                 writes.push((slot, value));
             }
         }
-        writes
+        let exact = writes.clone();
+        self.gathered = writes;
+        exact
     }
 
     /// An exit that leaves the block before the instruction that is being
