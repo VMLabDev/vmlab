@@ -248,12 +248,63 @@ mod tests {
         assert_eq!(tlb.lookup(0x10, 7).map(|entry| entry.phys), Some(0x10000));
         assert!(tlb.lookup(0x10, 8).is_none());
         assert!(tlb.lookup(0x11, 8).is_some());
-        // Another page with the same place replaces the entry.
-        tlb.insert(entry(0x20, 7, false, 12));
+        // Another page with the same place replaces the entry: 0x101 folds
+        // onto the place of 0x10.
+        tlb.insert(entry(0x101, 7, false, 12));
         assert!(tlb.lookup(0x10, 7).is_none());
         assert_eq!(tlb.len(), 2);
         tlb.flush();
-        assert!(tlb.is_empty() && tlb.lookup(0x20, 7).is_none());
+        assert!(tlb.is_empty() && tlb.lookup(0x101, 7).is_none());
+    }
+
+    #[test]
+    fn pages_a_multiple_of_the_table_apart_keep_their_entries() {
+        // 4 MiB apart, which took one place of 1,024 before the fold.
+        let mut tlb = Tlb::new(10);
+        for page in [0x400, 0x800, 0xc00, 0x1000] {
+            tlb.insert(entry(page, 1, false, 12));
+        }
+        assert_eq!(tlb.len(), 4);
+        for page in [0x400, 0x800, 0xc00, 0x1000] {
+            assert!(tlb.lookup(page, 1).is_some());
+        }
+    }
+
+    #[test]
+    fn an_invalidation_of_a_page_looks_at_its_place_or_at_all_of_them() {
+        let mut tlb = Tlb::new(10);
+        for page in 0..512 {
+            tlb.insert(entry(page, 1, false, 12));
+        }
+        // No larger mapping: one place, and only the entry of the page.
+        tlb.flush_page(5, u64::MAX, Some(1));
+        assert_eq!(tlb.len(), 511);
+        assert!(tlb.lookup(5, 1).is_none() && tlb.lookup(4, 1).is_some());
+        // Another address space keeps the entry.
+        tlb.flush_page(6, u64::MAX, Some(2));
+        assert_eq!(tlb.len(), 511);
+        // A page of a 2 MiB mapping: the invalidation of any page of it
+        // drops all of its entries.
+        for page in [0x10_0000, 0x10_0042, 0x10_01ff] {
+            tlb.insert(entry(page, 1, false, 21));
+        }
+        tlb.flush_page(0x10_0100, u64::MAX, Some(1));
+        for page in [0x10_0000, 0x10_0042, 0x10_01ff] {
+            assert!(tlb.lookup(page, 1).is_none());
+        }
+        assert!(tlb.lookup(100, 1).is_some());
+        // More larger mappings than the TLB keeps apart: every invalidation
+        // looks at every entry, and is still right.
+        for mapping in 0..(LARGE as u64 + 1) {
+            tlb.insert(entry(0x20_0000 + (mapping << 9), 1, false, 21));
+        }
+        assert!(tlb.large.is_none());
+        tlb.flush_page(0x20_0000 + (3 << 9) + 7, u64::MAX, None);
+        assert!(tlb.lookup(0x20_0000 + (3 << 9), 1).is_none());
+        assert!(tlb.lookup(0x20_0000 + (4 << 9), 1).is_some());
+        assert!(tlb.lookup(100, 1).is_some());
+        tlb.flush();
+        assert_eq!(tlb.large, Some(Vec::new()));
     }
 
     #[test]
