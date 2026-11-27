@@ -952,7 +952,14 @@ fn a_hit_asks_nothing_and_a_miss_runs_the_access_in_the_thunk() {
     let want = u64::from_le_bytes(ram[8..16].try_into().expect("eight bytes"));
     // An empty TLB that the misses fill: both miss.
     let mut slots = [0u128; 1];
-    let ran = compiled_on(&mut jit, &block, &mut slots, 10, &mut ram, Some(FastTlb::new()));
+    let ran = compiled_on(
+        &mut jit,
+        &block,
+        &mut slots,
+        10,
+        &mut ram,
+        Some(FastTlb::new()),
+    );
     assert_eq!((ran.code, ran.misses, ran.thunk_calls), (DONE, 2, 2));
     assert_eq!(slots[0], u128::from(want));
     assert_eq!(&ram[0x1004..0x1008], &0xeeff_1122u32.to_le_bytes());
@@ -975,8 +982,11 @@ fn a_hit_asks_nothing_and_a_miss_runs_the_access_in_the_thunk() {
     assert_eq!(run(&mut jit, &block, &mut ram, empty), (DONE, 1, 1, 0));
     // A load that is not aligned misses also in a page that the TLB holds,
     // and one outside the memory leaves the block.
-    for (load_at, calls, code) in [(RAM + 9, 1, DONE), (RAM + 0x1ff8, 1, DONE), (RAM - 8, 1, LEFT)]
-    {
+    for (load_at, calls, code) in [
+        (RAM + 9, 1, DONE),
+        (RAM + 0x1ff8, 1, DONE),
+        (RAM - 8, 1, LEFT),
+    ] {
         let (ops, frame) = load_and_store(load_at, RAM + 0x1004);
         let block = access_block(ops, frame, 2, Memory::Inline);
         // RAM + 0x1ff8 is in the second page, which has no read entry.
