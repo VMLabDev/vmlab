@@ -913,7 +913,9 @@ JIT_REPORT = re.compile(
     r"(?:; chaining: (?P<chained>\d+) chained, (?P<jump_hits>\d+) jump cache hits, "
     r"(?P<unlinked>\d+) unlinked, (?P<lookups>\d+) jump cache misses, (?P<entered>\d+) runs "
     r"entered; (?P<links>\d+) links, (?P<unlinks>\d+) unlinks, (?P<fills>\d+) fills"
-    r"(?:, (?P<clears>\d+) clears of the jump cache)?)?")
+    r"(?:, (?P<clears>\d+) clears of the jump cache)?)?"
+    # The fast TLB of card J3, when the line has it.
+    r"(?:; fast TLB: (?P<tlb_accesses>\d+) accesses, (?P<tlb_misses>\d+) misses)?")
 
 
 def last_jit_report(run_dir):

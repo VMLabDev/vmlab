@@ -6,8 +6,10 @@
 //! - `asm`: the assembler.
 //! - `region`: the code memory, one `memfd` mapped twice (H13d, Q3).
 //! - `emit`: the one-pass allocator with its spill (H3), the inline forms of
-//!   the operations of one word, the guards and their stubs (H9), and the
-//!   thunk through which every effect runs.
+//!   the operations of one word, the guards and their stubs (H9), the
+//!   inlined loads and stores of 1 to 8 bytes over the fast TLB (H7), and
+//!   the thunk through which every other effect runs.
+//! - `tlb`: the layout of the fast TLB and its fill and flush (H7).
 //! - `perf`: the perf map (H13e), which names each block for `perf`.
 //! - The trampoline here (H4): `enter` saves the registers that the System V
 //!   ABI keeps, loads the context, and jumps to a block. A block leaves by a
@@ -39,9 +41,10 @@ pub mod asm;
 pub mod emit;
 pub mod perf;
 pub mod region;
+pub mod tlb;
 
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
-pub use emit::{Chain, Defect, Effect, Next, NextPc, Refused, Shape};
+pub use emit::{Chain, Defect, Effect, Memory, Next, NextPc, Refused, Shape};
 use region::Region;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -62,10 +65,25 @@ pub const VERIFY: u64 = 0x30;
 pub const SITES: usize = 2;
 
 /// The function that runs an operation of a block for its code: `env` is
-/// what the context holds, `index` the operation, `block` what the head of
-/// the block that runs stored in `Context::block`. 0: go on. Anything
-/// else: the block leaves with that value.
+/// what the context holds, `index` the operation in the low 32 bits and
+/// what is asked of it in the high ones (`MISS`, `WATCHED`, `LOGGED`; none:
+/// run the operation), `block` what the head of the block that runs stored
+/// in `Context::block`. 0: go on. Anything else: the block leaves with that
+/// value.
 pub type Thunk = unsafe extern "sysv64" fn(env: *mut c_void, index: u64, block: *mut c_void) -> u64;
+
+/// An inlined load or store missed the fast TLB: run it as the operation,
+/// which fills the TLB where H7a lets it.
+pub const MISS: u64 = 1 << 32;
+/// An inlined store wrote its bytes and found the watch word of its page
+/// odd (card S3): the owner tells its memory. The address is in the frame.
+/// Nothing else happens, and the block goes on.
+pub const WATCHED: u64 = 2 << 32;
+/// An inlined load or store hit, in a block compiled for a CPU that keeps
+/// its accesses (`Memory::Logged`): the address, and the value of a store,
+/// are in the frame, and the value of a load is in its result word. The
+/// owner keeps the access. The block goes on.
+pub const LOGGED: u64 = 4 << 32;
 
 /// What compiled code reads through R13.
 #[repr(C)]
@@ -86,6 +104,17 @@ pub struct Context {
     /// The generation of the jump cache, which every key of an entry holds
     /// added to it: `clear_jumps` moves it, and every entry is then a miss.
     pub jump_generation: u64,
+    /// The read and the write table of the fast TLB for the level of the
+    /// blocks that run (`tlb::FastTlb::table`), or `tlb::EMPTY_TABLE`, which
+    /// `Jit::context` puts here. The thunk may change them while the code
+    /// runs. A chained block has the context of the block before it, and so
+    /// its level.
+    pub reads: *const tlb::Entry,
+    pub writes: *const tlb::Entry,
+    /// The loads and stores that the code makes inline (H7): the head of a
+    /// block adds those of its block, so a block that leaves before its end
+    /// counts all of them.
+    pub accesses: u64,
 }
 
 pub(crate) const CONTEXT_BUDGET: i32 = 0;
@@ -96,6 +125,16 @@ pub(crate) const CONTEXT_JUMP: i32 = 32;
 pub(crate) const CONTEXT_CHAINED: i32 = 40;
 pub(crate) const CONTEXT_HITS: i32 = 48;
 pub(crate) const CONTEXT_JUMP_GENERATION: i32 = 56;
+pub(crate) const CONTEXT_READS: i32 = 64;
+pub(crate) const CONTEXT_WRITES: i32 = 72;
+pub(crate) const CONTEXT_ACCESSES: i32 = 80;
+
+const _: () = {
+    assert!(std::mem::offset_of!(Context, jump_generation) == CONTEXT_JUMP_GENERATION as usize);
+    assert!(std::mem::offset_of!(Context, reads) == CONTEXT_READS as usize);
+    assert!(std::mem::offset_of!(Context, writes) == CONTEXT_WRITES as usize);
+    assert!(std::mem::offset_of!(Context, accesses) == CONTEXT_ACCESSES as usize);
+};
 
 /// One entry of the jump cache (H6): the key is that of the context plus
 /// the generation of the cache when it was filled. An empty entry has the
@@ -210,6 +249,8 @@ pub struct Jit {
     trampoline: (u64, u64),
     /// Each block is named in the perf map (H13e).
     perf_map: bool,
+    /// How the code in the region reaches memory (H7, `set_memory`).
+    memory: Memory,
     pub stats: Stats,
 }
 
@@ -269,8 +310,27 @@ impl Jit {
             defect: Defect::None,
             trampoline: (base, len as u64),
             perf_map: false,
+            memory: Memory::Thunk,
             stats: Stats::default(),
         })
+    }
+
+    /// How the blocks that are compiled from now on reach memory (H7). A
+    /// change drops the code of the region, as a full region does (H13c),
+    /// so that no block of the other kind runs or is chained to: a block
+    /// that keeps its accesses never reaches one that does not.
+    pub fn set_memory(&mut self, memory: Memory) {
+        if memory != self.memory {
+            self.region.reset();
+            self.incoming.clear();
+            self.clear_jumps();
+            self.memory = memory;
+        }
+    }
+
+    /// How the code in the region reaches memory.
+    pub fn memory(&self) -> Memory {
+        self.memory
     }
 
     /// A context for code of this JIT, with nothing counted yet.
@@ -284,6 +344,9 @@ impl Jit {
             chained: 0,
             hits: 0,
             jump_generation: self.jump_generation,
+            reads: tlb::EMPTY_TABLE.as_ptr(),
+            writes: tlb::EMPTY_TABLE.as_ptr(),
+            accesses: 0,
         }
     }
 
