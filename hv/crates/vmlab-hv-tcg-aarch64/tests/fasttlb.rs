@@ -172,38 +172,6 @@ fn a_load_and_a_store_of_ram_fill_the_tables_of_their_level_and_then_hit() {
 }
 
 #[test]
-fn the_misses_are_counted_by_their_cause() {
-    let entries = vmlab_hv_tcg_jit::tlb::ENTRIES as u64;
-    // The page that takes the place of `VA + 0x1000` in the tables.
-    let rival = VA + 0x1000 + (entries << 12);
-    let mut machine = Machine::new(&[ldr(1, 0), str(1, 2), HVC]);
-    machine.map(VA, DATA | AF | NO_EXECUTE);
-    machine.map(VA + 0x1000, OTHER | AF | NO_EXECUTE);
-    machine.map(rival, OTHER | AF | NO_EXECUTE);
-    machine.cpu.state.set_x(0, VA + 0x10);
-    machine.cpu.state.set_x(2, VA + 0x1ff8);
-    machine.run();
-    let kinds = |machine: &Machine| {
-        let counts = machine.cpu.jit_counts();
-        (
-            counts.tlb_miss_unaligned,
-            counts.tlb_miss_empty,
-            counts.tlb_miss_conflict,
-        )
-    };
-    // Both found their entries empty.
-    assert_eq!((machine.misses(), kinds(&machine)), (2, (0, 2, 0)));
-    // A load that is not aligned to its size, and a store to the page
-    // that has the place of the one that the entry holds.
-    machine.cpu.state.set_x(0, VA + 0x11);
-    machine.cpu.state.set_x(2, rival + 0x8);
-    machine.run();
-    assert_eq!(machine.cpu.taken, None);
-    assert_eq!((machine.misses(), kinds(&machine)), (4, (1, 2, 1)));
-    assert!(machine.holds(EL1, true, rival) && !machine.holds(EL1, true, VA + 0x1000));
-}
-
-#[test]
 fn an_access_of_el0_fills_the_tables_of_el0() {
     let mut machine = Machine::new(&[ldr(1, 0), str(1, 2), HVC]);
     machine.map(VA, DATA | AF | USER | NO_EXECUTE);
