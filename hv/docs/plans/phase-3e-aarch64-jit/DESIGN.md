@@ -1283,6 +1283,79 @@ to 57 % of QEMU. Basis: the gains of the table multiplied, each on the
 measured rows of J9b. So R1 holds: the next cards do not reach D1 on the
 boot or on the D2 workloads, and they do not show what would.
 
+### J13, measured by card J13
+
+Helios, 2026-11-28, *measured*, the JIT on (the default) for both
+columns. Before: `2f8a7dc4` (`next`, whose hv code is that of `4af3439a`,
+the commit of J9). After: `d28d07cc`, the code of this card. The D2 suite
+on Debian 13, the median of 3 with the range: before on cores 20 to 23,
+after on cores 24 to 27, side by side for most of the runs. Other cards ran
+builds and boots at the same time (load average 6 to 20 at the starts of
+the rows). The flat images: cores 28 to 31, one after the other. The rows
+are in `bench/history/aarch64.jsonl` with the note `card J13`. "Of QEMU" is
+QEMU's time of the J9 rows over ours.
+
+What changed:
+
+- **J13a. The crypto operations are fourteen helpers.** Each of the 3d set
+  (`AESE` to `SHA256SU1`) is a pure helper of its own,
+  `helpers::crypto::HELPERS`, on `(d, n, m)`, with no code of the operation
+  to dispatch on. Compiled code calls each one with the six words of its
+  three values in the argument registers of the System V convention and
+  takes the result from RAX and RDX (`jit::Effect::registers`,
+  `jit::RegisterFn`): no `pure_call`, no walk over the places of the call
+  in Rust, no slice of arguments. The interpreter calls the same function
+  through `HelperFn::Pure`.
+- **J13b. Lane operations inline.** The integer `ADD`, `SUB`, `CMEQ` (of a
+  register and of zero), `CMTST` and `REV16`, `REV32`, `REV64` of a vector
+  of 64 or 128 bits, and `ADD` and `SUB` of D registers, are operations of
+  the graph on words of 64 bits that carry nothing from one lane into the
+  next (the top bit of each lane kept apart), which the emitter has inline
+  forms for. Before, each was a call of `simd::eval`. The `sha256` loop
+  runs `ADD` of 32-bit lanes and `REV32` of bytes beside the four SHA-256
+  operations (its moves, `ORR`, were inline already), and the string
+  functions of glibc and the kernel compare bytes with `CMEQ` and `CMTST`.
+  Which AdvSIMD forms a boot runs, and how often, was not counted: the
+  profile of J9 names the functions of the evaluator, not the forms.
+
+| Workload | vCPUs | Before | After | Gain | After, of QEMU |
+|---|---|---|---|---|---|
+| `sha256_256M`, s | 1 | 10.59 (10.51 to 15.01) | 3.92 (3.69 to 4.29) | 2.7 times | 54 % |
+| `sha256_256M`, s | 4 | 8.47 (7.64 to 8.50) | 2.11 (2.09 to 2.18) | 4.0 times | 96 % |
+| `xz_9_32M`, s | 1 | 9.29 (9.07 to 15.70) | 9.29 (9.09 to 9.37) | none | 30 % |
+| `xz_9_32M`, s | 4 | 9.37 (8.67 to 9.97) | 9.06 (8.82 to 9.12) | none: noise | 30 % |
+| Boot to agent ready, full suite, s | 1 | 97.34 (90.71 to 132.21), 185.6 MIPS | 68.79 (66.13 to 74.76), 260.0 MIPS | see J13d | 39 % |
+| Boot to agent ready, full suite, s | 4 | 60.46 (57.22 to 64.32), 330.0 MIPS | 48.26 (45.86 to 52.27), 395.9 MIPS | see J13d | 42 % |
+| Boot to agent ready, boot suite, s | 1 | 80.38 (66.09 to 85.45), 225.0 MIPS | 73.00 (72.81 to 105.16), 245.1 MIPS | none: noise | 37 % |
+| CoreMark mix, flat, MIPS | 1 | 1,963.0 (1,950.8 to 1,970.2) | 1,985.8 (1,984.7 to 2,002.6) | none: noise | 77 % |
+| Scalar loop, flat, MIPS | 1 | 2,004.1 (1,998.5 to 2,011.0) | 2,021.1 (2,007.2 to 2,035.7) | none: noise | 65 % |
+
+- **J13c. `sha256` is above bar T3** at both vCPU counts (O1 of Q4: at
+  least 50 % of QEMU), and near QEMU at four vCPUs. The estimate of J9c
+  was 2 to 3 times; one vCPU measured 2.7 and four 4.0. The two differ by
+  1.9 times after, against 1.25 before. The basis of an explanation, not
+  measured: as in J9b3, at one vCPU the same vCPU also serves the
+  interrupts and the reads of the page cache, and that part did not get
+  faster.
+- **J13d. The boot rows.** The boot ran 3.2 % of its samples in the
+  helpers of FP, AdvSIMD and crypto (J9a), so the change cannot make it 1.4
+  times faster at one vCPU. The full-suite rows before ran beside the
+  first `just ci::check` of this card and other cards' builds, and the
+  boot-suite rows, which ran with less load, differ within their noise.
+  The rows at four vCPUs are 1.25 times apart, which is more than their
+  ranges; that the change gives it is not shown.
+- **J13e. The interpreter share (H2b)** is zero for a missing form in every
+  row, before and after: no block refused. At the budget (H2c): 145 to 305
+  instructions a boot at one vCPU, 6,722 to 9,000 at four.
+- **J13f. Boots that did not reach agent ready.** Four Debian boots of this
+  card fell into emergency mode on the 90 s timeout of the device of
+  `/boot/efi`: one of the before binary, two of the after binary and one
+  of K3, each while the host's load average was 15 to 44. Each serial
+  log shows the timeout and the emergency mode, and each vCPU had run 18.0e9
+  instructions, those of a boot to agent ready, when it went idle. They are not in
+  the rows: each was stopped and its row run again. J6f found the same
+  timeout for Fedora.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
