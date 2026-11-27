@@ -1862,14 +1862,15 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
             let at = frame[usize::from(op.a)];
             let bytes = op.aux & !UNPRIVILEGED;
             let level = usize::from(!env.side.user);
-            if let Some(entry) = env
+            if let Some(phys) = env
                 .side
                 .mmu
                 .fast()
                 .and_then(|fast| fast.lookup(level, true, at, bytes))
+                .map(|entry| entry.phys)
             {
                 env.memory
-                    .wrote_straight(entry.phys | (at & 0xfff), usize::from(bytes));
+                    .wrote_straight(phys | (at & 0xfff), usize::from(bytes));
                 env.side.own_writes += 1;
             }
             return 0;
@@ -1877,7 +1878,10 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
         jit::LOGGED => {
             // A hit of a block compiled for a CPU that keeps its accesses.
             let bytes = op.aux & !UNPRIVILEGED;
-            let write = op.code as u8 >= Code::Store1 as u8 && op.code as u8 <= Code::Store8 as u8;
+            let write = matches!(
+                op.code,
+                Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8
+            );
             let value = frame[usize::from(if write { op.b } else { op.dst })];
             if let Some(log) = &mut env.side.log {
                 log.push(Access {

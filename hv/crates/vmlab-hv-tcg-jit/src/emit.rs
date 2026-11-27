@@ -454,7 +454,7 @@ impl Emitter<'_> {
 
     /// Call the thunk for the operation `index`, keeping `saved`. RAX holds
     /// what it returns.
-    fn call_thunk(asm: &mut Asm, index: usize, saved: &[Reg]) {
+    fn call_thunk(asm: &mut Asm, index: u64, saved: &[Reg]) {
         for reg in saved {
             asm.push(*reg);
         }
@@ -464,7 +464,7 @@ impl Emitter<'_> {
             asm.alu_imm(Alu::Sub, Rm::Reg(RSP), 8);
         }
         asm.mov(RDI, Rm::Mem(R13, CONTEXT_ENV));
-        asm.mov_imm(RSI, index as u64);
+        asm.mov_imm(RSI, index);
         asm.call_indirect(Rm::Mem(R13, CONTEXT_THUNK));
         if pad {
             asm.alu_imm(Alu::Add, Rm::Reg(RSP), 8);
@@ -486,7 +486,7 @@ impl Emitter<'_> {
             self.words[usize::from(*word)].home = Home::Frame;
         }
         let saved = self.live_caller_saved();
-        Self::call_thunk(&mut self.asm, index, &saved);
+        Self::call_thunk(&mut self.asm, index as u64, &saved);
         self.asm.test(RAX, RAX);
         self.asm.jcc_absolute(Cond::Ne, self.exit);
     }
@@ -526,7 +526,7 @@ impl Emitter<'_> {
             Self::home_code(&mut self.asm, *word, w);
         }
         let saved = self.live_caller_saved();
-        Self::call_thunk(&mut self.asm, index, &saved);
+        Self::call_thunk(&mut self.asm, index as u64, &saved);
         self.asm.test(RAX, RAX);
         self.asm.jcc_absolute(Cond::Ne, self.exit);
         self.asm.jmp(back);
