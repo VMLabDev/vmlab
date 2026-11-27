@@ -59,7 +59,7 @@ pub mod tlb;
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
 pub use emit::{
     Chain, Defect, Effect, FlagOperation, FlagTest, LazyCondition, Memory, Next, NextPc, Refused,
-    Shape, add_flags, sub_flags,
+    Shape, Side, add_flags, sub_flags,
 };
 use region::Region;
 use std::cell::Cell;
@@ -78,8 +78,9 @@ pub const LOOKUP: u64 = 0x20;
 /// The block ran to its end and the jump cache had an entry for the PC,
 /// which it did not take (`Chain::verify`).
 pub const VERIFY: u64 = 0x30;
-/// The most exits of a block that can be linked.
-pub const SITES: usize = 2;
+/// The most exits of a block that can be linked: two at its end, and the
+/// side exits of a superblock (card J14).
+pub const SITES: usize = 10;
 
 /// The function that runs an operation of a block for its code: `env` is
 /// what the context holds, `index` the operation in the low 32 bits and
@@ -139,6 +140,11 @@ pub struct Context {
     /// block adds those of its block, so a block that leaves before its end
     /// counts all of them.
     pub accesses: u64,
+    /// The instructions that the head of a superblock took from the budget
+    /// and that a side exit of it did not run (card J14). They stay taken
+    /// from the budget, so that the head of a block after it in a run of
+    /// one block leaves as it would, and the owner counts them apart.
+    pub refund: u64,
 }
 
 pub(crate) const CONTEXT_BUDGET: i32 = 0;
@@ -152,12 +158,14 @@ pub(crate) const CONTEXT_JUMP_GENERATION: i32 = 56;
 pub(crate) const CONTEXT_READS: i32 = 64;
 pub(crate) const CONTEXT_WRITES: i32 = 72;
 pub(crate) const CONTEXT_ACCESSES: i32 = 80;
+pub(crate) const CONTEXT_REFUND: i32 = 88;
 
 const _: () = {
     assert!(std::mem::offset_of!(Context, jump_generation) == CONTEXT_JUMP_GENERATION as usize);
     assert!(std::mem::offset_of!(Context, reads) == CONTEXT_READS as usize);
     assert!(std::mem::offset_of!(Context, writes) == CONTEXT_WRITES as usize);
     assert!(std::mem::offset_of!(Context, accesses) == CONTEXT_ACCESSES as usize);
+    assert!(std::mem::offset_of!(Context, refund) == CONTEXT_REFUND as usize);
 };
 
 /// One entry of the jump cache (H6): the key is that of the context plus
@@ -404,6 +412,7 @@ impl Jit {
             reads: tlb::EMPTY_TABLE.as_ptr(),
             writes: tlb::EMPTY_TABLE.as_ptr(),
             accesses: 0,
+            refund: 0,
         }
     }
 

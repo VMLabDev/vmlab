@@ -444,6 +444,7 @@ fn compiled_on(
         chain: None,
         next: None,
         memory: block.memory,
+        sides: &[],
     };
     let entry = jit.compile(&shape).expect("a block that the emitter takes");
     let mut frame = block.frame.clone();
@@ -1427,6 +1428,7 @@ fn a_form_that_the_host_lacks_is_refused() {
         chain: None,
         next: None,
         memory: Memory::Thunk,
+        sides: &[],
     };
     assert_eq!(jit.compile(&shape), Err(Refused::Form(Code::PopCount)));
     let rbit = Op {
@@ -1461,6 +1463,7 @@ fn a_full_region_starts_a_new_generation() {
             chain: None,
             next: None,
             memory: Memory::Thunk,
+            sides: &[],
         };
         let entry = jit.compile(&shape).expect("a block");
         let first = *first.get_or_insert(entry);
@@ -1494,6 +1497,7 @@ fn the_perf_map_names_the_trampoline_and_each_block() {
         chain: None,
         next: None,
         memory: Memory::Thunk,
+        sides: &[],
     };
     // Off: nothing is written.
     let entry = jit.compile(&shape).expect("a block");
@@ -1534,6 +1538,7 @@ fn written_words_are_the_results_and_the_inputs_and_the_rest_are_constants() {
             chain: None,
             next: None,
             memory: Memory::Thunk,
+            sides: &[],
         };
         let written = crate::emit::written(&shape).expect("a block");
         assert_eq!(written.len(), block.frame.len());
@@ -1596,6 +1601,7 @@ fn a_seeded_defect_makes_an_add_subtract() {
         chain: None,
         next: None,
         memory: Memory::Thunk,
+        sides: &[],
     };
     for (defect, expected) in [(crate::Defect::None, 8), (crate::Defect::AddSubtracts, 2)] {
         let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
@@ -1687,6 +1693,7 @@ impl Looping {
             }),
             next: Some(Next { pc: 1, kind }),
             memory: Memory::Thunk,
+            sides: &[],
         };
         jit.compile(&shape).expect("a block that the emitter takes")
     }
@@ -2045,6 +2052,7 @@ fn run_on_tables(
         chain: None,
         next: None,
         memory: block.memory,
+        sides: &[],
     };
     let entry = jit.compile(&shape).expect("a block");
     let mut frame = block.frame.clone();
