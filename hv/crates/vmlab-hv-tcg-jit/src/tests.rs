@@ -172,6 +172,27 @@ struct Env {
     logged: Vec<(u64, u8, u64, bool)>,
 }
 
+impl Env {
+    /// The fields beside the block: no memory, an empty TLB.
+    fn base() -> Self {
+        Self {
+            ops: Vec::new(),
+            frame: std::ptr::null_mut(),
+            words: 0,
+            calls: Vec::new(),
+            thunk_calls: 0,
+            left_at: None,
+            ram: std::ptr::null_mut(),
+            tlb: FastTlb::new(),
+            watch: Vec::new(),
+            fill: false,
+            misses: 0,
+            watched: 0,
+            logged: Vec::new(),
+        }
+    }
+}
+
 /// A helper call of the test: the first word that it writes gets a mix of
 /// the words that it reads.
 fn call(effect: &Effect, frame: &mut [u64]) {
@@ -189,7 +210,7 @@ const LEFT: u64 = 7;
 
 /// # Safety
 /// `env` is an `Env` whose frame is valid.
-unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64) -> u64 {
+unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64, _block: *mut c_void) -> u64 {
     // SAFETY: the test passes its `Env`.
     let env = unsafe { &mut *env.cast::<Env>() };
     env.thunk_calls += 1;
@@ -326,6 +347,16 @@ struct Ran {
     logged: Vec<(u64, u8, u64, bool)>,
 }
 
+/// What a compiled run did beside its slots.
+struct Ran {
+    code: u64,
+    words: Vec<u64>,
+    thunk_calls: u64,
+    misses: u64,
+    watched: u64,
+    logged: Vec<(u64, u8, u64, bool)>,
+}
+
 fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u64, Vec<u64>, u64) {
     let mut ram = vec![0u8; PAGES * 4096];
     let ran = compiled_on(jit, block, slots, budget, &mut ram, None);
@@ -352,6 +383,8 @@ fn compiled_on(
         inputs: &block.inputs,
         outputs: &block.outputs,
         instructions: 1,
+        chain: None,
+        next: None,
         memory: block.memory,
     };
     let entry = jit.compile(&shape).expect("a block that the emitter takes");
@@ -362,30 +395,29 @@ fn compiled_on(
         frame: frame.as_mut_ptr(),
         words: frame.len(),
         calls: block.calls.clone(),
-        thunk_calls: 0,
-        left_at: None,
         ram: ram.as_mut_ptr(),
         tlb: tlb.unwrap_or_else(FastTlb::new),
         watch: (0..PAGES)
             .map(|page| AtomicU32::new(u32::from(page == WATCHED_PAGE)))
             .collect(),
         fill,
-        misses: 0,
-        watched: 0,
-        logged: Vec::new(),
+        ..Env::base()
     };
     let reads = env.tlb.table(1, false);
     let writes = env.tlb.table(1, true);
-    let mut context = Context {
-        budget,
-        thunk,
-        env: (&raw mut env).cast(),
-        reads,
-        writes,
-    };
+    let mut context = jit.context(budget, thunk, (&raw mut env).cast());
+    context.reads = reads;
+    context.writes = writes;
     // SAFETY: the entry was just compiled from this block, and the slots
     // and the frame are as large as it names. The tables live in `env`.
-    let code = unsafe { jit.enter(&entry, &mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
+    let code = unsafe {
+        jit.enter(
+            &entry,
+            &raw mut context,
+            slots.as_mut_ptr(),
+            frame.as_mut_ptr(),
+        )
+    };
     let mut words = Vec::new();
     if code == LEFT {
         let op = block.ops[env.left_at.expect("the guard that failed")];
@@ -547,7 +579,7 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
                 };
                 ops.push(Op {
                     code,
-                    aux: bytes,
+                    aux: 0,
                     dst,
                     a: at,
                     b,
@@ -726,6 +758,8 @@ fn a_form_that_the_host_lacks_is_refused() {
         inputs: &inputs,
         outputs: &outputs,
         instructions: 1,
+        chain: None,
+        next: None,
         memory: Memory::Thunk,
     };
     assert_eq!(jit.compile(&shape), Err(Refused::Form(Code::PopCount)));
@@ -757,6 +791,8 @@ fn a_full_region_starts_a_new_generation() {
             inputs: &block.inputs,
             outputs: &block.outputs,
             instructions: 1,
+            chain: None,
+            next: None,
             memory: Memory::Thunk,
         };
         let entry = jit.compile(&shape).expect("a block");
@@ -767,6 +803,338 @@ fn a_full_region_starts_a_new_generation() {
         }
     }
     panic!("the region never filled");
+}
+
+#[test]
+fn the_perf_map_names_the_trampoline_and_each_block() {
+    assert_eq!(
+        crate::perf::line(0x7f00_1000, 0x40, "a\nb"),
+        "7f001000 40 a b\n"
+    );
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut random = Random(5);
+    let block = random_block(&mut random, 20);
+    let shape = Shape {
+        ops: &block.ops,
+        generics: &[],
+        frame: &block.frame,
+        accesses: &[],
+        calls: &block.calls,
+        leaves: &block.leaves,
+        inputs: &block.inputs,
+        outputs: &block.outputs,
+        instructions: 1,
+        chain: None,
+        next: None,
+        memory: Memory::Thunk,
+    };
+    // Off: nothing is written.
+    let entry = jit.compile(&shape).expect("a block");
+    jit.name(&entry, "not named").expect("no map, no write");
+    jit.set_perf_map(true).expect("the perf map opens");
+    let entry = jit.compile(&shape).expect("a block");
+    jit.name(&entry, "a64 0x1000 test block")
+        .expect("a line of the map");
+    let map = std::fs::read_to_string(crate::perf::path()).expect("the perf map");
+    let line = format!(
+        "{:x} {:x} a64 0x1000 test block",
+        entry.address, entry.bytes
+    );
+    assert!(map.lines().any(|l| l == line), "{map}");
+    assert!(
+        map.lines().any(|l| l.ends_with(" vmlab-hv-jit enter")),
+        "{map}"
+    );
+    assert!(!map.contains("not named"));
+    let _ = std::fs::remove_file(crate::perf::path());
+}
+
+#[test]
+fn written_words_are_the_results_and_the_inputs_and_the_rest_are_constants() {
+    let mut random = Random(9);
+    for _ in 0..50 {
+        let block = random_block(&mut random, 30);
+        let shape = Shape {
+            ops: &block.ops,
+            generics: &[],
+            frame: &block.frame,
+            accesses: &[],
+            calls: &block.calls,
+            leaves: &block.leaves,
+            inputs: &block.inputs,
+            outputs: &block.outputs,
+            instructions: 1,
+            chain: None,
+            next: None,
+            memory: Memory::Thunk,
+        };
+        let written = crate::emit::written(&shape).expect("a block");
+        assert_eq!(written.len(), block.frame.len());
+        for op in &block.ops {
+            if (op.code as u8) < vmlab_hv_tcg_ir::block::FIRST_EFFECT && op.code != Code::Generic {
+                assert!(written[usize::from(op.dst)], "{op:?}");
+            }
+        }
+        for (place, _) in &block.inputs {
+            assert!(written[usize::from(place.slot)]);
+        }
+    }
+}
+
+#[test]
+fn a_seeded_defect_makes_an_add_subtract() {
+    // add, of the inputs, to the output: 5 + 3 is 2 with the defect.
+    let frame = vec![0u64; 3];
+    let ops = [Op {
+        code: Code::Add,
+        aux: 64,
+        dst: 2,
+        a: 0,
+        b: 1,
+        imm: u64::MAX,
+    }];
+    let inputs = [
+        (
+            Place {
+                slot: 0,
+                wide: false,
+            },
+            0,
+        ),
+        (
+            Place {
+                slot: 1,
+                wide: false,
+            },
+            1,
+        ),
+    ];
+    let outputs = [(
+        2,
+        Place {
+            slot: 2,
+            wide: false,
+        },
+    )];
+    let shape = Shape {
+        ops: &ops,
+        generics: &[],
+        frame: &frame,
+        accesses: &[],
+        calls: &[],
+        leaves: &[],
+        inputs: &inputs,
+        outputs: &outputs,
+        instructions: 1,
+        chain: None,
+        next: None,
+        memory: Memory::Thunk,
+    };
+    for (defect, expected) in [(crate::Defect::None, 8), (crate::Defect::AddSubtracts, 2)] {
+        let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+        jit.seed_defect(defect);
+        let entry = jit.compile(&shape).expect("a block");
+        let mut slots = [5u128, 3, 0];
+        let mut run_frame = frame.clone();
+        let mut env = Env {
+            ops: ops.to_vec(),
+            frame: run_frame.as_mut_ptr(),
+            words: run_frame.len(),
+            calls: Vec::new(),
+            ..Env::base()
+        };
+        let mut context = jit.context(10, thunk, (&raw mut env).cast());
+        // SAFETY: the entry was just compiled from this block, and the
+        // slots and the frame are as large as it names.
+        let code = unsafe {
+            jit.enter(
+                &entry,
+                &raw mut context,
+                slots.as_mut_ptr(),
+                run_frame.as_mut_ptr(),
+            )
+        };
+        assert_eq!((code, slots[2]), (DONE, expected), "{defect:?}");
+    }
+}
+
+/// A block of one instruction that adds 1 to the register 0 and moves the
+/// PC (the register 1) by the constant 0 or to the value of the register 2:
+/// it chains to itself through a linked jump or through the jump cache.
+struct Looping {
+    frame: Vec<u64>,
+    ops: Vec<Op>,
+    inputs: Vec<(Place, u32)>,
+    outputs: Vec<(u32, Place)>,
+}
+
+fn word(slot: Slot) -> Place {
+    Place { slot, wide: false }
+}
+
+impl Looping {
+    fn new() -> Self {
+        // Word 1 is the register 0, 2 the sum, 3 the constant 1, 4 the
+        // distance 0, 5 the register 2.
+        let mut frame = vec![0u64; 6];
+        frame[3] = 1;
+        Self {
+            frame,
+            ops: vec![Op {
+                code: Code::Add,
+                aux: 0,
+                dst: 2,
+                a: 1,
+                b: 3,
+                imm: u64::MAX,
+            }],
+            inputs: vec![(word(1), 0), (word(5), 2)],
+            outputs: vec![(0, word(2))],
+        }
+    }
+
+    fn compile(&mut self, jit: &mut Jit, kind: NextPc, key: u64) -> Entry {
+        let frame = self.frame.as_mut_ptr() as u64;
+        let shape = Shape {
+            ops: &self.ops,
+            generics: &[],
+            frame: &self.frame,
+            accesses: &[],
+            calls: &[],
+            leaves: &[],
+            inputs: &self.inputs,
+            outputs: &self.outputs,
+            instructions: 1,
+            chain: Some(Chain {
+                frame,
+                tag: 0x7a6,
+                key,
+                page_offset: 0x100,
+                sites: true,
+                jumps: true,
+                verify: false,
+            }),
+            next: Some(Next { pc: 1, kind }),
+            memory: Memory::Thunk,
+        };
+        jit.compile(&shape).expect("a block that the emitter takes")
+    }
+
+    /// Run from `entry` with `budget`: the code it left with, and the
+    /// context after.
+    fn run(
+        &mut self,
+        jit: &Jit,
+        entry: &Entry,
+        slots: &mut [u128; 3],
+        budget: i64,
+    ) -> (u64, Context) {
+        let mut env = Env {
+            ops: self.ops.clone(),
+            frame: self.frame.as_mut_ptr(),
+            words: self.frame.len(),
+            calls: Vec::new(),
+            ..Env::base()
+        };
+        let mut context = jit.context(budget, thunk, (&raw mut env).cast());
+        // SAFETY: the entry was compiled from this block, whose frame is
+        // alive, and the slots are as many as it names.
+        let code = unsafe {
+            jit.enter(
+                entry,
+                &raw mut context,
+                slots.as_mut_ptr(),
+                self.frame.as_mut_ptr(),
+            )
+        };
+        (code, context)
+    }
+}
+
+#[test]
+fn a_linked_jump_chains_until_the_budget_and_unlinks_to_its_stub() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Relative(word(4)), 9);
+    assert_eq!(entry.site_count, 1);
+    let mut slots = [0u128, 0x4000_0100, 0];
+    // Not linked: one run, and the exit of the jump.
+    let (code, context) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!((code, context.budget, context.chained), (CHAIN, 99, 1));
+    assert_eq!(context.block as u64, 0x7a6);
+    assert_eq!(slots[..2], [1, 0x4000_0100]);
+    // Linked: the block runs until its head finds the budget spent.
+    assert!(jit.link(&entry, 0, &entry));
+    assert_eq!(jit.linked(), 1);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.budget, context.chained), (BUDGET, 0, 10));
+    assert_eq!(slots[0], 11);
+    // Unlinked: back to the stub.
+    jit.unlink_to(entry.address);
+    assert_eq!(jit.linked(), 0);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!(code, CHAIN);
+    assert_eq!(slots[0], 12);
+    assert_eq!((jit.stats.links, jit.stats.unlinks), (1, 1));
+}
+
+#[test]
+fn the_jump_cache_serves_its_pc_and_its_key_and_is_dropped_with_the_region() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    assert_eq!(entry.site_count, 0);
+    let pc = 0x4000_0100u64;
+    let mut slots = [0u128, u128::from(pc), u128::from(pc)];
+    let (code, _) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!(code, LOOKUP);
+    jit.fill(pc, 9, &entry);
+    assert_eq!(jit.jump_target(pc, 9), Some(entry.address));
+    let (code, context) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!((code, context.hits), (BUDGET, 20));
+    assert_eq!(slots[0], 21);
+    // An entry of another context is a miss.
+    jit.fill(pc, 8, &entry);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!((code, context.hits), (LOOKUP, 0));
+    // An entry from before the cache was emptied is a miss.
+    jit.fill(pc, 9, &entry);
+    jit.clear_jumps();
+    assert_eq!(jit.jump_target(pc, 9), None);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!(code, LOOKUP);
+    // Another PC is a miss.
+    jit.fill(pc, 9, &entry);
+    slots[2] = u128::from(pc + 4);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!(code, LOOKUP);
+    // A full region drops the jump cache with the code.
+    let mut other = Looping::new();
+    let resets = jit.stats.resets;
+    while jit.stats.resets == resets {
+        other.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    assert_eq!(jit.jump_target(pc, 9), None);
+    assert!(!jit.current(&entry));
+}
+
+#[test]
+fn a_fixed_next_pc_leaves_with_done_and_a_jump_outside_the_page_has_no_site() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Fixed(8), 9);
+    assert_eq!(entry.site_count, 0);
+    let mut slots = [0u128, 0x4000_0100, 0];
+    let (code, _) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!(code, DONE);
+    assert_eq!(slots[1], 0x4000_0108);
+    // A distance of a page from the offset 0x100 leaves it: the jump cache.
+    block.frame[4] = 0x1000;
+    let entry = block.compile(&mut jit, NextPc::Relative(word(4)), 9);
+    assert_eq!(entry.site_count, 0);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!(code, LOOKUP);
+    assert_eq!(slots[1], 0x4000_1108);
 }
 
 /// The memory of the tests with a pattern in it.
@@ -884,6 +1252,8 @@ fn run_on_tables(
         inputs: &[],
         outputs: &block.outputs,
         instructions: 1,
+        chain: None,
+        next: None,
         memory: block.memory,
     };
     let entry = jit.compile(&shape).expect("a block");
@@ -892,29 +1262,17 @@ fn run_on_tables(
         ops: thunk_ops.to_vec(),
         frame: frame.as_mut_ptr(),
         words: frame.len(),
-        calls: Vec::new(),
-        thunk_calls: 0,
-        left_at: None,
         ram: ram.as_mut_ptr(),
-        tlb: FastTlb::new(),
-        watch: Vec::new(),
-        fill: false,
-        misses: 0,
-        watched: 0,
-        logged: Vec::new(),
+        ..Env::base()
     };
-    let mut context = Context {
-        budget: 10,
-        thunk,
-        env: (&raw mut env).cast(),
-        reads,
-        writes,
-    };
+    let mut context = jit.context(10, thunk, (&raw mut env).cast());
+    context.reads = reads;
+    context.writes = writes;
     let mut slots = [0u128; 1];
     // SAFETY: the entry was just compiled from this block, the slots and
     // the frame are as large as it names, and the caller's tables live
     // through the run.
-    let code = unsafe { jit.enter(&entry, &mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
+    let code = unsafe { jit.enter(&entry, &raw mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
     (code, env.thunk_calls, env.misses, env.watched)
 }
 
@@ -924,7 +1282,7 @@ fn load_and_store(load_at: u64, store_at: u64) -> (Vec<Op>, Vec<u64>) {
     let ops = vec![
         Op {
             code: Code::Load8,
-            aux: 8,
+            aux: 0,
             dst: 2,
             a: 1,
             b: 0,
@@ -932,7 +1290,7 @@ fn load_and_store(load_at: u64, store_at: u64) -> (Vec<Op>, Vec<u64>) {
         },
         Op {
             code: Code::Store4,
-            aux: 4,
+            aux: 0,
             dst: 0,
             a: 4,
             b: 3,
@@ -1003,7 +1361,7 @@ fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
     let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
     let load = Op {
         code: Code::Load4,
-        aux: 4,
+        aux: 0,
         dst: 2,
         a: 1,
         b: 0,
@@ -1017,7 +1375,7 @@ fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
     for (op, memory) in [
         (
             Op {
-                aux: 4 | THUNK_ACCESS,
+                aux: THUNK_ACCESS,
                 ..load
             },
             Memory::Inline,
@@ -1038,6 +1396,17 @@ fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
         run_on_tables(&mut jit, &block, &[load], &mut ram, reads, writes),
         (DONE, 0, 0, 0)
     );
+    // An alignment of 16 in `aux`: an address aligned to 16 hits, one
+    // aligned to 8 only misses.
+    let aligned = Op { aux: 0x0f, ..load };
+    for (address, misses) in [(RAM + 16, 0), (RAM + 24, 1)] {
+        let block = access_block(vec![aligned], vec![0, address, 0], 2, Memory::Inline);
+        assert_eq!(
+            run_on_tables(&mut jit, &block, &[load], &mut ram, reads, writes),
+            (DONE, misses, misses, 0),
+            "{address:#x}"
+        );
+    }
 }
 
 #[test]

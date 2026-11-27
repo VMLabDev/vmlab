@@ -80,18 +80,28 @@ pub enum Code {
     /// Leave through the exit `imm` unless the word `a` is not zero (`aux`
     /// 1) or is zero (`aux` 0).
     Guard,
-    /// Load `aux` bytes at the address `a` into `dst`. The exit is `imm`.
+    /// Load 1, 2, 4 or 8 bytes at the address `a` into `dst`. The exit is
+    /// `imm`. The `aux` of each load and store code up to `StorePair` holds
+    /// whether the access is made as EL0 and the alignment that Device
+    /// memory asks of it (`exec`).
     Load1,
     Load2,
     Load4,
     Load8,
-    /// Store the low `aux` bytes of `b` at the address `a`. The exit is
+    /// Store the low 1, 2, 4 or 8 bytes of `b` at the address `a`. The exit is
     /// `imm`.
     Store1,
     Store2,
     Store4,
     Store8,
-    /// The access of the index `imm`: 16 bytes, or exclusive.
+    /// Load 16 bytes at the address `a` into `dst` and the word after it.
+    /// The exit is `imm`.
+    LoadPair,
+    /// Store the 16 bytes of `b`, the low word, and `dst`, the high one, at
+    /// the address `a`. The exit is `imm`.
+    StorePair,
+    /// The access of the index `imm`: 16 bytes that are not two words, or
+    /// exclusive.
     Access,
     /// The helper call of the index `imm`.
     Call,
@@ -224,7 +234,7 @@ pub fn op_in_frame(op: &Op, words: usize, generics: usize) -> bool {
         && word(op.dst)
         && match op.code {
             Code::Select => (op.imm as usize) < words,
-            Code::Widen => usize::from(op.dst) + 1 < words,
+            Code::Widen | Code::LoadPair => usize::from(op.dst) + 1 < words,
             Code::Generic => (op.imm as usize) < generics,
             _ => true,
         }
@@ -319,6 +329,8 @@ pub unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Generic]) -
             | Code::Store2
             | Code::Store4
             | Code::Store8
+            | Code::LoadPair
+            | Code::StorePair
             | Code::Access
             | Code::Call => return true,
         };
@@ -351,6 +363,21 @@ fn type_mask(ty: ScalarType) -> u128 {
     }
 }
 
+/// The bitvector of two words that `scalar` is one whole word of, and which
+/// word: a slice of 64 bits at the offset 0 or 64 of a bitvector of 128.
+fn word_of(graph: &Graph, scalar: &crate::native::Scalar) -> Option<(ScalarId, Slot)> {
+    let Operation::Slice {
+        value,
+        offset: offset @ (0 | 64),
+        width: 64,
+    } = scalar.operation
+    else {
+        return None;
+    };
+    (scalar.ty == ScalarType::Bits(64) && graph.scalars[value].ty == ScalarType::Bits(128))
+        .then_some((value, offset / 64))
+}
+
 /// The words of the scalars of one block, and the operations so far.
 pub struct Lowering {
     first: Vec<Slot>,
@@ -380,6 +407,12 @@ impl Lowering {
                 && (wide[value] || !is)
             {
                 first.push(first[value]);
+                continue;
+            }
+            // A word of a bitvector of two words is that word: the halves of
+            // a load or a register of 16 bytes need no operation (card S4).
+            if let Some((value, word)) = word_of(graph, scalar) {
+                first.push(first[value] + word);
                 continue;
             }
             first.push(Slot::try_from(words).ok()?);
@@ -621,6 +654,10 @@ impl Lowering {
     ) -> bool {
         if self.wide[id] {
             return false;
+        }
+        // It shares the words of `value` (`word_of`).
+        if word_of(graph, &graph.scalars[id]).is_some() {
+            return true;
         }
         let imm = (mask(width) as u64) & word_mask(graph.scalars[id].ty);
         let dst = self.first[id];

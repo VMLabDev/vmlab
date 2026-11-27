@@ -37,14 +37,17 @@
 //! AMD64 ABI for the call of the thunk. The operations are those of
 //! `vmlab_hv_tcg_ir::block`.
 
+use crate::asm::Label;
 use crate::asm::{
     Alu, Asm, Cond, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
     Reg, Rm, Shift,
 };
 use crate::tlb::{ADDEND, ENTRIES, ENTRY_BITS, TAG, WATCH};
 use crate::{
-    BUDGET, CONTEXT_BUDGET, CONTEXT_ENV, CONTEXT_READS, CONTEXT_THUNK, CONTEXT_WRITES, Features,
-    LOGGED, MISS, WATCHED,
+    BUDGET, CHAIN, CONTEXT_ACCESSES, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV,
+    CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_THUNK,
+    CONTEXT_WRITES, Features, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
+    WATCHED,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
 
@@ -77,6 +80,56 @@ pub enum Memory {
 /// TLB does not answer for the access (H7a: an unprivileged access of
 /// aarch64).
 pub const THUNK_ACCESS: u8 = 0x80;
+/// The bits of `Op::aux` of a load or a store that are a mask of the low
+/// bits of the address that an inline hit asks to be zero, beside those
+/// below the size of the access. An address with one of them set misses
+/// the fast TLB, and the thunk serves it, which knows why the owner asks
+/// for them (the alignment of Device memory on aarch64).
+pub const ALIGNMENT: u8 = 0x7f;
+
+/// How a block that can be chained to starts and ends (DESIGN.md H5, H6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chain {
+    /// The address of the frame of the block: its head loads it, because
+    /// a block reached by a jump finds the frame of another one in R14.
+    pub frame: u64,
+    /// What its head stores in `Context::block`.
+    pub tag: u64,
+    /// The key of the context of the block in the jump cache. Not 0.
+    pub key: u64,
+    /// The offset of its first instruction in its 4 KiB page.
+    pub page_offset: u32,
+    /// Whether its exits look for the code of the next block: `sites`,
+    /// linked jumps to a target in the same page, and `jumps`, the jump
+    /// cache for the rest. Without either, the block leaves with `DONE`, and
+    /// without one, its exits leave with `DONE` where it would serve them.
+    pub sites: bool,
+    pub jumps: bool,
+    /// A hit of the jump cache leaves with `VERIFY` instead of jumping, so
+    /// that the owner can compare the entry with its own lookup (a check
+    /// for a bisect).
+    pub verify: bool,
+}
+
+/// What the block makes of the PC of the state at its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextPc {
+    /// The PC moves by a constant: the block ends before an instruction
+    /// that its owner runs. It leaves with `DONE`.
+    Fixed(u64),
+    /// The PC moves by the value of a word.
+    Relative(Place),
+    /// The PC is the value of a word.
+    Absolute(Place),
+}
+
+/// The PC at the end of a block: the register slot that holds it, and how
+/// it changes. No operation of a block writes that slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Next {
+    pub pc: u32,
+    pub kind: NextPc,
+}
 
 /// A block as the emitter sees it.
 pub struct Shape<'a> {
@@ -95,7 +148,26 @@ pub struct Shape<'a> {
     /// Register slot, words of the frame: written to the state at the end.
     pub outputs: &'a [(u32, Place)],
     pub instructions: u32,
+    /// The head and the exits of a block that is chained (H5). `None`: the
+    /// frame is the one that `enter` names, and the block leaves with
+    /// `DONE`.
+    pub chain: Option<Chain>,
+    /// The PC at the end of the block. `None`: the block does not change
+    /// it.
+    pub next: Option<Next>,
+    /// How its loads and stores of 1 to 8 bytes reach memory (H7).
     pub memory: Memory,
+}
+
+/// A defect that the emitter puts into its code on purpose, for the tests
+/// that show that K2 and K3 catch a wrong form (3e DESIGN.md J2). Only a
+/// test turns one on: `Jit::seed_defect`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Defect {
+    #[default]
+    None,
+    /// `Code::Add` subtracts.
+    AddSubtracts,
 }
 
 /// Why the emitter made no code for a block. The block runs in the
@@ -200,6 +272,17 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
             reads.extend(leave(op.imm)?);
             (reads, Vec::new())
         }
+        // Two words from `dst` on, and from `b` (low) and `dst` (high).
+        Code::LoadPair => {
+            let mut reads = vec![op.a];
+            reads.extend(leave(op.imm)?);
+            (reads, vec![op.dst, op.dst.checked_add(1)?])
+        }
+        Code::StorePair => {
+            let mut reads = vec![op.a, op.b, op.dst];
+            reads.extend(leave(op.imm)?);
+            (reads, Vec::new())
+        }
         Code::Access | Code::Call => {
             let effect = if op.code == Code::Access {
                 shape.accesses.get(op.imm as usize)?
@@ -217,6 +300,8 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
 
 struct Emitter<'a> {
     asm: Asm,
+    /// Where each word is at the head of the block.
+    initial: Vec<Home>,
     words: Vec<Word>,
     owner: [Option<Slot>; 16],
     /// The positions at which each word is read, in order.
@@ -225,6 +310,7 @@ struct Emitter<'a> {
     pinned: u16,
     exit: u64,
     features: Features,
+    defect: Defect,
     shape: &'a Shape<'a>,
 }
 
@@ -465,6 +551,7 @@ impl Emitter<'_> {
         }
         asm.mov(RDI, Rm::Mem(R13, CONTEXT_ENV));
         asm.mov_imm(RSI, index);
+        asm.mov(RDX, Rm::Mem(R13, CONTEXT_BLOCK));
         asm.call_indirect(Rm::Mem(R13, CONTEXT_THUNK));
         if pad {
             asm.alu_imm(Alu::Add, Rm::Reg(RSP), 8);
@@ -575,8 +662,8 @@ impl Emitter<'_> {
         self.asm.alu(Alu::Add, RCX, Rm::Mem(R13, table));
         // The address in its page and below its size, against the tag.
         self.asm.mov(RDX, Rm::Reg(RAX));
-        self.asm
-            .alu_imm(Alu::And, Rm::Reg(RDX), !0xfff | (i32::from(bytes) - 1));
+        let low = (i32::from(bytes) - 1) | i32::from(op.aux & ALIGNMENT);
+        self.asm.alu_imm(Alu::And, Rm::Reg(RDX), !0xfff | low);
         self.asm.alu(Alu::Cmp, RDX, Rm::Mem(RCX, TAG));
         self.asm.jcc(Cond::Ne, miss);
         self.asm.alu(Alu::Add, RAX, Rm::Mem(RCX, ADDEND));
@@ -656,6 +743,7 @@ impl Emitter<'_> {
                 let b = self.value(op.b, at);
                 self.load(RAX, a);
                 let alu = match op.code {
+                    Code::Add if self.defect == Defect::AddSubtracts => Alu::Sub,
                     Code::Add => Alu::Add,
                     Code::Sub => Alu::Sub,
                     Code::And => Alu::And,
@@ -897,8 +985,158 @@ impl Emitter<'_> {
         }
     }
 
-    /// The end of the block: the outputs to the state, then the exit.
-    fn outputs(&mut self) {
+    /// The end of the block: the outputs to the state, the PC, then the
+    /// exit. The exits that chain are returned: the label of each jump and
+    /// of its stub.
+    fn outputs(&mut self) -> Vec<(Label, Label)> {
+        // The word of the next PC goes into RCX before an output can write
+        // over the slot that it is still in.
+        let next = self.shape.next;
+        if let Some(Next {
+            kind: NextPc::Relative(place) | NextPc::Absolute(place),
+            ..
+        }) = next
+        {
+            let value = self.current(place.slot);
+            self.load(RCX, value);
+        }
+        self.write_outputs();
+        let Some(next) = next else {
+            self.asm.xor32(RAX, RAX);
+            self.asm.jmp_absolute(self.exit);
+            return Vec::new();
+        };
+        let pc = i32::try_from(u64::from(next.pc) * 16).unwrap_or(i32::MAX);
+        let slot = Rm::Mem(R15, pc);
+        match next.kind {
+            NextPc::Fixed(distance) => {
+                self.asm.mov(RAX, slot);
+                if i32::try_from(distance as i64).is_ok() {
+                    self.asm.alu_imm(Alu::Add, Rm::Reg(RAX), distance as i32);
+                } else {
+                    self.asm.mov_imm(RDX, distance);
+                    self.asm.alu(Alu::Add, RAX, Rm::Reg(RDX));
+                }
+            }
+            NextPc::Relative(_) => {
+                self.asm.mov(RAX, slot);
+                self.asm.alu(Alu::Add, RAX, Rm::Reg(RCX));
+            }
+            NextPc::Absolute(_) => self.asm.mov(RAX, Rm::Reg(RCX)),
+        }
+        self.asm.store(slot, RAX);
+        self.asm.store_imm(Rm::Mem(R15, pc + 8), 0);
+        let chain = match self.shape.chain {
+            Some(chain)
+                if (chain.sites || chain.jumps) && !matches!(next.kind, NextPc::Fixed(_)) =>
+            {
+                chain
+            }
+            _ => {
+                self.asm.xor32(RAX, RAX);
+                self.asm.jmp_absolute(self.exit);
+                return Vec::new();
+            }
+        };
+        // H5: a constant distance to a target in the page of the block is a
+        // jump that its owner links. RCX holds the distance.
+        let mut sites = Vec::new();
+        if let NextPc::Relative(place) = next.kind
+            && chain.sites
+        {
+            for distance in self.candidates(place.slot) {
+                let target = i64::from(chain.page_offset) + distance as i64;
+                if !(0..4096).contains(&target) || sites.len() == SITES {
+                    continue;
+                }
+                let Ok(immediate) = i32::try_from(distance as i64) else {
+                    continue;
+                };
+                let other = self.asm.label();
+                let jump = self.asm.label();
+                let stub = self.asm.label();
+                self.asm.alu_imm(Alu::Cmp, Rm::Reg(RCX), immediate);
+                self.asm.jcc(Cond::Ne, other);
+                self.asm.alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_CHAINED), 1);
+                self.asm.bind(jump);
+                self.asm.jmp(stub);
+                self.asm.bind(other);
+                self.asm.cold(true);
+                self.asm.bind(stub);
+                self.asm.mov_imm(RAX, CHAIN + sites.len() as u64);
+                self.asm.jmp_absolute(self.exit);
+                self.asm.cold(false);
+                sites.push((jump, stub));
+            }
+        }
+        if !chain.jumps {
+            self.asm.xor32(RAX, RAX);
+            self.asm.jmp_absolute(self.exit);
+            return sites;
+        }
+        // H6: the jump cache, by the PC in RAX.
+        let miss = self.asm.label();
+        self.asm.mov(RDX, Rm::Reg(RAX));
+        self.asm.shift_imm(Shift::Shr, RDX, 2);
+        self.asm
+            .alu_imm(Alu::And, Rm::Reg(RDX), (JUMP_ENTRIES - 1) as i32);
+        self.asm.shift_imm(Shift::Shl, RDX, JUMP_SHIFT);
+        self.asm.alu(Alu::Add, RDX, Rm::Mem(R13, CONTEXT_JUMP));
+        self.asm.alu(Alu::Cmp, RAX, Rm::Mem(RDX, 0));
+        self.asm.jcc(Cond::Ne, miss);
+        self.asm.mov_imm(RCX, chain.key);
+        self.asm
+            .alu(Alu::Add, RCX, Rm::Mem(R13, CONTEXT_JUMP_GENERATION));
+        self.asm.alu(Alu::Cmp, RCX, Rm::Mem(RDX, 8));
+        self.asm.jcc(Cond::Ne, miss);
+        self.asm.alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_HITS), 1);
+        if chain.verify {
+            self.asm.mov_imm(RAX, VERIFY);
+            self.asm.jmp_absolute(self.exit);
+        } else {
+            self.asm.jmp_indirect(Rm::Mem(RDX, 16));
+        }
+        self.asm.cold(true);
+        self.asm.bind(miss);
+        self.asm.mov_imm(RAX, LOOKUP);
+        self.asm.jmp_absolute(self.exit);
+        self.asm.cold(false);
+        sites
+    }
+
+    /// The constant values that the word `slot` can have at the end of
+    /// the block: a constant, or a `Select` of two constants (a
+    /// conditional branch).
+    fn candidates(&self, slot: Slot) -> Vec<u64> {
+        let constant = |word: Slot| match self.initial.get(usize::from(word)) {
+            Some(Home::Const(value)) => Some(*value),
+            _ => None,
+        };
+        if let Some(value) = constant(slot) {
+            return vec![value];
+        }
+        let Some(op) = self.shape.ops.iter().rev().find(|op| {
+            uses_of(op, self.shape.generics, self.shape)
+                .is_some_and(|(_, writes)| writes.contains(&slot))
+        }) else {
+            return Vec::new();
+        };
+        if op.code != Code::Select || op.dst != slot {
+            return Vec::new();
+        }
+        let mut values = Vec::new();
+        for word in [op.a, op.b] {
+            if let Some(value) = constant(word)
+                && !values.contains(&value)
+            {
+                values.push(value);
+            }
+        }
+        values
+    }
+
+    /// The outputs to the state.
+    fn write_outputs(&mut self) {
         let outputs = self.shape.outputs;
         let targets: Vec<(i32, i32)> = outputs
             .iter()
@@ -941,8 +1179,6 @@ impl Emitter<'_> {
                 self.put(target, value);
             }
         }
-        self.asm.xor32(RAX, RAX);
-        self.asm.jmp_absolute(self.exit);
     }
 }
 
@@ -963,13 +1199,26 @@ fn inline_access(op: &Op, memory: Memory) -> Option<(u8, bool)> {
         Code::Store8 => (8, true),
         _ => return None,
     };
-    // The size is in `aux` too, below the bit of the thunk.
-    (op.aux == bytes).then_some((bytes, store))
+    Some((bytes, store))
 }
 
-/// Emit the code of `shape`. `exit` is the address of the common exit of
-/// the trampoline.
-pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused> {
+/// The words of the frame of `shape` that its code writes: the results of
+/// its operations and its inputs. Every other word is a constant, which no
+/// run changes. K3 fills the written words with a pattern before a replay,
+/// so that a word that the code reads before it writes it shows.
+pub fn written(shape: &Shape) -> Result<Vec<bool>, Refused> {
+    Ok(analyse(shape)?.written)
+}
+
+/// What `emit` knows of a block before its pass.
+struct Analysis {
+    uses: Vec<Vec<u32>>,
+    written: Vec<bool>,
+    effects: Vec<(Vec<Slot>, Vec<Slot>)>,
+    homes: Vec<Home>,
+}
+
+fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
     let words = shape.frame.len();
     if words > i32::MAX as usize / 8 {
         return Err(Refused::Size);
@@ -1026,13 +1275,49 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
             uses[usize::from(slot)].push(end);
         }
     }
+    if let Some(next) = shape.next {
+        if next.pc as usize * 16 + 16 > i32::MAX as usize {
+            return Err(Refused::Size);
+        }
+        if let NextPc::Relative(place) | NextPc::Absolute(place) = next.kind {
+            if place.wide || !in_frame(place.slot) {
+                return Err(Refused::Malformed);
+            }
+            uses[usize::from(place.slot)].push(end);
+        }
+    }
     for (slot, home) in homes.iter_mut().enumerate() {
         if !written[slot] {
             *home = Home::Const(shape.frame[slot]);
         }
     }
+    Ok(Analysis {
+        uses,
+        written,
+        effects,
+        homes,
+    })
+}
+
+/// Emit the code of `shape`. `exit` is the address of the common exit of
+/// the trampoline. With the code, the labels of the jumps that chain and of
+/// their stubs, in the order of their exit indices.
+pub fn emit(
+    shape: &Shape,
+    exit: u64,
+    features: Features,
+    defect: Defect,
+) -> Result<(Asm, Vec<(Label, Label)>), Refused> {
+    let Analysis {
+        uses,
+        effects,
+        homes,
+        ..
+    } = analyse(shape)?;
+    let words = shape.frame.len();
     let mut emitter = Emitter {
         asm: Asm::new(),
+        initial: homes.clone(),
         words: homes
             .into_iter()
             .map(|home| Word {
@@ -1047,8 +1332,16 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
         pinned: 0,
         exit,
         features,
+        defect,
         shape,
     };
+    // H5: the head of a block that chains loads its own frame and names
+    // itself, because a jump from another block reaches it.
+    if let Some(chain) = shape.chain {
+        emitter.asm.mov_imm(R14, chain.frame);
+        emitter.asm.mov_imm(RAX, chain.tag);
+        emitter.asm.store(Rm::Mem(R13, CONTEXT_BLOCK), RAX);
+    }
     // H10: the head of the block takes its instructions from the budget,
     // and leaves when the budget is spent.
     let spent = emitter.asm.label();
@@ -1065,6 +1358,18 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
     emitter.asm.mov_imm(RAX, BUDGET);
     emitter.asm.jmp_absolute(exit);
     emitter.asm.cold(false);
+    // H7: the block counts its inlined loads and stores, for the hit rate.
+    let inlined = shape
+        .ops
+        .iter()
+        .filter(|op| inline_access(op, shape.memory).is_some())
+        .count();
+    if inlined != 0 {
+        let inlined = i32::try_from(inlined).map_err(|_| Refused::Size)?;
+        emitter
+            .asm
+            .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_ACCESSES), inlined);
+    }
     for (index, op) in shape.ops.iter().enumerate() {
         let (reads, writes) = &effects[index];
         if let Some((bytes, store)) = inline_access(op, shape.memory) {
@@ -1079,6 +1384,6 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
             emitter.pure(index, op, reads)?;
         }
     }
-    emitter.outputs();
-    Ok(emitter.asm)
+    let sites = emitter.outputs();
+    Ok((emitter.asm, sites))
 }

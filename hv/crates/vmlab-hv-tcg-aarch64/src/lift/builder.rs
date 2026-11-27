@@ -71,9 +71,14 @@ pub enum Trap {
 pub enum ExceptionClass {
     Undefined,
     /// A load or a store that cannot be made. `unprivileged`: the accesses
-    /// of the instruction are made as EL0 (`LDTR`, `STTR`).
+    /// of the instruction are made as EL0 (`LDTR`, `STTR`). `device`: the
+    /// alignment in bytes that Device memory asks of the access, which the
+    /// access checks itself where its page is Device memory (1: none). Only
+    /// a block lifted without `Context::strict` has one above 1: a strict
+    /// block checks every alignment before the access (card S4).
     DataAbort {
         unprivileged: bool,
+        device: u8,
     },
     /// An access to an address that is not a multiple of its size. The
     /// syndrome is the address. `always`: the instruction asks for the
@@ -198,8 +203,12 @@ pub struct Builder {
     /// what an exit inside the instruction writes back.
     before: [Option<ScalarId>; slot::COUNT],
     before_written: [bool; slot::COUNT],
-    /// The exit of a failed memory access of this instruction, once made.
-    abort: Option<ExitId>,
+    /// The exit of a failed memory access of this instruction, once made,
+    /// with the Device alignment it asks for.
+    abort: Option<(ExitId, u8)>,
+    /// The Device alignment that the next access of this instruction asks
+    /// for, in a block lifted without `Context::strict` (1: none).
+    device: u8,
     /// The memory effects of the block so far. Each has its own number.
     effects: usize,
     /// The addresses of this instruction that an alignment guard covers,
@@ -240,6 +249,7 @@ impl Builder {
             before: [None; slot::COUNT],
             before_written: [false; slot::COUNT],
             abort: None,
+            device: 1,
             effects: 0,
             aligned: Vec::new(),
             unprivileged: false,
@@ -257,6 +267,7 @@ impl Builder {
         self.before = self.current;
         self.before_written = self.written;
         self.abort = None;
+        self.device = 1;
         self.aligned.clear();
         self.unprivileged = false;
     }
@@ -691,8 +702,13 @@ impl Builder {
         b: ScalarId,
         carry: ScalarId,
     ) -> (ScalarId, Flags) {
-        let inverted = self.not(width, b);
-        let (result, _) = self.add_with_carry(width, a, inverted, carry);
+        // With the carry set it is one subtraction (card S4).
+        let result = if self.block.graph.literal(carry) == Some(1) {
+            self.binary(width, Binary::Sub, a, b)
+        } else {
+            let inverted = self.not(width, b);
+            self.add_with_carry(width, a, inverted, carry).0
+        };
         let sum = Sum {
             width,
             a,
@@ -1105,15 +1121,21 @@ impl Builder {
         })
     }
 
+    /// The exit of a failed access of this instruction, which asks for the
+    /// Device alignment that `require_aligned` left for it.
     fn abort_exit(&mut self) -> ExitId {
-        if let Some(exit) = self.abort {
+        let device = std::mem::replace(&mut self.device, 1);
+        if let Some((exit, asked)) = self.abort
+            && asked == device
+        {
             return exit;
         }
         let class = ExceptionClass::DataAbort {
             unprivileged: self.unprivileged,
+            device,
         };
         let exit = self.exit_before(class, Vec::new());
-        self.abort = Some(exit);
+        self.abort = Some((exit, device));
         exit
     }
 
@@ -1228,6 +1250,12 @@ impl Builder {
     /// only where something asks for it: SCTLR_EL1.A or the MMU being off,
     /// which ask for `bytes`, or Device memory at the address, which asks
     /// for `device` bytes. The loop decides that when the guard fails.
+    ///
+    /// A block lifted without `Context::strict` has no guard for what only
+    /// Device memory asks: the next access of the instruction checks
+    /// `device` itself, after the walk of its page and before its
+    /// permissions, where the guard and the loop put that fault (card S4).
+    /// Call it right before the access that it covers.
     pub fn require_aligned(
         &mut self,
         address: ScalarId,
@@ -1242,6 +1270,10 @@ impl Builder {
                 .iter()
                 .any(|(checked, size)| *checked == address && *size >= bytes)
         {
+            return;
+        }
+        if !always && !self.context.strict {
+            self.device = device;
             return;
         }
         self.aligned.push((address, bytes));

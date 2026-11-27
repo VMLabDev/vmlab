@@ -9,6 +9,7 @@
 use vmlab_hv_tcg::{FlatMemory, Memory};
 use vmlab_hv_tcg_aarch64::exception::{Cause, Exception};
 use vmlab_hv_tcg_aarch64::oracle::asm::{self, op};
+use vmlab_hv_tcg_aarch64::oracle::jitdiff::Runner;
 use vmlab_hv_tcg_aarch64::sysreg;
 use vmlab_hv_tcg_aarch64::{Cpu, State, Stop};
 
@@ -135,6 +136,11 @@ fn ldtr(rt: u32, rn: u32) -> u32 {
 
 fn sttr(rt: u32, rn: u32) -> u32 {
     0xf800_0800 | rn << 5 | rt
+}
+
+/// `ADD Xd, Xn, #imm12`.
+fn add_x(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0x9100_0000 | imm12 << 10 | rn << 5 | rd
 }
 
 #[test]
@@ -325,6 +331,130 @@ fn alignment_faults_in_device_memory_and_with_sctlr_a() {
         machine.cpu.state.set_x(0, VA + 3);
         machine.cpu.step().unwrap();
         assert_eq!(machine.abort(), Some((VA + 3, esr)));
+    }
+}
+
+/// `SUBS Xd, Xn, Xm`, `SUB Wd, Wn, Wm`, and `LDP` and `STP` of two X
+/// registers at `[Xn]`.
+fn subs(rd: u32, rn: u32, rm: u32) -> u32 {
+    0xeb00_0000 | rm << 16 | rn << 5 | rd
+}
+
+fn sub_w(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x4b00_0000 | rm << 16 | rn << 5 | rd
+}
+
+fn ldp(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xa940_0000 | rt2 << 10 | rn << 5 | rt
+}
+
+fn stp(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xa900_0000 | rt2 << 10 | rn << 5 | rt
+}
+
+#[test]
+fn an_access_late_in_a_block_leaves_with_the_registers_before_it() {
+    // One block: add x3, x3, #1 ; subs x4, x3, x5 ; sub w6, w3, w5 ;
+    // ldr x1, [x0] ; hvc. The load is not aligned: it faults in Device
+    // memory and with SCTLR_EL1.A, which the block checks before it, and
+    // not in Normal memory (card S4). Where it faults, the three
+    // instructions before it are written back and the load is not.
+    for (attribute, strict, faults) in [(0u64, false, false), (1, false, true), (0, true, true)] {
+        let mut machine = Machine::new(&[
+            add_x(3, 3, 1),
+            subs(4, 3, 5),
+            sub_w(6, 3, 5),
+            ldr(1, 0),
+            HVC,
+        ]);
+        machine.map(VA, DATA | AF | NO_EXECUTE | attribute << 2);
+        if strict {
+            machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::A;
+        }
+        machine
+            .cpu
+            .memory
+            .write(DATA + 3, &0x1122_3344_5566_7788u64.to_le_bytes())
+            .unwrap();
+        let state = &mut machine.cpu.state;
+        state.set_x(0, VA + 3);
+        state.set_x(1, 0x77);
+        state.set_x(3, 10);
+        state.set_x(5, 20);
+        assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        let case = format!("attribute {attribute} strict {strict}");
+        let state = &machine.cpu.state;
+        assert_eq!(state.x(3), 11, "{case}");
+        assert_eq!(state.x(4), 11u64.wrapping_sub(20), "{case}");
+        assert_eq!(state.x(6), 0xffff_fff7, "{case}");
+        if faults {
+            assert_eq!(machine.abort(), Some((VA + 3, 0x9600_0021)), "{case}");
+            assert_eq!(state.system.regs[sysreg::reg::ELR_EL1], CODE + 12, "{case}");
+            // N set, Z, C and V clear: 11 - 20 borrows.
+            assert_eq!(
+                state.system.regs[sysreg::reg::SPSR_EL1] >> 28,
+                0b1000,
+                "{case}"
+            );
+            assert_eq!(state.x(1), 0x77, "{case}");
+        } else {
+            assert_eq!(machine.cpu.exceptions, 0, "{case}");
+            assert_eq!(state.cpsr() >> 28, 0b1000, "{case}");
+            assert_eq!(state.x(1), 0x1122_3344_5566_7788, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_pair_of_x_registers_is_one_access() {
+    // stp x1, x2, [x0] ; ldp x3, x4, [x0] ; hvc, in Normal memory, aligned
+    // and not.
+    for offset in [0x10, 0x4] {
+        let mut machine = Machine::new(&[stp(1, 2, 0), ldp(3, 4, 0), HVC]);
+        machine.map(VA, DATA | AF | NO_EXECUTE);
+        let state = &mut machine.cpu.state;
+        state.set_x(0, VA + offset);
+        state.set_x(1, 0x0102_0304_0506_0708);
+        state.set_x(2, 0x1112_1314_1516_1718);
+        assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        assert_eq!(machine.cpu.exceptions, 0);
+        assert_eq!(machine.word(DATA + offset), 0x0102_0304_0506_0708);
+        assert_eq!(machine.word(DATA + offset + 8), 0x1112_1314_1516_1718);
+        let state = &machine.cpu.state;
+        assert_eq!(
+            (state.x(3), state.x(4)),
+            (0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
+        );
+    }
+    // A pair that crosses into a page without a translation: the fault
+    // names the first byte of that page, and no register is written.
+    let mut machine = Machine::new(&[add_x(5, 5, 1), ldp(3, 4, 0), HVC]);
+    machine.map(VA, DATA | AF | NO_EXECUTE);
+    machine.cpu.state.set_x(0, VA + 0xff8);
+    machine.cpu.state.set_x(3, 0x33);
+    assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+    assert_eq!(machine.abort(), Some((VA + 0x1000, 0x9600_0007)));
+    let state = &machine.cpu.state;
+    assert_eq!((state.x(3), state.x(5)), (0x33, 1));
+    // In Device memory a pair asks for the alignment of one register: a
+    // store at 8 bytes writes, and one at 4 faults before it writes.
+    for (offset, faults) in [(8, false), (4, true)] {
+        let mut machine = Machine::new(&[stp(1, 2, 0), HVC]);
+        machine.map(VA, DATA | AF | NO_EXECUTE | 1 << 2);
+        machine.cpu.state.set_x(0, VA + offset);
+        machine.cpu.state.set_x(1, 0xaa);
+        machine.cpu.state.set_x(2, 0xbb);
+        assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        if faults {
+            assert_eq!(machine.abort(), Some((VA + offset, 0x9600_0061)));
+            assert_eq!(machine.word(DATA + offset), 0);
+        } else {
+            assert_eq!(machine.cpu.exceptions, 0);
+            assert_eq!(
+                (machine.word(DATA + offset), machine.word(DATA + offset + 8)),
+                (0xaa, 0xbb)
+            );
+        }
     }
 }
 
@@ -611,6 +741,13 @@ fn the_cache_operations_do_nothing_and_el0_runs_some_with_uci() {
 
 #[test]
 fn code_that_is_written_through_another_address_runs_as_written() {
+    // K6 of 3e DESIGN.md: on every runner.
+    for runner in Runner::ALL {
+        code_that_is_written_through_another_address_runs_as_written_on(runner);
+    }
+}
+
+fn code_that_is_written_through_another_address_runs_as_written_on(runner: Runner) {
     // The page of the data is mapped twice: for writing at VA and for
     // running at VA + 2 pages. add x1, x1, #1 ; ret.
     const ADD_1: u32 = 0x9100_0421;
@@ -618,6 +755,7 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     const RUN: u64 = VA + 0x2000;
     // blr x2 ; str w3, [x0] ; blr x2 ; hvc
     let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(2), HVC]);
+    runner.apply(&mut machine.cpu);
     machine.map(VA, DATA | AF | NO_EXECUTE);
     machine.map(RUN, DATA | AF | READ_ONLY);
     machine
@@ -631,9 +769,10 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.taken, None);
     // One from the first call, two from the second.
-    assert_eq!(machine.cpu.state.x(1), 3);
+    assert_eq!(machine.cpu.state.x(1), 3, "{runner:?}");
     // The same when every instruction is stepped.
     let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(2), HVC]);
+    runner.apply(&mut machine.cpu);
     machine.map(VA, DATA | AF | NO_EXECUTE);
     machine.map(RUN, DATA | AF | READ_ONLY);
     machine
@@ -647,11 +786,17 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     for _ in 0..7 {
         machine.cpu.step().unwrap();
     }
-    assert_eq!(machine.cpu.state.x(1), 3);
+    assert_eq!(machine.cpu.state.x(1), 3, "{runner:?}");
 }
 
 #[test]
 fn an_address_that_maps_other_code_runs_the_other_code() {
+    for runner in Runner::ALL {
+        an_address_that_maps_other_code_runs_the_other_code_on(runner);
+    }
+}
+
+fn an_address_that_maps_other_code_runs_the_other_code_on(runner: Runner) {
     // The address RUN maps one page of code, then the other, with a TLBI
     // between. A block is kept under the physical address of its code too.
     const RUN: u64 = VA + 0x2000;
@@ -664,6 +809,7 @@ fn an_address_that_maps_other_code_runs_the_other_code() {
         HVC,
     ];
     let mut machine = Machine::new(&program);
+    runner.apply(&mut machine.cpu);
     let entry = machine.map(RUN, DATA | AF | READ_ONLY);
     // The tables are mapped at their own addresses, for EL1.
     for page in 0..TABLE_PAGES {
@@ -691,20 +837,21 @@ fn an_address_that_maps_other_code_runs_the_other_code() {
     assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.taken, None);
     // add x1, x1, #1 from the first page, add x1, x1, #5 from the second.
-    assert_eq!(machine.cpu.state.x(1), 6);
+    assert_eq!(machine.cpu.state.x(1), 6, "{runner:?}");
 }
 
 /// One page of code, mapped at two addresses and called at each. The block
 /// computes its PC-relative values from the PC it runs at, so one
 /// translation serves both addresses (card C13). With `copy`, the second
 /// address maps a copy of the page instead: other code, its own block.
-fn code_at_two_addresses(copy: bool) -> Machine {
+fn code_at_two_addresses(copy: bool, runner: Runner) -> Machine {
     const FIRST: u64 = VA + 0x2000;
     const SECOND: u64 = VA + 0x5000;
     // adr x4, . ; add x1, x1, #1 ; ret
     const CALLED: [u32; 3] = [0x1000_0004, 0x9100_0421, asm::RET];
     // blr x2 ; add x5, x4, #0 ; blr x6 ; hvc
     let mut machine = Machine::new(&[asm::blr(2), asm::add(5, 4, 0), asm::blr(6), HVC]);
+    runner.apply(&mut machine.cpu);
     machine.map(FIRST, DATA | AF | READ_ONLY);
     let second = if copy { OTHER } else { DATA };
     machine.map(SECOND, second | AF | READ_ONLY);
@@ -728,9 +875,12 @@ fn code_at_two_addresses(copy: bool) -> Machine {
 
 #[test]
 fn one_translation_serves_code_at_two_addresses() {
-    let shared = code_at_two_addresses(false).cpu.translations;
-    let copied = code_at_two_addresses(true).cpu.translations;
-    assert_eq!(shared + 1, copied);
+    // K6 of 3e DESIGN.md: on every runner.
+    for runner in Runner::ALL {
+        let shared = code_at_two_addresses(false, runner).cpu.translations;
+        let copied = code_at_two_addresses(true, runner).cpu.translations;
+        assert_eq!(shared + 1, copied, "{runner:?}");
+    }
 }
 
 #[test]

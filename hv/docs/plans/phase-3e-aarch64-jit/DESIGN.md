@@ -574,6 +574,11 @@ against the interpreter, and against QEMU through the same two harnesses.
   states and the log. This proves the emitter on the blocks of a real boot,
   with MMIO and faults. It does not prove the inlined TLB sequence, which K2
   and unit tests cover. Speed: below the interpreter.
+  - **K3a.** `VMLAB_HV_JIT_CHECK_RUNS=<n>` checks the first n runs of each
+    compiled block, and every later run is a plain run of its code. Every
+    block that runs is still checked, at least once after each compile. A
+    check of every run is too slow for the 90 s device timeouts of a Debian
+    boot (J2a), so the boot of the proof uses n = 1000.
 - **K4. O4 with the JIT on.** The boot lockstep runs as in 3d, with compiled
   one-instruction blocks. It is the nightly and by-hand run that it is today.
 - **K5. kvm-unit-tests and S1** with the JIT on, at 1, 2 and 4 vCPUs: the
@@ -750,6 +755,115 @@ threads). The rows are in `bench/history/aarch64.jsonl`.
   blocks are compiled with every hit kept (`jit::Memory::Logged`), with the
   same lookup as in a run without the log. K2 keeps the accesses of every
   other round and compares the two lists.
+### J2, the proof tools (measured)
+
+Helios, 2026-11-27, *measured*, with the load average of the host at 5 to
+14 of 32 threads. The tools: `VMLAB_HV_JIT_CHECK` (K3, K3a),
+`VMLAB_HV_JIT_PERF_MAP` (H13e), the counters of the debug log, and
+`Cpu::seed_jit_defect` for the tests.
+
+| Proof | Result |
+|---|---|
+| K3 on a Debian 13 boot, 1 vCPU, `VMLAB_HV_JIT_CHECK=1` and `VMLAB_HV_JIT_CHECK_RUNS=1000` | The login prompt on `ttyAMA0` after 244.1 s, no difference. 855,603 compiles and 134.3 million checked runs (637.7 million instructions) up to the last counter line, at 18.0e9 instructions. The same setting reached agent ready in 266.6 s in a run of the bench. |
+| K3 of every run on the same boot | No difference in 2.45 billion checked runs (14.97e9 instructions). At 32 MIPS the boot fell into emergency mode on the 90 s device timeouts after 544 s, before the login prompt (J2a). |
+| K3 on the K2 streams, seed `0x3e0001`, 1,000 rounds (`tests/jit.rs`) | 5,185 checked runs, no difference. |
+| A seeded defect (`Defect::AddSubtracts`: `Code::Add` subtracts) | K2 finds it in round 1 (the states differ). K3 finds it in round 1: a store at another address than the interpreter's. |
+
+The rows before (`cc6060d7`, `next`) and after (`76a9a1dd`), interleaved on
+the same cores, in `bench/history/aarch64.jsonl`. MIPS, median of 3, cores 20
+to 23 for the flat images; one boot each, side by side on cores 12 to 15 and
+16 to 19. The second pass of the flat images ran while the load rose; its
+rows are in the history too.
+
+| Workload | Before | After |
+|---|---|---|
+| CoreMark mix, flat, JIT | 160.3 | 158.4 |
+| Scalar loop, flat, JIT | 176.5 | 175.5 |
+| CoreMark mix, flat, interpreter | 133.5 | 113.3 |
+| Scalar loop, flat, interpreter | 149.7 | 131.4 |
+| Debian 13 boot with the JIT, to agent ready, s | 219.1 | 187.1 |
+| The same, boot MIPS | 82.5 | 96.0 |
+| Instructions in the interpreter (H2b) in the boot, in blocks | 48.6 million in 6.17 million | 45.2 million in 5.74 million |
+
+No instruction of the flat images ran in the interpreter. The interpreter rows
+of the flat images moved by 13 % between the two passes of one commit as well
+(`cc6060d7`: 133.5 and 108.9 on CoreMark), so the difference in that pair is
+the noise of the host. J2 changes no emitter form and the plain run of a
+compiled block only by its counters.
+
+- **J2a.** K3 costs per block a copy of the 72 register slots and one
+  compare, the slow paths of the loads and stores in the interpreter (the
+  log is on), and the replay through its own thunk. A block with an ordered
+  helper call copies and compares the whole state. The first build cloned the
+  whole state twice per block and formatted the two ends of every run: 15 to
+  20 MIPS. Without both, 32 MIPS. A first build of J2 also slowed the plain
+  JIT by a fifth (145 against 181 MIPS on the loop): the replay was a branch
+  in the one thunk, and the run of compiled code was no longer inlined.
+- **J2b.** The perf map is `/tmp/perf-<pid>.map` behind
+  `VMLAB_HV_JIT_PERF_MAP=1`: the trampoline as `vmlab-hv-jit enter`, and each
+  block as `a64 <pc> pa <physical address> el<n> <count> insns`. After a reset
+  of the region an address can carry two names: the later line names the
+  code that is there now.
+- **J2c.** The counter line of the debug log (every 1e9 instructions, from
+  `vmlab_hv_vmm::vcpu::emulated`) gains the fallbacks (runs of refused blocks,
+  and runs that the budget sent to the interpreter), the exits of compiled
+  runs by kind (the end of the block, an exception, a store into translated
+  code, a stop) and the runs and instructions that K3 checked. The bench reads
+  them into `jit_reports`.
+- **J2d.** K6: the tests of a store into translated code (into its own
+  block, through another address, under an address that maps other code, at
+  two addresses, a write from outside, a data store that keeps the blocks)
+  run on the interpreter, on the JIT and on the JIT with K3, and a new test
+  stores from a second CPU into code that the first ran. A chained pair waits
+  for J4.
+- **J2e.** No emitter form changed, so K1 had no group to run. K2 ran in
+  `ci::check` (`tests/jit.rs`).
+### G3, measured by card J4
+
+Helios, 2026-11-27, one vCPU, *measured*. Before: `b640db7c` (`next` with
+J1). After: `f286f9b3`. Other cards ran boots and builds at the same time
+(load average 7 to 27 of 32 threads). The rows are in
+`bench/history/aarch64.jsonl`.
+
+| Workload | JIT, J1 | JIT, J4 | Gain |
+|---|---|---|---|
+| Scalar loop, flat, MIPS (median of 3, cores 28 to 31) | 163.6 | 1,901.9 | 11.6 times |
+| CoreMark mix, flat, MIPS | 143.6 | 315.2 | 2.2 times |
+| Debian 13 boot to agent ready, s (median of 3, cores 12 to 15) | 168.4 (166.3 to 170.5) | 136.4 (132.4 to 157.8) | 1.23 times |
+| The same, boot MIPS | 106.5 | 132.1 | 1.24 times |
+
+- **J4a. Where the exits go.** An exit of a block is a linked jump, a hit
+  of the jump cache, or a return to the Rust loop. CoreMark: 54.37 million
+  linked, 1.65 million hits, 463 to the loop. The boot, the last report of
+  the first run (18.0e9 instructions): 2,496 million linked (81 %), 339
+  million hits (11 %), 247 million to the loop (8 %), of which 106 million
+  are misses of the jump cache (a hit rate of 76 %) and 33 million are jumps
+  not linked yet. The jump cache was emptied 1.28 million times: every write
+  of TTBR0 or TTBR1, every TLBI, and every new epoch. The kernel has no
+  hardware PAN (`cortex-a53`), so it writes TTBR0 at every entry from EL0
+  and every return to it.
+- **J4b. The interpreter share** is that of J1: 47.4 million of 18.0e9
+  instructions (0.26 %) in 6.0 million runs of 361 refused blocks. No
+  instruction of the flat images runs in the interpreter.
+- **J4c. With `VMLAB_HV_JIT_CHAIN=0`** the flat rows are those of J1 (163.1
+  and 142.9 MIPS): the switch leaves the code of J1.
+- **J4d. Code.** The boot compiled 826,000 blocks to 284 MB of code (344
+  bytes a block) and dropped the region 4 times, against 550,000 blocks, 120
+  MB and one drop before: the exits are longer, and every drop compiles the
+  working set again.
+- **J4e. Two boots fell into emergency mode** at the first commits of the
+  card (`01d6a923`, `e8e239ff`), both with heavy work of other processes on
+  the host: udev did not find the EFI partition within its 90 s, where the
+  other boots needed 22 to 35 s. A boot with only the linked jumps, one with
+  only the jump cache, and one with both passed at low load. At those
+  commits each clear of the jump cache wrote all of its 128 KiB, and a phase
+  with many system calls paid two to four of those writes for each call.
+  Since `ca9d9be6` a clear moves a generation that every key holds, and the
+  three boots of the rows passed at a load of 15 to 27. That the clear was
+  the cause, and not a defect of the chaining, is an explanation and not
+  proven. Its basis: the failed phase ran the same instructions in more host
+  time, the boots of each half and the boots after the change passed, and
+  K1 and K2 found no difference.
 
 ## 8. The cards
 

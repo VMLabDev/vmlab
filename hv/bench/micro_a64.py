@@ -223,7 +223,7 @@ def run_qemu(args, commit, dirty, host, log, pin):
 
 
 BACKEND_VERSIONS = {"interpreter": "packed block interpreter",
-                    "jit": "packed block interpreter with the x86-64 JIT (J1)"}
+                    "jit": "packed block interpreter with the x86-64 JIT (J4: chaining)"}
 
 
 def run_interpreter_backend(args, commit, dirty, host, log, pin):
@@ -255,6 +255,12 @@ def run_interpreter_backend(args, commit, dirty, host, log, pin):
         if "tlb_accesses" in raw[0]:
             noise["tlb_accesses"] = raw[0]["tlb_accesses"]
             noise["tlb_misses"] = raw[0]["tlb_misses"]
+        # The exits of compiled blocks (card J4): chained, jump cache hits,
+        # and those that reach the Rust loop.
+        if "chained" in raw[0]:
+            noise["chaining"] = bool(raw[0].get("chaining"))
+            for key in ("chained", "jump_hits", "unlinked", "lookups", "entered"):
+                noise[key] = raw[0][key]
         noise["loadavg_end"] = lib.read_loadavg()
         rec = record(args.backend, name, commit, dirty, host, samples, mips, noise, raw)
         rec["qemu_baseline"] = lib.latest_baseline(lib.read_history("aarch64"), "aarch64",
