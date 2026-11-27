@@ -1135,7 +1135,7 @@ to 27, the two columns side by side.
 Helios, 2026-11-28, *measured*, `next` at `4af3439a` with the JIT on by
 default. Other cards ran builds and boots at the same time, and so did this
 card: its merge bar, the boot that wrote the windows of O4w and the window
-lockstep (load average 4 to 10 of 32 threads).
+lockstep (load average 4 to 12 of 32 threads).
 
 **The stack profile.** Debian 13 to agent ready at one vCPU, cores 16 to
 19, a W1 build (line tables, frame pointers), `VMLAB_HV_JIT_PERF_MAP=1`,
@@ -1173,13 +1173,13 @@ starts in it ends there: the leaf is what the numbers below count.
      an entry.
   2. *Translation and the code cache*: the lift and the emitter (6.0 %),
      `Jit::link`, the map of blocks, `Cache::revive` and the allocations of
-     the translation, about 14 % together. J6d counts 0.95 million blocks and 6 drops of the
-     region in a boot, each drop compiling the working set again.
+     the translation, about 14 % together. J6d counts 0.95 million blocks
+     and 6 drops of the region in a boot, each drop compiling the working
+     set again.
   3. *Memory behind the fast TLB*: the libc function with no frame (8.4 %),
-     libc under `asynchronous` (1.1 %) and the RAM paths of `GuestBus` (2.5
-     %), about 12 %. Which libc function
-     it is was not resolved: glibc does not export its memmove and memset,
-     and no caller is in the chain.
+     libc under `asynchronous` (1.1 %) and the RAM paths of `GuestBus`
+     (2.5 %), about 12 %. Which libc function it is was not resolved: glibc
+     does not export its memmove and memset, and no caller is in the chain.
 - **C13b-P2.** The guest's own work, compiled code, is 17.3 % of the vCPU.
 
 **S1, the boot matrix.** The four templates at 1 and 2 vCPUs, three repeats
@@ -1193,17 +1193,19 @@ be a wrong base for the next speed card to compare with.
 |---|---|---|
 | alpine-3.23 | 113.6, 124.3, 98.7 | 108.2, 95.0, 88.3 |
 | debian-13 | 76.8, 84.6, 80.5 | 54.8, 54.5, 54.1 |
-| fedora-44 | 172.5, 160.5; 149.6, 157.1, emergency mode; emergency mode; emergency mode | 160.3, 160.4, 182.0 |
+| fedora-44 | 172.5, 160.5; 149.6, 157.1, emergency; emergency; emergency (C13b-S1) | 160.3, 160.4, 182.0 |
 | ubuntu-24.04 | 193.7, 144.2, 188.6 | 123.0, 154.7, 242.0 |
 
 - **C13b-S1. S1 does not hold for Fedora at one vCPU.** Of seven boots
-  (two runs of three, the first cut short by the VM cap of the host after
-  two repeats, and two runs of one), four reached agent ready in 149.6 to
+  (a run of three cut short by the VM cap of the host after two repeats, a
+  run of three, and two more runs that this card stopped after their first
+  repeat), four reached agent ready in 149.6 to
   172.5 s and three went to emergency mode on the 90 s device timeout of
   systemd (`dev-disk-by-uuid`, once also `dev-zram0`), the failure of
   #1048 and J6f. In each of the three the rate of the vCPU fell from 170 to
-  240 MIPS to 90 to 130 MIPS from about 80 s on and to 20 to 50 MIPS after
-  that, against 115 to 170 MIPS in the same phase of a good boot. The host
+  240 MIPS to 37 to 130 MIPS from about 80 s on, against 115 to 170 MIPS
+  in the same phase of a good boot, and the guest then waited in emergency
+  mode. The host
   had a load of 7 to 12 then: the boot that wrote the windows (68 copies of
   2 GiB of RAM), the window lockstep, the merge bar of this card, and the
   boots and builds of other cards, once a VM of another card pinned to the
