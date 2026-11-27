@@ -99,24 +99,18 @@ pub struct EmulatedVcpu {
     /// the CPU is set from it before each slice, so that it stands still
     /// while the machine is paused.
     counter: Option<(Counter, u64)>,
-    report_boot_instructions: bool,
 }
 
-impl Drop for EmulatedVcpu {
-    fn drop(&mut self) {
-        if self.report_boot_instructions {
+impl EmulatedVcpu {
+    /// The VM calls this after joining its vCPU workers.
+    pub(crate) fn report_boot_counts(&self, instructions: bool) {
+        if instructions {
             eprintln!("boot instructions: {} {}", self.id, self.cpu.instructions);
         }
         if let Some(counts) = &self.cpu.block_counts {
             eprintln!("boot block counts: {} {counts:?}", self.id);
         }
     }
-}
-
-/// The count of the system counter of a machine now.
-pub type Counter = Arc<dyn Fn() -> u64 + Send + Sync>;
-
-impl EmulatedVcpu {
     /// The vCPU `id` in the reset state `state`, on `memory`, with the
     /// system counter of `clock`.
     pub fn new(id: u8, memory: GuestBus, state: State, clock: Clock) -> Self {
@@ -149,7 +143,6 @@ impl EmulatedVcpu {
             hypercall: None,
             logged: 0,
             counter: None,
-            report_boot_instructions: std::env::var_os("VMLAB_HV_BOOT_INSTRUCTIONS").is_some(),
         }
     }
 
@@ -298,6 +291,9 @@ impl EmulatedVcpu {
         Exit::Fail(ExitReason::Error(format!("vcpu {}: {what}", self.id)))
     }
 }
+
+/// The count of the system counter of a machine now.
+pub type Counter = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl VcpuBackend for EmulatedVcpu {
     fn run(&mut self, running: bool) -> Exit {
