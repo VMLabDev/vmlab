@@ -54,7 +54,7 @@ use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
 use crate::mmu::{self, Kind, Miss, Mmu, Regime};
 use crate::shootdown::Invalidation;
-use crate::state::{Context, State, slot};
+use crate::state::{Context, State};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
@@ -814,9 +814,10 @@ struct Compiled {
     /// The last instruction, when the loop runs it: its distance in bytes
     /// from the first, and what it does.
     terminal: Option<(u64, Trap)>,
-    /// The output of the PC is its distance from the PC at the entry
-    /// (`A64Next::Relative`).
-    relative: bool,
+    /// The words of the next PC, and whether they hold its distance from
+    /// the PC at the entry (`A64Next::Relative`). The loop sets the PC from
+    /// them after the outputs.
+    next: Option<(Place, bool)>,
 }
 
 /// The most arguments of a helper.
@@ -932,7 +933,7 @@ fn compile(
     let mut parts = Parts::default();
     let mut block_outputs = None;
     let mut terminal = None;
-    let mut relative = false;
+    let mut next_pc = None;
     // The exits that events leave through, by their number in the block.
     let mut leave_of = vec![None; block.exits.len()];
     for event in &block.events {
@@ -990,11 +991,8 @@ fn compile(
         }
         if let Event::Exit(_) = event {
             match payload.next {
-                A64Next::Pc(next) => outputs.push((slot::PC as u32, lowering.place(next))),
-                A64Next::Relative(next) => {
-                    outputs.push((slot::PC as u32, lowering.place(next)));
-                    relative = true;
-                }
+                A64Next::Pc(next) => next_pc = Some((lowering.place(next), false)),
+                A64Next::Relative(next) => next_pc = Some((lowering.place(next), true)),
                 // The loop runs the last instruction, with the PC at it.
                 A64Next::Trap { pc, trap } => terminal = Some((pc, trap)),
                 A64Next::Exception { .. } => {
@@ -1150,7 +1148,7 @@ fn compile(
         inputs: parts.inputs,
         outputs,
         terminal,
-        relative,
+        next: next_pc,
     })
 }
 
@@ -1489,8 +1487,13 @@ impl Compiled {
         for (register, place) in &self.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
         }
-        if self.relative {
-            state.set_pc(entry.wrapping_add(state.pc()));
+        if let Some((place, relative)) = &self.next {
+            let value = place.read(&self.frame) as u64;
+            state.set_pc(if *relative {
+                entry.wrapping_add(value)
+            } else {
+                value
+            });
         }
         // The loop runs the last instruction with the PC at it.
         if let Some((distance, _)) = self.terminal {
@@ -2530,6 +2533,7 @@ impl<M: Memory> Cpu<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::slot;
     use vmlab_hv_tcg::FlatMemory;
 
     const BASE: u64 = 0x4000_0000;
