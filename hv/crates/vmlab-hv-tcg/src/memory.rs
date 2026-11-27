@@ -142,6 +142,14 @@ pub trait Memory {
     fn own_generation(&self) -> Option<u64> {
         None
     }
+    /// The count of the writes through this handle that ended translated
+    /// code: each found the watch word of a page odd and made it even. A CPU
+    /// of a machine tells the others when it moved, so that none of them
+    /// runs a block of such a page again without looking at its stamp.
+    /// 0, the default, for a memory without watch words.
+    fn ended_code(&self) -> u64 {
+        0
+    }
     /// Write `new` at `address` when the memory holds `expected` there, as
     /// one host operation against the writes of every other CPU, also those
     /// that a CPU makes straight. Both are the same size and the range is
@@ -169,6 +177,8 @@ pub struct FlatMemory {
     page_generations: Vec<u64>,
     /// The watch word of each page (`HostPage`).
     watch: Box<[std::sync::atomic::AtomicU32]>,
+    /// Writes that made a watch word even (`Memory::ended_code`).
+    ended: u64,
 }
 
 impl FlatMemory {
@@ -183,18 +193,22 @@ impl FlatMemory {
             watch: (0..pages)
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            ended: 0,
         }
     }
 
     /// Make the watch words of the pages `first..=last` even: a write into
     /// a page ends what a CPU translated there.
-    fn unwatch(&self, first: usize, last: usize) {
+    fn unwatch(&mut self, first: usize, last: usize) {
+        let mut ended = false;
         for word in &self.watch[first..=last] {
             let now = word.load(std::sync::atomic::Ordering::SeqCst);
             if now & 1 != 0 {
                 word.store(now.wrapping_add(1), std::sync::atomic::Ordering::SeqCst);
+                ended = true;
             }
         }
+        self.ended += u64::from(ended);
     }
 
     /// Move the stamps of the pages `first..=last`, after a write.
@@ -280,6 +294,9 @@ impl Memory for FlatMemory {
     }
     fn generation(&self) -> u64 {
         self.generation
+    }
+    fn ended_code(&self) -> u64 {
+        self.ended
     }
     fn code_stamp(&self, address: u64, len: usize) -> Option<CodeStamp> {
         let range = self.range(address, len).ok()?;
@@ -375,6 +392,18 @@ impl Memory for SharedMemory {
     }
     fn generation(&self) -> u64 {
         self.with(|memory| memory.generation())
+    }
+    // The watch words of the pages, without host pages: every write goes
+    // through `write`, and a CPU of a test machine learns from
+    // `ended_code` that a write of any CPU ended translated code.
+    fn watch_code(&mut self, address: u64) -> Option<u32> {
+        self.with(|memory| memory.watch_code(address))
+    }
+    fn watch_holds(&self, address: u64, word: u32) -> bool {
+        self.with(|memory| memory.watch_holds(address, word))
+    }
+    fn ended_code(&self) -> u64 {
+        self.with(|memory| memory.ended_code())
     }
     fn code_stamp(&self, address: u64, len: usize) -> Option<CodeStamp> {
         self.with(|memory| memory.code_stamp(address, len))

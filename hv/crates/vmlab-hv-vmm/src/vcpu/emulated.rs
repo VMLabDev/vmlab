@@ -65,6 +65,9 @@ impl CpuLine {
 impl IrqLine for CpuLine {
     fn set_level(&self, high: bool) {
         if self.atomic().swap(high, Ordering::SeqCst) != high && high {
+            // Compiled code that chains leaves at its next block head, and
+            // the loop takes the interrupt (3e DESIGN.md H10c).
+            self.lines.kick();
             self.waker.notify();
         }
     }
@@ -129,8 +132,13 @@ impl EmulatedVcpu {
     /// The vCPU `id` in the reset state `state`, on `memory`, with the
     /// system counter of `clock`.
     pub fn new(id: u8, memory: GuestBus, state: State, clock: Clock) -> Self {
-        let waker = Arc::new(Waker::default());
         let shared = Arc::new(Lines::default());
+        // A pause or a snapshot ends the slice at the next block, also in
+        // compiled code that chains.
+        let waker = Arc::new(Waker::with_kick({
+            let shared = shared.clone();
+            move || shared.leave()
+        }));
         let line = |fiq| {
             Arc::new(CpuLine {
                 lines: shared.clone(),
@@ -273,7 +281,7 @@ impl EmulatedVcpu {
         self.jit_report = self.cpu.instructions + JIT_REPORT;
         let jit = self.cpu.jit_counts();
         log::info!(
-            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses",
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting",
             self.id,
             self.cpu.instructions,
             jit.interpreted_instructions,
@@ -302,6 +310,11 @@ impl EmulatedVcpu {
             jit.clears,
             jit.tlb_accesses,
             jit.tlb_misses,
+            jit.machine.exclusive_loads,
+            jit.machine.exclusive_stores,
+            jit.machine.code_mails,
+            jit.machine.code_pages,
+            jit.machine.wait_ns / 1_000_000,
         );
     }
 

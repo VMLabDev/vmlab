@@ -364,6 +364,26 @@ struct Side {
     mmu: Mmu,
     /// The block that runs is at EL0.
     user: bool,
+    /// The mailboxes of the machine and the index of this CPU: a copy of
+    /// `Cpu::shootdown`, which a store and a translation post to.
+    shootdown: Option<(std::sync::Arc<crate::shootdown::Shootdown>, usize)>,
+    /// `Memory::ended_code` when this CPU last told the others.
+    ended_code: u64,
+    /// The counts of `JitCounts::machine`.
+    machine: MachineCounts,
+}
+
+/// What a CPU of a machine of more than one did that the others see (3e
+/// card J7): its exclusive loads and stores, the code mail and the pages of
+/// new code that it told the others of, and the time that it waited for
+/// them to take it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineCounts {
+    pub exclusive_loads: u64,
+    pub exclusive_stores: u64,
+    pub code_mails: u64,
+    pub code_pages: u64,
+    pub wait_ns: u64,
 }
 
 impl Side {
@@ -382,6 +402,94 @@ impl Side {
             code_written: false,
             mmu: Mmu::new(state),
             user: false,
+            shootdown: None,
+            ended_code: 0,
+            machine: MachineCounts::default(),
+        }
+    }
+
+    fn invalidate(&mut self, invalidation: Invalidation) {
+        match invalidation {
+            Invalidation::All => self.mmu.flush(),
+            Invalidation::Page { argument, asid } => {
+                self.mmu.flush_page(Regime::El10, argument, asid)
+            }
+            Invalidation::Asid(asid) => self.mmu.flush_asid(Regime::El10, asid),
+            Invalidation::CodePage(phys) => {
+                if let Some(fast) = self.mmu.fast_mut() {
+                    fast.drop_writes(phys);
+                }
+            }
+        }
+    }
+
+    /// Apply what the other CPUs posted. Code mail starts a new epoch,
+    /// as a store of this CPU into its code does: compiled code leaves at
+    /// its next block head, and the loop looks at the blocks again.
+    fn take_mail(&mut self) {
+        let mail = match &self.shootdown {
+            Some((shootdown, id)) => shootdown.take(*id),
+            None => return,
+        };
+        if let Some(mail) = mail {
+            for invalidation in mail.invalidations {
+                self.invalidate(invalidation);
+            }
+            if mail.code {
+                self.code_written = true;
+            }
+        }
+    }
+
+    /// Hand `invalidation` to the other CPUs, or code mail for `None`, and
+    /// return when every one of them that runs has taken it
+    /// (`shootdown.rs`). The caller holds no lock that another CPU could
+    /// wait for.
+    fn broadcast(&mut self, invalidation: Option<Invalidation>) {
+        let Some((shootdown, id)) = self.shootdown.clone() else {
+            return;
+        };
+        match invalidation {
+            Some(Invalidation::CodePage(page)) => {
+                self.machine.code_pages += 1;
+                shootdown.post(id, Invalidation::CodePage(page));
+            }
+            Some(invalidation) => shootdown.post(id, invalidation),
+            None => {
+                self.machine.code_mails += 1;
+                shootdown.post_code(id);
+            }
+        }
+        let started = std::time::Instant::now();
+        let mut spins = 0u32;
+        while shootdown.outstanding(id) {
+            // Mail of a CPU that waits on this one is taken here.
+            self.take_mail();
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(64) {
+                // A kick that the head of a block overwrote.
+                shootdown.kick_outstanding(id);
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        self.machine.wait_ns += started.elapsed().as_nanos() as u64;
+    }
+
+    /// A store of this CPU ended translated code of some CPU in a page
+    /// (`Memory::ended_code`): tell the others before the store completes,
+    /// so that none runs a block of the page again without looking at the
+    /// memory (3e DESIGN.md H11a). Chained code looks at nothing.
+    #[inline]
+    fn tell_code<M: Memory>(&mut self, memory: &M) {
+        if self.shootdown.is_none() {
+            return;
+        }
+        let ended = memory.ended_code();
+        if ended != self.ended_code {
+            self.ended_code = ended;
+            self.broadcast(None);
         }
     }
 
@@ -629,6 +737,7 @@ impl Side {
         let mut buffer = [0u8; 16];
         let part = &mut buffer[..usize::from(bytes)];
         if exclusive {
+            self.machine.exclusive_loads += 1;
             // A failed load leaves the monitor as it was. An exclusive load
             // is aligned, so it is in one page.
             let generation = memory
@@ -701,6 +810,7 @@ impl Side {
             }
         }
         self.wrote(address, spot, bytes, value, code);
+        self.tell_code(memory);
         Ok(())
     }
 
@@ -726,6 +836,7 @@ impl Side {
             self.code_written = true;
             self.unmark_code(spot.first);
         }
+        self.tell_code(memory);
         if let Some(log) = &mut self.log {
             for half in 0..ZERO_BLOCK / 16 {
                 log.push(Access {
@@ -744,6 +855,22 @@ impl Side {
     /// load: QEMU then writes where the low bytes agree and reports failure
     /// unless the whole value agrees, and so does this.
     fn store_exclusive<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        address: u64,
+        bytes: u8,
+        value: u128,
+        user: bool,
+        single: bool,
+    ) -> Result<(bool, bool), Unstored> {
+        self.machine.exclusive_stores += 1;
+        let done = self.store_exclusive_locked(memory, address, bytes, value, user, single);
+        // After the lock of the store is let go: the others may wait for it.
+        self.tell_code(memory);
+        done
+    }
+
+    fn store_exclusive_locked<M: Memory>(
         &mut self,
         memory: &mut M,
         address: u64,
@@ -1800,6 +1927,8 @@ fn store_pair<M: Memory>(
             .write(phys + 8, &high.to_le_bytes())
             .map_err(|error| (exit, Failed::Access(Fault::memory(error, at), true)))?;
         side.own_writes += 1;
+        // Translated code of another CPU can be in the page.
+        side.tell_code(memory);
         // Compiled code makes the pair inline from now on (3e J6).
         if privileged && side.mmu.fast().is_some() {
             side.fill_fast_after(at, 16, Kind::Write);
@@ -1862,6 +1991,7 @@ fn store<M: Memory, const N: usize>(
             if watch.load(Ordering::Relaxed) & 1 != 0 {
                 memory.wrote_straight(entry.phys | offset, N);
                 side.own_writes += 1;
+                side.tell_code(memory);
             } else if privileged && side.mmu.fast().is_some() {
                 side.fill_fast(at, &entry, true);
             }
@@ -1875,6 +2005,8 @@ fn store<M: Memory, const N: usize>(
             && memory.write(phys, &value.to_le_bytes()[..N]).is_ok()
         {
             side.own_writes += 1;
+            // Translated code of another CPU can be in the page.
+            side.tell_code(memory);
             return Ok(());
         }
     }
@@ -2244,9 +2376,6 @@ struct Env<'a, M> {
     context: *mut jit::Context,
     /// The inlined loads and stores that missed the fast TLB.
     misses: u64,
-    /// The budget when the thunk spent it so that the run leaves at the
-    /// next block head: a store went into a page of translated code.
-    kicked: Option<i64>,
     /// Why the block left, when an effect did not complete.
     failed: Option<(u32, Failed)>,
     stop: Option<Stop>,
@@ -2257,10 +2386,6 @@ struct Env<'a, M> {
 
 /// What the thunk returns when the block leaves.
 const THUNK_LEFT: u64 = 2;
-
-/// The budget that the thunk leaves when it ends a chained run: far below
-/// zero, so that no block head takes its instructions from it.
-const KICKED: i64 = i64::MIN / 2;
 
 /// The thunk of compiled code (3e DESIGN.md J1): it runs the operation
 /// `index` of `block` as the interpreter does. The emitter put every word
@@ -2311,6 +2436,16 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
                 env.memory
                     .wrote_straight(phys | (at & 0xfff), usize::from(bytes));
                 env.side.own_writes += 1;
+                let changes = env.side.mmu.changes();
+                env.side.tell_code(env.memory);
+                // Code mail, or an invalidation of the TLB, that the CPU
+                // took while it waited: the links and the jump cache of the
+                // run follow translations that are gone.
+                if env.side.code_written || env.side.mmu.changes() != changes {
+                    // SAFETY: the context of the run, which compiled code
+                    // does not hold while it calls.
+                    unsafe { jit::seat::kick(env.context) };
+                }
             }
             return 0;
         }
@@ -2362,6 +2497,7 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
     // while it calls.
     let state = unsafe { &mut *env.state };
     let written = env.side.code_written;
+    let changes = env.side.mmu.changes();
     let done = Compiled::effect(
         op,
         frame,
@@ -2386,12 +2522,15 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
             // A block of one instruction made a store into a page of
             // translated code: no block after it may run before the loop
             // looked at the code again (H11).
-            if !written && env.side.code_written && env.kicked.is_none() {
+            // So did code mail that the CPU took while it waited (a store
+            // tells the other CPUs and waits for them, J7c). An
+            // invalidation of the TLB that it took then leaves the links
+            // and the jump cache of the run on translations that are gone:
+            // the run ends, and the next one empties the jump cache.
+            if (!written && env.side.code_written) || env.side.mmu.changes() != changes {
                 // SAFETY: the context of the run, which compiled code does
                 // not hold while it calls.
-                let context = unsafe { &mut *env.context };
-                env.kicked = Some(context.budget);
-                context.budget = KICKED;
+                unsafe { jit::seat::kick(env.context) };
             }
             0
         }
@@ -2950,6 +3089,7 @@ unsafe fn run_chained<M: Memory>(
     budget: u64,
     counts: &mut JitCounts,
     replay: Option<&mut Replay>,
+    seat: Option<&jit::seat::Seat>,
 ) -> Option<Ran> {
     // SAFETY: the caller's promise.
     let context_el = unsafe { (*first).context.el };
@@ -2957,14 +3097,13 @@ unsafe fn run_chained<M: Memory>(
     let state_pointer: *mut State = state;
     // SAFETY: as above.
     let frame = unsafe { (*first).frame.as_mut_ptr() };
-    let budget = budget.min(i64::MAX as u64) as i64;
+    let budget = budget.min(jit::seat::MOST) as i64;
     let mut env = Env {
         state: state_pointer,
         memory,
         side,
         context: std::ptr::null_mut(),
         misses: 0,
-        kicked: None,
         failed: None,
         stop: None,
         replay,
@@ -2974,8 +3113,8 @@ unsafe fn run_chained<M: Memory>(
     } else {
         thunk::<M>
     };
-    let mut context = jit.context(budget, thunk, (&raw mut env).cast());
-    context.block = first.cast();
+    let mut fresh = jit.context(budget, thunk, (&raw mut env).cast());
+    fresh.block = first.cast();
     // The tables of the fast TLB for the level of the blocks (H7). A replay
     // of K3 keeps the empty ones, so that every access comes to its thunk,
     // and so does a run while an exclusive mark is set, for the stores.
@@ -2984,38 +3123,57 @@ unsafe fn run_chained<M: Memory>(
         && let Some(fast) = env.side.mmu.fast()
     {
         let level = usize::from(context_el != 0);
-        context.reads = fast.table(level, false);
+        fresh.reads = fast.table(level, false);
         if env.side.exclusive.is_none() {
-            context.writes = fast.table(level, true);
+            fresh.writes = fast.table(level, true);
         }
     }
-    env.context = &raw mut context;
+    // The context of a CPU of a machine is in its seat, where the other
+    // threads kick it (H10c). Another run has it on the stack.
+    let mut local = None;
+    let context: *mut jit::Context = match seat {
+        Some(seat) => {
+            seat.prepare(fresh);
+            seat.context()
+        }
+        None => local.insert(fresh),
+    };
+    env.context = context;
     // SAFETY: `entry` is current and was compiled from `first`, whose frame
     // and register slots are as large as its shape names. While the code
     // runs, only it and the thunk touch the frames and the state, and the
-    // thunk reaches them through `env` and the tag of the block alone.
+    // thunk reaches them through `env` and the tag of the block alone. The
+    // context lives to the end of the function; other threads touch only
+    // its budget, with atomic operations.
     let code = unsafe {
         jit.enter(
             entry,
-            &raw mut context,
+            context,
             (&raw mut (*state_pointer).slots).cast(),
             frame,
         )
     };
     let failed = env.failed.take();
     let stop = env.stop.take();
-    let left = match env.kicked {
-        Some(saved) => saved + (context.budget - KICKED),
-        None => context.budget,
+    // SAFETY: as above.
+    let left = unsafe { jit::seat::left(context) };
+    // SAFETY: as above. Only the budget is shared.
+    let (chained, hits, accesses, last) = unsafe {
+        (
+            (*context).chained,
+            (*context).hits,
+            (*context).accesses,
+            (*context).block,
+        )
     };
     // Every block head took its instructions from the budget, and gave them
     // back when they did not fit.
     let taken = u32::try_from(budget - left).unwrap_or(u32::MAX);
-    counts.chained += context.chained;
-    counts.jump_hits += context.hits;
-    counts.tlb_accesses += context.accesses;
+    counts.chained += chained;
+    counts.jump_hits += hits;
+    counts.tlb_accesses += accesses;
     counts.tlb_misses += env.misses;
-    let last = context.block.cast::<Compiled>();
+    let last = last.cast::<Compiled>();
     // SAFETY: the head of the block that ran last stored it, and it is
     // alive (above). Nothing else refers to it now.
     let last = unsafe { &mut *last };
@@ -3153,6 +3311,7 @@ impl Compiled {
                 budget,
                 &mut counts,
                 replay,
+                None,
             )
         };
         ran.map(|ran| (ran.count, ran.halt))
@@ -3456,6 +3615,8 @@ pub struct JitCounts {
     pub tlb_misses: u64,
     pub tlb_fills: u64,
     pub tlb_flushes: u64,
+    /// What this CPU and the others of its machine told each other (J7).
+    pub machine: MachineCounts,
 }
 
 /// Make the link that the run before left for `block`, whose code is
@@ -3527,6 +3688,8 @@ struct JitRun<'a> {
     check: u32,
     /// Chaining of compiled blocks (3e DESIGN.md H5, H6).
     chaining: &'a mut Chaining,
+    /// Where the context of the run is, for a kick from another thread.
+    seat: &'a jit::seat::Seat,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -3553,6 +3716,7 @@ unsafe fn execute<M: Memory>(
         counts,
         check,
         chaining,
+        seat,
     } = run;
     let Some(jit) = jit.as_mut() else {
         // SAFETY: the caller's promise.
@@ -3634,7 +3798,16 @@ unsafe fn execute<M: Memory>(
         // it drops it.
         if let Some(ran) = unsafe {
             run_chained(
-                block, &entry, jit, state, memory, side, budget, counts, None,
+                block,
+                &entry,
+                jit,
+                state,
+                memory,
+                side,
+                budget,
+                counts,
+                None,
+                Some(seat),
             )
         } {
             counts.exit(&ran.halt);
@@ -3822,10 +3995,31 @@ impl Cache {
 /// an access of this CPU to the controller. A CPU that has them reads them
 /// before every block, so that a line that falls (the guest acknowledged
 /// the interrupt) is not taken again.
+///
+/// The seat is where the compiled code of the CPU keeps its context: a line
+/// that rises kicks it (3e DESIGN.md H10c), so that a run of chained code
+/// leaves at its next block head, and so does `leave`.
 #[derive(Debug, Default)]
 pub struct Lines {
     pub irq: std::sync::atomic::AtomicBool,
     pub fiq: std::sync::atomic::AtomicBool,
+    pub seat: std::sync::Arc<jit::seat::Seat>,
+    /// The owner wants `run` to end at the next block: a pause or a
+    /// snapshot. `run` clears it when it ends there.
+    pub leave: std::sync::atomic::AtomicBool,
+}
+
+impl Lines {
+    /// Make a run of compiled code leave at its next block head.
+    pub fn kick(&self) {
+        self.seat.kick();
+    }
+
+    /// Make `run` return at the next block.
+    pub fn leave(&self) {
+        self.leave.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.seat.kick();
+    }
 }
 
 /// One CPU on a memory.
@@ -3867,6 +4061,9 @@ pub struct Cpu<M> {
     /// TLB maintenance operation of the Inner Shareable domain reaches the
     /// others through them. `None`: the CPU is alone.
     pub shootdown: Option<(std::sync::Arc<crate::shootdown::Shootdown>, usize)>,
+    /// The seat of the compiled code of a CPU without `lines`, whose seat
+    /// it is otherwise.
+    seat: std::sync::Arc<jit::seat::Seat>,
     blocks: Cache,
     /// Blocks of one instruction, for `step` and for the end of a budget.
     singles: Cache,
@@ -3928,6 +4125,7 @@ impl<M: Memory> Cpu<M> {
             block_counts: None,
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
+            seat: Default::default(),
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
@@ -4100,6 +4298,7 @@ impl<M: Memory> Cpu<M> {
             counts.tlb_fills = fast.fills;
             counts.tlb_flushes = fast.flushes;
         }
+        counts.machine = self.side.machine;
         counts
     }
 
@@ -4426,33 +4625,13 @@ impl<M: Memory> Cpu<M> {
     }
 
     fn invalidate(&mut self, invalidation: Invalidation) {
-        match invalidation {
-            Invalidation::All => self.side.mmu.flush(),
-            Invalidation::Page { argument, asid } => {
-                self.side.mmu.flush_page(Regime::El10, argument, asid)
-            }
-            Invalidation::Asid(asid) => self.side.mmu.flush_asid(Regime::El10, asid),
-        }
+        self.side.invalidate(invalidation);
     }
 
     /// Hand `invalidation` to the other CPUs, and return when every one of
     /// them that runs has applied it (`shootdown.rs`).
     fn broadcast(&mut self, invalidation: Invalidation) {
-        let Some((shootdown, id)) = self.shootdown.clone() else {
-            return;
-        };
-        shootdown.post(id, invalidation);
-        let mut spins = 0u32;
-        while shootdown.outstanding(id) {
-            // Mail of a CPU that waits on this one is taken here.
-            self.take_mail();
-            spins = spins.wrapping_add(1);
-            if spins.is_multiple_of(64) {
-                std::thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
-        }
+        self.side.broadcast(Some(invalidation));
     }
 
     #[inline(always)]
@@ -4464,15 +4643,9 @@ impl<M: Memory> Cpu<M> {
         }
     }
 
-    /// Apply what the other CPUs invalidated.
+    /// Apply what the other CPUs posted.
     fn take_mail(&mut self) {
-        let mail = match &self.shootdown {
-            Some((shootdown, id)) => shootdown.take(*id),
-            None => return,
-        };
-        for invalidation in mail.into_iter().flatten() {
-            self.invalidate(invalidation);
-        }
+        self.side.take_mail();
     }
 
     fn unknown_operation(
@@ -4598,6 +4771,13 @@ impl<M: Memory> Cpu<M> {
         // taken before the code is read: a write that lands after the read
         // moves a stamp that is newer than the one of the block.
         let watch = self.memory.watch_code(phys);
+        // H11c: no other CPU keeps a write entry of the fast TLB for the
+        // page when its code is read. A page that this CPU holds code of
+        // was told before.
+        if self.side.shootdown.is_some() && !self.side.holds_code(phys) {
+            self.side
+                .broadcast(Some(Invalidation::CodePage(phys & !0xfff)));
+        }
         let stamp = self.memory.code_stamp(phys, self.stamp_len(phys));
         let mut builder = Builder::new(context, pc);
         let mut at = pc;
@@ -4693,8 +4873,14 @@ impl<M: Memory> Cpu<M> {
         }
         // A write that made the page unwatched while the code was read: the
         // block holds no stamp, and runs until the next epoch.
-        compiled.stamp =
-            stamp.filter(|_| watch.is_none_or(|word| self.memory.watch_holds(phys, word)));
+        let held = watch.is_none_or(|word| self.memory.watch_holds(phys, word));
+        compiled.stamp = stamp.filter(|_| held);
+        // Its epoch ends after this run: with chaining it would not end
+        // before the next check of the memory, which can be a whole run
+        // away, and the bytes that it holds may be the old ones.
+        if !held {
+            self.side.code_written = true;
+        }
         compiled.epoch = self.epoch;
         Ok(compiled)
     }
@@ -4893,6 +5079,10 @@ impl<M: Memory> Cpu<M> {
                         0
                     },
                     chaining: &mut self.chaining,
+                    seat: match &self.lines {
+                        Some(lines) => &lines.seat,
+                        None => &self.seat,
+                    },
                 },
                 pending,
                 self.epoch,
@@ -4934,6 +5124,7 @@ impl<M: Memory> Cpu<M> {
     /// that comes before it. `taken` says which.
     pub fn step(&mut self) -> Result<(), Stop> {
         self.taken = None;
+        self.join_machine();
         self.take_mail();
         self.read_lines();
         self.check_generation();
@@ -4950,8 +5141,29 @@ impl<M: Memory> Cpu<M> {
         }
     }
 
+    /// Bring the side up to date with `shootdown`, which the owner sets,
+    /// and give the mailbox of the CPU its seat.
+    fn join_machine(&mut self) {
+        let same = match (&self.shootdown, &self.side.shootdown) {
+            (Some((a, i)), Some((b, j))) => std::sync::Arc::ptr_eq(a, b) && i == j,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.side.shootdown = self.shootdown.clone();
+        }
+        if let Some((shootdown, id)) = &self.shootdown {
+            let seat = match &self.lines {
+                Some(lines) => &lines.seat,
+                None => &self.seat,
+            };
+            shootdown.seat(*id, seat);
+        }
+    }
+
     /// Run up to `budget` instructions and say why the loop stopped.
     pub fn run(&mut self, budget: u64) -> Stop {
+        self.join_machine();
         if let Some((shootdown, id)) = &self.shootdown {
             shootdown.set_running(*id, true);
         }
@@ -4995,9 +5207,21 @@ impl<M: Memory> Cpu<M> {
             // next and no other.
             let pending = self.chaining.pending.take();
             // Another CPU invalidated translations: no block starts before
-            // this CPU has dropped them too.
+            // this CPU has dropped them too. Code mail: another CPU wrote
+            // into a page of translated code, and the blocks are looked at
+            // again before one runs (H11a).
             self.take_mail();
+            if self.side.code_written {
+                self.settle();
+            }
             self.read_lines();
+            // A pause or a snapshot asked the CPU to leave its run.
+            if let Some(lines) = &self.lines
+                && lines.leave.load(Ordering::Relaxed)
+            {
+                lines.leave.store(false, Ordering::SeqCst);
+                break;
+            }
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);
             let fetched = if quiet {
@@ -5032,6 +5256,10 @@ impl<M: Memory> Cpu<M> {
                                 0
                             },
                             chaining: &mut self.chaining,
+                            seat: match &self.lines {
+                                Some(lines) => &lines.seat,
+                                None => &self.seat,
+                            },
                         },
                         pending,
                         self.epoch,
@@ -5125,6 +5353,62 @@ mod tests {
 
     // add x0, x0, #1 ; subs x1, x1, #1 ; b.ne -8
     const LOOP: [u32; 3] = [0x9100_0400, 0xf100_0421, 0x54ff_ffc1];
+
+    /// 3e card J7: a store of compiled code into a page that another CPU
+    /// holds code of waits for that CPU (J7c). An invalidation of the TLB
+    /// that the waiting CPU takes then ends its chained run, so that the
+    /// next run empties the jump cache; without one the run goes on. The
+    /// other CPU is a thread that answers the mailbox: it posts
+    /// `TLBI VMALLE1IS` while the store waits, with the kick of the post
+    /// sent to another seat, waits until it was taken, and then takes the
+    /// code mail.
+    #[test]
+    fn a_tlbi_taken_while_a_store_waits_ends_the_chained_run() {
+        use crate::shootdown::{Invalidation, Shootdown};
+        use std::sync::Arc;
+        const PAGE: u64 = BASE + 0x1000;
+        let runs = |tlbi: bool| -> u64 {
+            // str w1, [x2] ; b -4
+            let mut cpu = cpu(&[0xb900_0041, 0x17ff_ffff]);
+            cpu.set_jit(true).unwrap();
+            cpu.set_chaining(true).unwrap();
+            let shootdown = Arc::new(Shootdown::new(2));
+            cpu.shootdown = Some((shootdown.clone(), 0));
+            cpu.state.set_x(2, PAGE);
+            // Compiled and linked, with the page of the store unwatched.
+            assert_eq!(cpu.run(200), Stop::Budget);
+            let before = cpu.jit_counts().compiled_runs;
+            // The other CPU translated code in the page and runs.
+            assert!(cpu.memory.watch_code(PAGE).is_some());
+            shootdown.set_running(1, true);
+            let other = std::thread::spawn({
+                let shootdown = shootdown.clone();
+                move || {
+                    while !shootdown.has_mail(1) {
+                        std::hint::spin_loop();
+                    }
+                    if tlbi {
+                        // The post kicks the seat of the CPU too, and so
+                        // ends its run by itself. Without that kick only
+                        // the thunk sees the invalidation (a kick can be
+                        // lost, J7a).
+                        shootdown.seat(0, &Arc::new(jit::seat::Seat::new()));
+                        shootdown.post(1, Invalidation::All);
+                        while shootdown.has_mail(0) {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    assert!(shootdown.take(1).is_some_and(|mail| mail.code));
+                }
+            });
+            assert_eq!(cpu.run(2000), Stop::Budget);
+            other.join().unwrap();
+            assert_eq!(cpu.jit_counts().machine.code_mails, 1);
+            cpu.jit_counts().compiled_runs - before
+        };
+        let quiet = runs(false);
+        assert_eq!(runs(true), quiet + 1, "the run after the TLBI");
+    }
 
     #[test]
     fn a_counted_loop_runs_to_its_end_with_the_flags_of_the_last_compare() {

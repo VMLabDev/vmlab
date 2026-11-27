@@ -201,12 +201,26 @@ pub struct Waker {
     kicked: AtomicBool,
     lock: Mutex<()>,
     wake: Condvar,
+    /// What else a kick does: an emulated CPU leaves its run of compiled
+    /// code at the next block (3e DESIGN.md H10c).
+    also: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Waker {
+    /// A waker whose kick also calls `also`.
+    pub fn with_kick(also: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            also: Some(Box::new(also)),
+            ..Self::default()
+        }
+    }
+
     /// Ask the vCPU to leave its backend and look at the machine state.
     pub fn kick(&self) {
         self.kicked.store(true, Ordering::SeqCst);
+        if let Some(also) = &self.also {
+            also();
+        }
         self.notify();
     }
 
