@@ -45,7 +45,8 @@ fn state(vcpu: &Mutex<EmulatedVcpu>) -> Result<State> {
 }
 
 pub(super) fn pc(shared: &VmShared, id: u8) -> Result<u64> {
-    Ok(state(&vcpu(shared, id)?)?.pc())
+    let vcpu = vcpu(shared, id)?;
+    Ok(state(&vcpu)?.pc())
 }
 
 /// The registers of `state` as the debug port shows them.
@@ -115,7 +116,8 @@ pub(super) fn set(state: &mut State, values: &BTreeMap<String, u64>) -> Result<(
 }
 
 pub(super) fn read_registers(shared: &VmShared, id: u8) -> Result<Aarch64Registers> {
-    Ok(registers(&state(&vcpu(shared, id)?)?))
+    let vcpu = vcpu(shared, id)?;
+    Ok(registers(&state(&vcpu)?))
 }
 
 pub(super) fn set_registers(shared: &VmShared, id: u8, values: &BTreeMap<String, u64>) -> Result<()> {
