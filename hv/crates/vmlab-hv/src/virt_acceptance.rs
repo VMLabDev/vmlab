@@ -357,7 +357,11 @@ fn snapshots_of_an_emulated_aarch64_machine_online_and_offline() {
 
     let mut machine = Machine::start(dir.path(), &desc);
     let at_save = machine.run_a_while();
-    assert!(at_save > 0, "the guest did not count: {}", machine.diagnostics());
+    assert!(
+        at_save > 0,
+        "the guest did not count: {}",
+        machine.diagnostics()
+    );
     ok(machine
         .client
         .call(Control::SnapshotSave {

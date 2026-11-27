@@ -369,7 +369,12 @@ const COUNTER: u64 = map::RAM_BASE + 0x10_0000;
 /// A machine whose one CPU arms its virtual timer, so that its line is high
 /// at the GIC, and then counts in RAM for ever, with the count also in
 /// TPIDR_EL1. Its vmstate disk is a qcow2 file in `dir`.
-fn counting(dir: &Path) -> (crate::vm::Vm, Vec<std::sync::Arc<parking_lot::Mutex<crate::vcpu::emulated::EmulatedVcpu>>>) {
+fn counting(
+    dir: &Path,
+) -> (
+    crate::vm::Vm,
+    Vec<std::sync::Arc<parking_lot::Mutex<crate::vcpu::emulated::EmulatedVcpu>>>,
+) {
     let mut words = asm::load(1, COUNTER).to_vec();
     words.extend(asm::load(4, 1));
     words.extend([asm::msr(CNTV_CVAL_EL0, 4), asm::msr(CNTV_CTL_EL0, 4)]);
@@ -447,7 +452,15 @@ fn cpu_state(
 
 fn gic_state(handle: &crate::vm::VmHandle) -> Vec<u8> {
     use vmlab_hv_devices::Snapshot;
-    handle.shared().virt.get().unwrap().gic.lock().save_state().unwrap()
+    handle
+        .shared()
+        .virt
+        .get()
+        .unwrap()
+        .gic
+        .lock()
+        .save_state()
+        .unwrap()
 }
 
 /// D13 on an emulated machine: a load puts RAM, the CPU with its system
@@ -588,10 +601,7 @@ fn the_debug_port_reads_steps_and_writes_an_emulated_cpu() {
     };
     assert_eq!(data, ((1u64 << 40) + 1).to_le_bytes());
     assert!(matches!(
-        crate::debug::handle(
-            handle.shared(),
-            DebugRequest::ReadRegisters { vcpu: 1 }
-        ),
+        crate::debug::handle(handle.shared(), DebugRequest::ReadRegisters { vcpu: 1 }),
         Outcome::Error { .. }
     ));
     debug(DebugRequest::Detach { resume: true });
@@ -599,4 +609,47 @@ fn the_debug_port_reads_steps_and_writes_an_emulated_cpu() {
     counted_past(&handle, (1 << 40) + 100);
     handle.quit();
     vm.wait();
+}
+
+/// A kernel of the EFI zboot format boots without firmware: the machine
+/// unpacks the Image inside it.
+#[test]
+fn a_zboot_kernel_is_unpacked_and_boots() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let mut program = Program::default();
+    program.push(asm::load(1, map::UART_BASE));
+    program.print("z\n");
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&asm::bytes(&program.finish())).unwrap();
+    let payload = gzip.finish().unwrap();
+    let mut image = vec![0u8; 0x40];
+    image[..8].copy_from_slice(b"MZ\0\0zimg");
+    image[8..12].copy_from_slice(&0x40u32.to_le_bytes());
+    image[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    image[0x18..0x1d].copy_from_slice(b"gzip\0");
+    image.extend(&payload);
+    let path = dir.path().join("vmlinuz");
+    std::fs::write(&path, &image).unwrap();
+    let boot = Boot::Kernel {
+        kernel: path.clone(),
+        initrd: None,
+        cmdline: String::new(),
+    };
+    let (reason, log) = run(&description(dir.path(), 1, boot));
+    assert_eq!(log, "z\n");
+    assert_eq!(reason, OFF);
+    // Another compression is named in the refusal.
+    image[0x18..0x1d].copy_from_slice(b"zstd\0");
+    std::fs::write(&path, &image).unwrap();
+    let boot = Boot::Kernel {
+        kernel: path,
+        initrd: None,
+        cmdline: String::new(),
+    };
+    let error = crate::build(&description(dir.path(), 1, boot), &NoDevices, true)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("zstd"), "{error}");
 }

@@ -76,9 +76,8 @@ pub(super) fn set(state: &mut State, values: &BTreeMap<String, u64>) -> Result<(
     for (name, value) in values {
         let value = *value;
         let lower = name.to_ascii_lowercase();
-        let narrow = |value: u64| {
-            u32::try_from(value).map_err(|_| invalid(format!("{name} takes 32 bits")))
-        };
+        let narrow =
+            |value: u64| u32::try_from(value).map_err(|_| invalid(format!("{name} takes 32 bits")));
         if let Some(n) = lower
             .strip_prefix('x')
             .and_then(|n| n.parse::<usize>().ok())
@@ -120,7 +119,11 @@ pub(super) fn read_registers(shared: &VmShared, id: u8) -> Result<Aarch64Registe
     Ok(registers(&state(&vcpu)?))
 }
 
-pub(super) fn set_registers(shared: &VmShared, id: u8, values: &BTreeMap<String, u64>) -> Result<()> {
+pub(super) fn set_registers(
+    shared: &VmShared,
+    id: u8,
+    values: &BTreeMap<String, u64>,
+) -> Result<()> {
     let vcpu = vcpu(shared, id)?;
     let mut state = state(&vcpu)?;
     set(&mut state, values)?;

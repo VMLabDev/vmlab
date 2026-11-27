@@ -166,7 +166,10 @@ impl Virt {
     }
 
     /// The sections of the machine. Every vCPU thread is parked.
-    pub(crate) fn save_sections(&self, sections: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
+    pub(crate) fn save_sections(
+        &self,
+        sections: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<(), String> {
         for (id, vcpu) in self.vcpus.iter().enumerate() {
             let VcpuState::Aarch64(state) = vcpu.lock().state()? else {
                 return Err(format!("vcpu {id} is no aarch64 CPU"));

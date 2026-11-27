@@ -502,6 +502,44 @@ fn read_image(path: &std::path::Path, what: &str, limit: u64) -> Result<Vec<u8>,
     Ok(data)
 }
 
+/// The Image inside an EFI zboot kernel, which Alpine and Fedora ship for
+/// arm64: a PE file whose header says `zimg` at 4, gives the offset and the
+/// size of the compressed Image at 8 and 12, and names the compression at
+/// 0x18 (Linux, `drivers/firmware/efi/libstub/zboot-header.S` as the
+/// kernel documents it). Firmware runs its stub, which unpacks the Image. A
+/// boot without firmware unpacks it here, as a boot loader does. Any other
+/// image is returned as it is.
+fn unpack_zboot(image: Vec<u8>, limit: u64) -> Result<Vec<u8>, VmmError> {
+    if image.get(..2) != Some(b"MZ") || image.get(4..8) != Some(b"zimg") {
+        return Ok(image);
+    }
+    let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap()) as usize;
+    let (offset, size) = (word(8), word(12));
+    let compression = image.get(0x18..0x20).unwrap_or_default();
+    let Some(payload) = offset
+        .checked_add(size)
+        .and_then(|end| image.get(offset..end))
+    else {
+        return Err(invalid("the zboot kernel names a payload outside its file"));
+    };
+    if !compression.starts_with(b"gzip\0") {
+        return Err(invalid(format!(
+            "the zboot kernel is compressed with {:?}, and only gzip is unpacked",
+            String::from_utf8_lossy(compression).trim_end_matches('\0')
+        )));
+    }
+    let mut unpacked = Vec::new();
+    use std::io::Read;
+    flate2::read::GzDecoder::new(payload)
+        .take(limit + 1)
+        .read_to_end(&mut unpacked)
+        .map_err(|e| invalid(format!("unpacking the zboot kernel: {e}")))?;
+    if unpacked.len() as u64 > limit {
+        return Err(invalid("the unpacked zboot kernel does not fit the RAM"));
+    }
+    Ok(unpacked)
+}
+
 /// Where a kernel image is loaded, above the base of RAM: an image with the
 /// arm64 header says so itself.
 fn kernel_offset(image: &[u8]) -> u64 {
@@ -541,7 +579,7 @@ fn images(desc: &MachineDescription, dtb: Option<Vec<u8>>) -> Result<Images, Vmm
             x0: 0,
         });
     };
-    let kernel = read_image(kernel, "kernel", ram_size)?;
+    let kernel = unpack_zboot(read_image(kernel, "kernel", ram_size)?, ram_size)?;
     let kernel_at = map::RAM_BASE + kernel_offset(&kernel);
     let data_at = map::RAM_BASE + (ram_size / 2).min(BOOT_DATA_OFFSET);
     let mut loads = Vec::new();
