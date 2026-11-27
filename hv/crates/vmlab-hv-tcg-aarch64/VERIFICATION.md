@@ -1340,6 +1340,31 @@ RAM, and the files come through DMA.
   the DSDT of the capture, whatever functions the machine has: that is a
   finding for card C11, not changed here.
 
+The second matrix, at commit `f7346539` (the head of this card), measures
+the speed of each boot. The same `bench/run.py` command in two lanes of
+four cores (16-19 and 20-23); every 20 s the sampler turns on the debug log
+of `vmlab_hv_vmm::vcpu::emulated` for 1 s and reads the instruction count of
+each vCPU from its exception lines. MIPS is the sum over the vCPUs of the
+last count, divided by the time from the process start to that sample, so
+idle time is inside it, and a boot in emergency mode idles after it fails.
+Other cards ran one or two emulated aarch64 VMs on other cores of helios
+during the first runs (load average 11 to 15); Debian ran again at load 5.
+
+| Template | vCPUs | Result | MIPS | Instructions, over |
+|---|---|---|---|---|
+| alpine-3.23 | 1 | agent ready in 296 s | 50.3 | 14.86e9, 295 s |
+| alpine-3.23 | 2 | agent ready in 298 s | 51.1 | 15.08e9, 295 s |
+| debian-13 | 1 | emergency mode under load; agent ready in 274 s at load 5 | 25.8; 64.2 | 18.23e9, 708 s; 18.94e9, 295 s |
+| debian-13 | 2 | emergency mode under load; agent ready in 204 s at load 5 | 27.2; 89.1 | 19.45e9, 715 s; 18.79e9, 211 s |
+| fedora-44 | 1 | emergency mode | 43.8 | 31.33e9, 715 s |
+| fedora-44 | 2 | emergency mode | 52.2 | 37.35e9, 716 s |
+| ubuntu-24.04 | 1 | emergency mode; the agent answered from it at 522 s | 44.6 | 24.42e9, 547 s |
+| ubuntu-24.04 | 2 | agent ready in 341 s | 68.5 | 24.50e9, 358 s |
+
+An agent that answers from emergency mode does not count as a pass of S1.
+Debian's two results show how near its timeouts it runs: the load of other
+VMs on the host is enough to push it over them.
+
 ### kvm-unit-tests
 
 `just tcg-a64-kvm-unit-tests` builds kvm-unit-tests (commit `32f8ad45`, with
@@ -1483,10 +1508,13 @@ D13).
 
 ## Card C13 (2026-11-27)
 
-The four templates to agent ready (DESIGN.md P4, M6). The card is not
-complete: four of the eight boots reach agent ready inside 600 s, and the
-boot lockstep (O4) of Debian did not run. What stops the rest is the speed
-of the interpreter, not an instruction or a device that a boot misses.
+The four templates to agent ready (DESIGN.md P4, M6). The card lands what
+it found and fixed. Five of the eight boots reach agent ready inside 600 s
+on a quiet host, Debian among them, and the boot lockstep (O4) of Debian did
+not run. What stops the rest is the speed of the interpreter, not an
+instruction or a device that a boot misses. The boots that fail on speed and
+the O4 lockstep of Debian move to card C13b (decision of the overseer,
+2026-11-27): guest time stays real time and no guest timeout is lengthened.
 
 ### What the boots missed, and what changed
 
@@ -1574,9 +1602,11 @@ same results. `timer` gives the same results after the deadline exit above.
 ### What this card does not do
 
 - Fedora at 1 and 2 vCPUs and Ubuntu at 1 vCPU do not reach agent ready,
-  and Debian at 1 vCPU is near its device timeouts: the speed above.
+  and Debian at 1 and 2 vCPUs is near its device timeouts: the speed above.
+  These move to card C13b.
 - O4 for Debian did not run: at the 0.59 million instructions a second of
-  card C10 the 18e9 instructions of the boot take about 8.5 hours.
+  card C10 the 18e9 instructions of the boot take about 8.5 hours. It moves
+  to card C13b.
 - The S1 test of the aarch64 guest asset (`s1_aarch64.rs`, card C14) did
   not run: helios has no aarch64 guest asset.
 
