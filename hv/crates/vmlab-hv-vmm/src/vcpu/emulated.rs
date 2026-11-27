@@ -167,8 +167,7 @@ impl EmulatedVcpu {
 
     /// Put the CPU into `state`, as a reset and PSCI `CPU_ON` do.
     pub fn reset(&mut self, state: State) {
-        self.cpu.state = state;
-        self.cpu.clear_exclusive();
+        self.cpu.replace_state(state);
         self.cpu.irq = false;
         self.cpu.fiq = false;
         self.hypercall = None;
@@ -240,6 +239,46 @@ impl EmulatedVcpu {
             self.id,
             unknown.join("; ")
         );
+    }
+
+    /// Run one instruction for the debug port, or take the interrupt that
+    /// comes before it, on the thread that asks: the thread of the vCPU is
+    /// parked. A hypercall is served by `host` at once, and a `WFI` ends
+    /// the step after it.
+    pub fn debug_step(&mut self, host: &dyn super::VcpuHost) -> Result<(), String> {
+        self.sync_counter();
+        self.drive_timer();
+        self.cpu.irq = self.lines.irq.level();
+        self.cpu.fiq = self.lines.fiq.level();
+        let result = self.cpu.step();
+        self.drive_timer();
+        self.log_unknown();
+        match result {
+            Ok(()) | Err(Stop::Halt | Stop::Budget) => Ok(()),
+            Err(Stop::Hypercall {
+                conduit,
+                immediate,
+                pc,
+            }) => {
+                let call = Hypercall {
+                    conduit: match conduit {
+                        vmlab_hv_tcg_aarch64::Conduit::Hvc => Conduit::Hvc,
+                        vmlab_hv_tcg_aarch64::Conduit::Smc => Conduit::Smc,
+                    },
+                    immediate,
+                    arguments: std::array::from_fn(|n| self.cpu.state.x(n)),
+                };
+                self.hypercall = Some(pc);
+                let outcome = host.hypercall(self.id, &call);
+                self.finish_hypercall(outcome);
+                Ok(())
+            }
+            Err(Stop::Unimplemented { pc, record }) => Err(format!(
+                "vcpu {}: the emulator has no instruction {record:?} yet, at {pc:#x}",
+                self.id
+            )),
+            Err(Stop::Host(error)) => Err(format!("vcpu {}: {error}", self.id)),
+        }
     }
 
     fn fail(&self, what: String) -> Exit {
@@ -364,9 +403,12 @@ impl VcpuBackend for EmulatedVcpu {
         let VcpuState::Aarch64(state) = state else {
             return Err("an emulated aarch64 vCPU takes the state of an aarch64 CPU".into());
         };
-        self.cpu.state = (**state).clone();
-        self.cpu.clear_exclusive();
+        // A restore and a write of the debug port: the caches of the CPU
+        // are built again from the new state and the memory as it is now.
+        self.cpu.replace_state((**state).clone());
         self.hypercall = None;
+        self.timer_levels = [None; 2];
+        self.sync_counter();
         Ok(())
     }
 }

@@ -1607,6 +1607,26 @@ impl<M: Memory> Cpu<M> {
         self.side.exclusive = None;
     }
 
+    /// Put the CPU into `state` from outside the guest: a reset, PSCI
+    /// `CPU_ON`, a snapshot restore or a write of the debug port. What the
+    /// CPU derived from the state and the memory before is dropped: the TLB
+    /// (its entries are tagged and survive a new table base, and a restore
+    /// can bring other tables under the same base), the translated blocks,
+    /// the code pages and the exclusive reservation. The next `run` builds
+    /// them again. The interrupt inputs, the counters and the log of
+    /// accesses stay.
+    pub fn replace_state(&mut self, state: State) {
+        self.state = state;
+        let log = self.side.log.take();
+        self.side = Side::new(&self.state);
+        self.side.log = log;
+        self.blocks = Cache::new();
+        self.singles = Cache::new();
+        self.generation = self.memory.generation();
+        self.epoch += 1;
+        self.taken = None;
+    }
+
     /// What the system registers read that is not in the state.
     pub fn environment(&self) -> Environment {
         Environment {
@@ -2401,6 +2421,29 @@ mod tests {
         assert_eq!(cpu.instructions, 3000);
         // One block of three instructions, translated once.
         assert_eq!(cpu.translations, 1);
+    }
+
+    #[test]
+    fn a_replaced_state_runs_on_caches_that_are_built_again() {
+        let mut cpu = cpu(&LOOP);
+        cpu.state.set_x(1, 1000);
+        assert_eq!(cpu.run(300), Stop::Budget);
+        assert!(
+            cpu.blocks.entries.iter().any(Option::is_some)
+                || cpu.singles.entries.iter().any(Option::is_some)
+        );
+        let translations = cpu.translations;
+        let mut state = State::reset(BASE);
+        state.set_x(1, 5);
+        cpu.replace_state(state);
+        // No block and no translation of the state before is kept.
+        assert_eq!(cpu.tlb_entries(), 0);
+        assert!(cpu.blocks.entries.iter().all(Option::is_none));
+        assert!(cpu.singles.entries.iter().all(Option::is_none));
+        assert_eq!(cpu.state.x(0), 0);
+        assert_eq!(cpu.run(15), Stop::Budget);
+        assert_eq!(cpu.state.x(0), 5);
+        assert!(cpu.translations > translations);
     }
 
     #[test]

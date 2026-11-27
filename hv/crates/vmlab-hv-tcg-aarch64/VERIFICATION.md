@@ -1409,3 +1409,74 @@ adoption rules of the boot lockstep.
   no Unicorn. kvm-unit-tests (GPL-2.0) was built and run, and its sources
   were not read to write this code. Its `unittests.cfg` is parsed by the
   script that runs it.
+
+## Card C14 (2026-11-27)
+
+Snapshots, reset and the debug port of an emulated machine (DESIGN.md F6,
+D13).
+
+### How it is built
+
+- `Cpu::replace_state` puts a new state into the core from outside the
+  guest and drops what the core derived from the old one: the TLB, the
+  translated blocks, the code pages and the exclusive reservation. The TLB
+  is tagged by ASID and keeps its entries over a new table base, so a
+  restore that brings other tables under the same `TTBR` would otherwise run
+  on stale translations. A reset, PSCI `CPU_ON`, a snapshot restore and a
+  register write of the debug port all go through it.
+- `virt/snapshot.rs` (vmlab-hv-vmm) writes the sections of the machine: each
+  CPU (its slots, PSTATE, every system register row by name and both generic
+  timers, under the name of the CPU model), which CPUs are on, the system
+  counter, the GICv2, the PL011, the PL031, the GED, fw_cfg, the flash bank
+  of the variables (its blocks that are not erased) and the host bridge. RAM,
+  the virtio functions and the BARs go through the common path of
+  `snapshot.rs`, which skips the KVM state and the memory slots on an
+  emulated machine. A restore sets the counter first, then the devices, then
+  the CPUs.
+- The debug port of an emulated machine (`debug/emulated.rs`): pause,
+  continue, detach, the registers (`aarch64_registers` in the reply),
+  `set_registers` by name, a step that runs one instruction on the thread of
+  the request while the machine stays paused, and memory by physical or
+  virtual address through the CPU's own walk.
+- A boot without firmware unpacks an EFI zboot kernel (gzip), which the
+  aarch64 guest asset ships.
+
+### Tests
+
+- S1 (`vmlab-hv`, `virt_acceptance.rs`):
+  `snapshots_of_an_emulated_aarch64_machine_online_and_offline` takes an
+  online snapshot of a counting guest over the control socket, loads it in
+  the same process and in a new one on the same disk (the count and X1 come
+  back, and the guest counts on), and refuses the load of an offline
+  snapshot of the disk with `snapshot_incompatible`.
+- vmlab-hv-vmm: the CPU, GIC, timer and RAM come back equal to the save
+  (`a_snapshot_of_an_emulated_machine_brings_its_cpu_gic_timer_and_ram_back`),
+  refusals change nothing, the debug port reads, steps and writes a CPU, a
+  zboot kernel boots, and the CPU state refuses another model or layout.
+- vmlab-hv-tcg-aarch64: a replaced state runs on caches that are built
+  again. vmlab-hv-devices: the flash bank's restore brings the array and the
+  file back.
+- `vmlab-hv-tests/tests/s1_aarch64.rs` boots the aarch64 guest asset to
+  agent ready, loads an online snapshot and resets the guest in place, with
+  the agent answering after each. It skips without the asset.
+
+### What this card does not do
+
+- The agent proof did not run to its end on helios (2026-11-27): Linux
+  6.12 of the guest asset boots on the emulator, then reports a soft lockup
+  in the timer softirq and reaches no user process in 540 s. Booting the
+  guests is card C13.
+- Breakpoints and `write_registers` (x86 registers) are refused on an
+  emulated vCPU. A step of a vCPU that PSCI has not turned on is refused.
+- The exclusive reservation is not saved: a restore ends it, which an
+  exception return also does.
+
+### Sources read for this card
+
+- The state of this crate. For the EFI zboot header: the first bytes of
+  the guest asset's kernel (`od`) and what `file` says of it (`MZ`, `zimg`,
+  the payload offset and size, `gzip`). No kernel source was read.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.

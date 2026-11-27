@@ -467,6 +467,20 @@ fn render(response: &DebugResponse) -> String {
                 let _ = writeln!(output, "{name:<8} {value:#018x}");
             }
         }
+        DebugResponse::Aarch64Registers { vcpu, registers } => {
+            let _ = writeln!(output, "vCPU {vcpu}");
+            for (n, value) in registers.x.iter().enumerate() {
+                let _ = writeln!(output, "{:<8} {value:#018x}", format!("x{n}"));
+            }
+            let _ = writeln!(output, "{:<8} {:#018x}", "sp", registers.sp);
+            let _ = writeln!(output, "{:<8} {:#018x}", "pc", registers.pc);
+            let _ = writeln!(output, "{:<8} {:#010x}", "cpsr", registers.cpsr);
+            let _ = writeln!(output, "{:<8} {:#010x}", "fpcr", registers.fpcr);
+            let _ = writeln!(output, "{:<8} {:#010x}", "fpsr", registers.fpsr);
+            for (name, value) in &registers.system {
+                let _ = writeln!(output, "{name:<8} {value:#018x}");
+            }
+        }
     }
     output
 }

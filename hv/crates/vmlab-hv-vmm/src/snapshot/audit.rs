@@ -12,6 +12,10 @@ use zerocopy::IntoBytes;
 use super::SnapshotError;
 
 pub(super) fn write(shared: &crate::vm::VmShared, phase: &str) {
+    // The audit records KVM state. An emulated machine has none.
+    if shared.kvm.get().is_none() {
+        return;
+    }
     if let Err(error) = record(shared, phase) {
         // A diagnostic failure must not interrupt a partially applied load.
         log::warn!("{error}");
