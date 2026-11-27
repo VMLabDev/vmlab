@@ -6229,8 +6229,10 @@ mod tests {
         // The virtual timer is due 20 us from now on a 1 GHz clock, and the
         // budget takes some milliseconds. A machine CPU leaves its loop
         // within `CLOCK_BLOCKS` blocks of the deadline, so that its owner
-        // raises the line. A CPU without lines runs its budget.
-        let budget = 3_000_000;
+        // raises the line. A CPU without lines runs its budget. The budget
+        // is ten times what the loop runs in 300 us at the speed of its
+        // superblock (J14), 9,000 MIPS.
+        let budget = 30_000_000;
         for machine in [true, false] {
             let mut cpu = cpu(&LOOP);
             cpu.state.set_x(1, budget);
