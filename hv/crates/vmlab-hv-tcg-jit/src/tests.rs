@@ -194,6 +194,10 @@ struct Env {
     watched: u64,
     /// The accesses that hits asked to keep: address, size, value, store.
     logged: Vec<(u64, u8, u128, bool)>,
+    /// What a miss of the jump cache (`JUMP`) gets: the code to go on to,
+    /// or 0. And the count of those calls.
+    serve: u64,
+    jumps: u64,
 }
 
 impl Env {
@@ -215,6 +219,8 @@ impl Env {
             misses: 0,
             watched: 0,
             logged: Vec::new(),
+            serve: 0,
+            jumps: 0,
         }
     }
 }
@@ -248,6 +254,10 @@ unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64, _block: *mut c_voi
     // SAFETY: the test passes its `Env`.
     let env = unsafe { &mut *env.cast::<Env>() };
     env.thunk_calls += 1;
+    if index == JUMP {
+        env.jumps += 1;
+        return env.serve;
+    }
     // SAFETY: the frame of the test, as long as its `words`.
     let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
     let request = index & !0xffff_ffff;
@@ -338,6 +348,27 @@ unsafe extern "sysv64" fn direct(env: *mut c_void, argument: u64, _block: *mut c
     let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
     call(&env.calls[argument as usize], frame);
     0
+}
+
+/// The function of a helper call with `Effect::registers` that reads `N`
+/// words: what `call` computes, from the argument registers.
+extern "sysv64" fn fold<const N: usize>(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> Words {
+    let mut value = 0x9e37_79b9_7f4a_7c15u64;
+    for word in [a, b, c, d, e, f].into_iter().take(N) {
+        value = value.rotate_left(7) ^ word;
+    }
+    Words {
+        low: value.wrapping_mul(3),
+        high: value.wrapping_mul(4),
+    }
+}
+
+/// The address of `fold` for `count` words.
+fn fold_of(count: usize) -> u64 {
+    let functions: [RegisterFn; 7] = [
+        fold::<0>, fold::<1>, fold::<2>, fold::<3>, fold::<4>, fold::<5>, fold::<6>,
+    ];
+    functions[count] as usize as u64
 }
 
 /// A block of the test.
@@ -908,15 +939,23 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
                     b: 0,
                     imm: calls.len() as u64,
                 });
-                // Half of the calls go to their own function (H12).
-                let direct = (random.below(2) == 0)
-                    .then_some((direct as Thunk as usize as u64, calls.len() as u64));
+                // Half of the calls go to their own function (H12), and a
+                // third of those with their words in registers (J13).
+                let how = random.below(6);
+                let direct =
+                    (how < 3).then_some((direct as Thunk as usize as u64, calls.len() as u64));
+                let registers = (how == 0).then(|| Registers {
+                    function: fold_of(reads.len()),
+                    args: reads.clone(),
+                    results: writes.clone(),
+                });
                 calls.push(Effect {
                     reads,
                     writes,
                     leave: None,
                     direct,
                     condition: None,
+                    registers,
                 });
             }
             1 => {
@@ -1241,7 +1280,7 @@ fn lazy_conditions_run_their_forms_inline_and_call_for_other_kinds() {
                     code: 4,
                     code_value: 11,
                     result: 5,
-                    cases: vec![(9, test), (3, FlagTest::Table(0x0ff0))],
+                    cases: vec![(9, test), (3, FlagTest::Table(0x0ff0))].into(),
                 };
                 let calls = vec![Effect {
                     reads: vec![kind_word, 2, 3, 4],
@@ -1249,6 +1288,7 @@ fn lazy_conditions_run_their_forms_inline_and_call_for_other_kinds() {
                     leave: None,
                     direct: None,
                     condition: Some(lazy),
+                    registers: None,
                 }];
                 let block = Block {
                     generics: Vec::new(),
@@ -1294,7 +1334,7 @@ fn a_lazy_condition_for_another_code_is_a_call() {
         code: 4,
         code_value: 12,
         result: 5,
-        cases: vec![(1, FlagTest::Always(true))],
+        cases: vec![(1, FlagTest::Always(true))].into(),
     };
     let block = Block {
         ops: vec![Op {
@@ -1313,6 +1353,7 @@ fn a_lazy_condition_for_another_code_is_a_call() {
             leave: None,
             direct: None,
             condition: Some(lazy),
+            registers: None,
         }],
         leaves: Vec::new(),
         inputs: vec![(word(1), 0), (word(2), 1), (word(3), 2)],
@@ -1623,6 +1664,8 @@ struct Looping {
     ops: Vec<Op>,
     inputs: Vec<(Place, u32)>,
     outputs: Vec<(u32, Place)>,
+    /// A miss of the jump cache asks the thunk (`Chain::serve`).
+    serve: bool,
 }
 
 fn word(slot: Slot) -> Place {
@@ -1647,6 +1690,7 @@ impl Looping {
             }],
             inputs: vec![(word(1), 0), (word(5), 2)],
             outputs: vec![(0, word(2))],
+            serve: false,
         }
     }
 
@@ -1670,6 +1714,7 @@ impl Looping {
                 sites: true,
                 jumps: true,
                 verify: false,
+                serve: self.serve,
             }),
             next: Some(Next { pc: 1, kind }),
             memory: Memory::Thunk,
@@ -1686,11 +1731,26 @@ impl Looping {
         slots: &mut [u128; 3],
         budget: i64,
     ) -> (u64, Context) {
+        let (code, context, _) = self.run_served(jit, entry, slots, budget, 0);
+        (code, context)
+    }
+
+    /// `run`, with a thunk that answers a miss of the jump cache with
+    /// `serve`: the code, the context after, and the count of those misses.
+    fn run_served(
+        &mut self,
+        jit: &Jit,
+        entry: &Entry,
+        slots: &mut [u128; 3],
+        budget: i64,
+        serve: u64,
+    ) -> (u64, Context, u64) {
         let mut env = Env {
             ops: self.ops.clone(),
             frame: self.frame.as_mut_ptr(),
             words: self.frame.len(),
             calls: Vec::new(),
+            serve,
             ..Env::base()
         };
         let mut context = jit.context(budget, thunk, (&raw mut env).cast());
@@ -1704,8 +1764,72 @@ impl Looping {
                 self.frame.as_mut_ptr(),
             )
         };
-        (code, context)
+        (code, context, env.jumps)
     }
+}
+
+#[test]
+fn a_miss_of_the_jump_cache_asks_the_thunk_and_goes_on_to_the_code_it_gives() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    block.serve = true;
+    let entry = block.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    let pc = 0x4000_0100u64;
+    let mut slots = [0u128, u128::from(pc), u128::from(pc)];
+    // The thunk has no code: the block leaves with `LOOKUP`, after one ask.
+    let (code, context, jumps) = block.run_served(&jit, &entry, &mut slots, 100, 0);
+    assert_eq!((code, context.hits, jumps), (LOOKUP, 0, 1));
+    assert_eq!(slots[0], 1);
+    // The thunk gives the code: the run goes on until its budget, with no
+    // return to the owner, every turn through the thunk.
+    let (code, context, jumps) = block.run_served(&jit, &entry, &mut slots, 20, entry.address);
+    assert_eq!(
+        (code, context.budget, context.hits, jumps),
+        (BUDGET, 0, 0, 20)
+    );
+    assert_eq!(slots[0], 21);
+    // A filled entry hits inline and asks nothing.
+    jit.fill(pc, 9, &entry);
+    let (code, context, jumps) = block.run_served(&jit, &entry, &mut slots, 20, 0);
+    assert_eq!((code, context.hits, jumps), (BUDGET, 20, 0));
+    // A block that does not ask leaves at a miss without a call.
+    let mut plain = Looping::new();
+    let entry = plain.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    slots[2] = u128::from(pc + 4);
+    let (code, _, jumps) = plain.run_served(&jit, &entry, &mut slots, 20, entry.address);
+    assert_eq!((code, jumps), (LOOKUP, 0));
+}
+
+#[test]
+fn an_entry_of_the_jump_cache_hits_only_in_its_address_space() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    let pc = 0x4000_0100u64;
+    let mut slots = [0u128, u128::from(pc), u128::from(pc)];
+    jit.set_jump_space(1);
+    jit.fill(pc, 9, &entry);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.hits), (BUDGET, 10));
+    // Another space: a miss, inline and in `jump_target`.
+    jit.set_jump_space(2);
+    assert_eq!(jit.jump_target(pc, 9), None);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.hits), (LOOKUP, 0));
+    // The first space again: the entry was kept.
+    jit.set_jump_space(1);
+    assert_eq!(jit.jump_target(pc, 9), Some(entry.address));
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.hits), (BUDGET, 10));
+    assert_eq!(jit.stats.spaces, 3);
+    // An emptied cache misses in every space.
+    jit.clear_jumps();
+    assert_eq!(jit.jump_target(pc, 9), None);
+    // The largest space keeps the bits of the key and of the generation.
+    jit.set_jump_space(u16::MAX);
+    jit.fill(pc, 9, &entry);
+    assert_eq!(jit.jump_target(pc, 9), Some(entry.address));
+    assert_eq!(jit.jump_target(pc, 8), None);
 }
 
 #[test]
@@ -1733,6 +1857,45 @@ fn a_linked_jump_chains_until_the_budget_and_unlinks_to_its_stub() {
     assert_eq!(code, CHAIN);
     assert_eq!(slots[0], 12);
     assert_eq!((jit.stats.links, jit.stats.unlinks), (1, 1));
+}
+
+#[test]
+fn a_full_region_drops_the_part_written_longest_ago_and_the_links_into_it() {
+    // X goes into the first part, A and B into the second. A is linked to
+    // X and B to A. The drop of the first part sets the jump of A back to
+    // its stub and keeps B linked to A (H13c, card J11).
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut x = Looping::new();
+    let mut a = Looping::new();
+    let mut b = Looping::new();
+    let mut filler = Looping::new();
+    let relative = NextPc::Relative(word(4));
+    let to_x = x.compile(&mut jit, relative, 9);
+    let mut probe = to_x;
+    while probe.generation == to_x.generation {
+        probe = filler.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    let to_a = a.compile(&mut jit, relative, 9);
+    let to_b = b.compile(&mut jit, relative, 9);
+    assert_eq!(to_a.generation, to_b.generation);
+    assert!(jit.link(&to_a, 0, &to_x));
+    assert!(jit.link(&to_b, 0, &to_a));
+    let mut slots = [0u128, 0x4000_0100, 0];
+    // A runs and jumps to X, whose head finds the budget spent.
+    let (code, context) = a.run(&jit, &to_a, &mut slots, 1);
+    assert_eq!((code, context.chained), (BUDGET, 1));
+    assert_eq!(jit.stats.resets, 0);
+    while jit.stats.resets == 0 {
+        filler.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    assert!(!jit.current(&to_x));
+    assert!(jit.current(&to_a) && jit.current(&to_b));
+    assert_eq!(jit.linked(), 1);
+    // A leaves at its stub, and B still goes on to A.
+    let (code, context) = a.run(&jit, &to_a, &mut slots, 10);
+    assert_eq!((code, context.budget), (CHAIN, 9));
+    let (code, context) = b.run(&jit, &to_b, &mut slots, 10);
+    assert_eq!((code, context.budget, context.chained), (CHAIN, 8, 2));
 }
 
 #[test]
@@ -2170,6 +2333,7 @@ fn a_direct_call_runs_its_function_and_not_the_thunk() {
         leave: None,
         direct: Some((direct as Thunk as usize as u64, 0)),
         condition: None,
+        registers: None,
     };
     let block = Block {
         ops: vec![Op {
@@ -2196,4 +2360,69 @@ fn a_direct_call_runs_its_function_and_not_the_thunk() {
     let ran = compiled_on(&mut jit, &block, &mut got, 10, &mut ram, None);
     assert_eq!((ran.code, got), (DONE, expected));
     assert_eq!((ran.thunk_calls, ran.direct_calls), (0, 1));
+}
+
+/// A helper call with `Effect::registers` takes six words in the argument
+/// registers and gives two in RAX and RDX, with no thunk and no direct
+/// call (3e DESIGN.md J13), while other words stay live in the registers
+/// that a call does not keep. A call whose words do not fit the effect
+/// goes through `direct` as before.
+#[test]
+fn a_register_call_takes_its_words_in_registers() {
+    for fits in [true, false] {
+        let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+        let reads: Vec<Slot> = vec![1, 2, 3, 4, 5, 6];
+        let effect = Effect {
+            reads: reads.clone(),
+            writes: vec![7, 8],
+            leave: None,
+            direct: Some((direct as Thunk as usize as u64, 0)),
+            condition: None,
+            registers: Some(Registers {
+                function: fold_of(6),
+                args: reads,
+                // A word that the effect does not write: the call does not fit.
+                results: if fits { vec![7, 8] } else { vec![7, 9] },
+            }),
+        };
+        // Words 1 to 6 are read again after the call, from the registers
+        // that the allocator gave them.
+        let mut ops = vec![Op {
+            code: Code::Call,
+            aux: 0,
+            dst: 0,
+            a: 0,
+            b: 0,
+            imm: 0,
+        }];
+        for n in 0..6u16 {
+            ops.push(Op {
+                code: Code::Add,
+                aux: 0,
+                dst: 10 + n,
+                a: 1 + n,
+                b: 7 + n % 2,
+                imm: 0,
+            });
+        }
+        let block = Block {
+            ops,
+            generics: Vec::new(),
+            frame: vec![0; 16],
+            calls: vec![effect],
+            leaves: Vec::new(),
+            inputs: (1..=6).map(|n| (word(n), u32::from(n))).collect(),
+            outputs: (0..6).map(|n| (n, word(10 + n as Slot))).collect(),
+            memory: Memory::Thunk,
+        };
+        let slots: Vec<u128> = (0..8).map(|n| 0x1111_2222_3333_4444 * (n + 1)).collect();
+        let mut expected = slots.clone();
+        interpret(&block, &mut expected, &mut []);
+        let mut got = slots;
+        let mut ram = vec![0u8; PAGES * 4096];
+        let ran = compiled_on(&mut jit, &block, &mut got, 10, &mut ram, None);
+        assert_eq!((ran.code, &got), (DONE, &expected), "fits: {fits}");
+        let calls = if fits { (0, 0) } else { (0, 1) };
+        assert_eq!((ran.thunk_calls, ran.direct_calls), calls, "fits: {fits}");
+    }
 }

@@ -2412,3 +2412,186 @@ measured rows are in J8 of the design.
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn. QEMU ran as the oracle of K4.
+
+## Card C13b, #1144 (2026-11-28)
+
+The rest of the acceptance of C13 (#1048): a new stack profile of the Debian
+boot, the S1 boot matrix, O4 for Debian in a form that ends in under two
+hours, and kvm-unit-tests at 4 vCPUs. The numbers are in 3e DESIGN.md,
+"C13b, measured by card C13b", and the form of O4 in 3d DESIGN.md, O4w.
+
+### How it is built
+
+- `oracle::window`: the state of a window as a text file (`Start`), our CPU
+  from it, and the flash image of the leader: a prelude that runs at EL2,
+  copies the first MiB of RAM (where QEMU puts its device tree), sets
+  HCR_EL2, CPTR_EL2, CNTHCTL_EL2, VPIDR_EL2, VMPIDR_EL2 and CNTVOFF_EL2,
+  writes every register of `oracle::compared`, the stack pointer in use, V0
+  to V31, FPCR and FPSR, loads X0 to X30 and leaves with `ERET`.
+- `oracle::boot::Options::window`: the leader as
+  `virt,virtualization=on` with `-bios` of that image and the RAM above its
+  first MiB as `-device loader`.
+- `vmlab-hv-vmm`, `vcpu/windows.rs`: `VMLAB_HV_A64_WINDOWS` makes vCPU 0 of
+  an emulated machine write its windows at the end of a slice.
+- `examples/a64_window_lockstep.rs` and `just tcg-a64-window-lockstep`:
+  the follower of every window, with the comparisons and the adoptions of
+  the boot lockstep. A window ends at its budget, at an external abort of
+  our CPU (an access outside RAM), at `WFI`, at a host call, at an
+  interrupt or at a device read of the leader, or at a CPU difference. On a
+  difference it prints the walk of both PCs in our RAM.
+- `plugin/a64lock.c`: the PC of an instruction is the PC register at the
+  start of its block, read in the block callback, plus its offset.
+
+### O4 for Debian, as windows
+
+- The boot of the windows: Debian 13 at one vCPU to agent ready in 124.9 s,
+  68 windows from 1e9 instructions every 250 million (the 68 copies of 2 GiB
+  of RAM held the guest for about 0.7 s each).
+- `just tcg-a64-window-lockstep /tmp/c13b-windows2 2048 40000000`, cores 16
+  to 19, the JIT on: 68 windows, 1,821,246,744 instructions compared in
+  3,410 s, no CPU difference. 24 windows in the firmware and the boot
+  loader (769 million instructions), 33 in the kernel (866 million, 47,999
+  exceptions, 338 of them at a fetch) and 11 in user space (186 million,
+  14,682 exceptions, 164 at a fetch). 39 windows ended at their budget, 28
+  at an access outside RAM and 1 at `WFI`. 86,047 counter and timer reads
+  were taken from the leader. The boot and the run took 59 minutes.
+- The first two runs found two defects of the harness, no defect of the CPU:
+  the instruction abort at a fetch, which has no record of its own, and the
+  PC of the plugin in a block that QEMU translated at another virtual
+  address of the same code (3e DESIGN.md, C13b-O1). The second showed as a
+  `BL` whose target was the address of another process, with the link
+  register right.
+
+### The plugin change, on the other locksteps
+
+- O3 `just tcg-a64-lockstep c1 2000`: 29,023 instructions verified in
+  1,400 rounds, no difference.
+- K4 `just tcg-a64-boot-lockstep` (AAVMF from the reset): no CPU difference
+  in 469.8 million instructions, past the 351,352,700 where the stream of
+  the leader stopped in card J8, and past the four keys of the boot menu.
+  This card stopped the run after 902 s, before the shell.
+
+### Tests
+
+- `oracle::window`: `a_window_file_gives_back_the_state_that_wrote_it`,
+  `the_prelude_is_instructions_that_end_in_eret_and_data_that_holds_the_state`,
+  `the_registers_without_an_msr_of_their_own_are_written_through_the_ones_that_set_them`.
+- `oracle::boot`: `the_leader_of_a_window_starts_at_el2_from_the_prelude_with_our_ram`.
+- `vmlab-hv-vmm`: `the_switch_names_a_directory_the_first_window_the_gap_and_the_count`.
+
+### What this card does not do
+
+- O4 from the reset to agent ready with the devices, the DMA and the
+  interrupts led by the leader. W1 to W5 of 3d O4w say what the windows do
+  not prove.
+- Any change of speed. The three largest costs of the profile are named in
+  C13b-P1 of the 3e design.
+- S1 for Fedora 44 at one vCPU. Of seven boots on a host at a load of 7 to
+  12, four reached agent ready in 149.6 to 172.5 s and three went to
+  emergency mode on systemd's 90 s device timeout, the vCPU at 37 to 130
+  MIPS in the late phase (3e DESIGN.md, C13b-S1). Every other cell of the
+  matrix passed its three repeats. The leader landed the card with this
+  cell open (C13b-S1a): a follow-up card measures it again after J10, J11
+  and J12.
+
+### Sources read for this card
+
+- The state of this crate (the oracle, the plugin, the boot lockstep), of
+  `vmlab-hv-vmm` (the emulated vCPU, `GuestBus`, the snapshot of `virt`) and
+  of the bench (`run.py`, `lib.py`, `bench/ipsample.c`, the measure tools of
+  3e).
+- The encodings of the registers of EL2 that the prelude writes and of the
+  loads, stores and branches that it uses were written by hand from their
+  op0, op1, CRn, CRm and op2 and their fixed bits, with no document opened
+  for them. The tests check the words against our decoder, which is
+  generated from the LLVM tables (S1), and the leader ran the prelude to the
+  first instruction of every window.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the oracle of O3, K4 and the windows, through its
+  command line and the plugin API that `a64lock.c` already used.
+
+## Card J13, #1185 (2026-11-28)
+
+AdvSIMD and crypto without the generic evaluator (3e DESIGN.md J13, N4).
+The measured rows are in J13 of the design.
+
+### What changed
+
+- `helpers::crypto::HELPERS`: one pure helper for each of the fourteen
+  crypto operations of the 3d set, on `(d, n, m)`, in place of the one
+  helper `CRYPTO` that took the operation as a fourth argument. The lifter
+  of `lift::crypto` calls the helper of its operation.
+- `jit::Effect::registers` (`jit::Registers`): a pure helper call whose
+  words go to its function in RDI, RSI, RDX, RCX, R8 and R9 and come back
+  in RAX and RDX, with the registers of the pool that a call does not keep
+  saved around it. The function has the type `jit::RegisterFn`, which
+  gives `jit::Words`. A call whose words do not fit the effect (more than
+  six, more than two results, or results that are not its writes) goes
+  through `direct` or the thunk as before. `exec` gives the crypto helpers
+  this form when their arguments and their result are values of 128 bits
+  (`helpers::in_registers_of`, `register_call`).
+- `lift::simd`: the integer `ADD`, `SUB`, `CMEQ` (register and zero),
+  `CMTST` and `REV16`, `REV32`, `REV64` of a whole vector of 64 or 128
+  bits, and `ADD` and `SUB` of D registers, are operations of the graph on
+  words of 64 bits (`inline_lanes`): the lanes without their top bits
+  added or subtracted, the top bits put back with an exclusive or; a
+  compare as the top bit of each lane spread over the lane; a reversal as
+  `bswap` and swaps of neighbouring blocks. The emitter has inline forms
+  for every operation they use. Every other lane operation still calls
+  `simd::eval`.
+- Shared interfaces changed: `vmlab_hv_tcg_jit::Effect` has the field
+  `registers`, and the crate exports `Registers`, `RegisterFn` and
+  `Words`. `helpers::crypto::CRYPTO` is gone.
+
+### Equal behaviour
+
+- K1, the O3 lockstep with the JIT on (`VMLAB_HV_JIT=1 just
+  tcg-a64-lockstep <group> 100000 1`, seed 1) at `d28d07cc`: `simd`
+  4,702,716 instructions in 391,893 rounds and `crypto` 700,320 in 58,360
+  rounds, no difference, every instruction compiled, no block refused.
+- K2 (`just tcg-a64-jit-diff 300000 3e0001`, and `3e0005 flags`) at
+  `cb021b6b`: 300,000 rounds each, no difference. `all`: 2,792,656
+  instructions, 665,512 blocks compiled, none refused. `flags`: 45,827,006
+  instructions, 1,300,303 blocks compiled, none refused.
+- K3 on a Debian 13 boot at `d28d07cc` (`VMLAB_HV_JIT_CHECK=1`,
+  `VMLAB_HV_JIT_CHECK_RUNS=1000`, the bench, cores 24 to 27): agent ready
+  after 156.7 s with no difference; 128.7 million checked runs (616.9
+  million instructions) up to the last counter line, at 18.0e9
+  instructions; no block refused. A first K3 boot fell into emergency mode
+  on the device timeout of `/boot/efi` under a load average of 44, with no
+  difference up to there (J13f of the design).
+- The fallback count (H2b) of every boot of the rows is zero.
+- `just ci::check` at `cb021b6b` (the code of this card, before these
+  notes): exit 0.
+
+### Tests
+
+- `exec::tests::inline_lanes_and_register_helpers_give_what_the_helpers_give`:
+  every arrangement of the inline forms, 64 rounds each of operands that
+  are random, all ones, top bits only and zero, with lanes equal between
+  the two operands, in the interpreter and in compiled code, against
+  `simd::eval`; the fourteen crypto instructions against
+  `helpers::crypto::crypto`, both ways, with their records checked
+  against the plan of `lift::crypto`.
+- `vmlab-hv-tcg-jit`: `a_register_call_takes_its_words_in_registers` (six
+  words in, two out, with six other words live across the call, and the
+  fallback to `direct` when the results are not the writes); a sixth of
+  the calls of `random_blocks_spill_call_and_leave_as_the_interpreter_does`
+  take their words in registers.
+- `tests/jit.rs` (K2, K3 on the streams) runs over the new forms.
+
+### Sources read for this card
+
+- The state of `vmlab-hv-tcg-jit`, of `vmlab-hv-tcg-ir`, of this crate and
+  of the bench. The System V AMD64 ABI for the argument registers and the
+  return of a structure of two words in RAX and RDX. The lane tricks
+  (an addition that keeps the top bits of the lanes apart, the spread of a
+  top bit over its lane) are written from the author's knowledge of
+  integer arithmetic, and checked by the test above against `simd::eval`
+  and by K1 against QEMU.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened. The encodings of the test are from the
+  author's knowledge of the A64 encoding, and the test checks each against
+  the record that the decoder gives.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the oracle of K1 and in the J9 rows only.

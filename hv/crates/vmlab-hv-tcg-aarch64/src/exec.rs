@@ -1091,6 +1091,24 @@ struct Compiled {
     written: Vec<bool>,
     /// The runs of the compiled code that K3 checked.
     checks: u32,
+    /// Why the block was translated, for the count of the compiles by
+    /// cause (3e DESIGN.md J11).
+    origin: Origin,
+}
+
+/// Why a block was translated (3e DESIGN.md J11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Origin {
+    /// The CPU never translated the code at its physical address in its
+    /// context before.
+    #[default]
+    First,
+    /// The CPU had a block for it whose code stamp no longer held: a write
+    /// into its page, or an epoch whose check failed.
+    Invalidated,
+    /// The CPU had translated it before, and the store of the cache dropped
+    /// that block, or a reset of the state dropped every block.
+    Evicted,
 }
 
 /// The most arguments of a helper.
@@ -1103,6 +1121,9 @@ struct Call {
     /// The call is `flags::CONDITION`, which the JIT can make inline (3e
     /// DESIGN.md H8c).
     condition: bool,
+    /// The function that compiled code calls with the words of the
+    /// arguments in registers, for a helper that has one (3e DESIGN.md J13).
+    registers: Option<jit::RegisterFn>,
     /// The words of the arguments.
     args: Vec<Place>,
     /// The words of each result, with the mask of its type.
@@ -1130,7 +1151,8 @@ fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
 /// (`Leave::ops`, `Leave::inputs`).
 type ColdPath = (Vec<Op>, Vec<(Place, u32)>);
 
-/// What `compile` gathers beside the operations of the block.
+/// What `compile` gathers beside the operations of the block. The block
+/// takes a copy of each list of its own size.
 #[derive(Default)]
 struct Parts {
     accesses: Vec<Access16>,
@@ -1138,6 +1160,37 @@ struct Parts {
     calls: Vec<Call>,
     inputs: Vec<(Place, u32)>,
     op_counts: Option<Vec<usize>>,
+    /// The scalars that one `emit` or `emit_cold` schedules, and the inputs
+    /// of a cold path while they are gathered.
+    scheduled: Vec<ScalarId>,
+    cold_inputs: Vec<(Place, u32)>,
+}
+
+impl Parts {
+    fn clear(&mut self) {
+        self.accesses.clear();
+        self.leaves.clear();
+        self.calls.clear();
+        self.inputs.clear();
+        self.op_counts = None;
+    }
+}
+
+/// The buffers of a translation, which the CPU keeps from one block to the
+/// next (3e DESIGN.md J11): the block that the lifter fills, the lowering
+/// and what `compile` gathers. Once they have grown to the size of the
+/// blocks, a translation makes heap calls only for the lists that the block
+/// it makes keeps.
+#[derive(Default)]
+struct Translator {
+    block: BlockOf<A64Exit>,
+    spare: crate::lift::builder::Spare,
+    prune: dce::PruneBuffers,
+    lowering: Lowering,
+    parts: Parts,
+    seen: Vec<bool>,
+    leave_of: Vec<Option<u32>>,
+    roots: Vec<ScalarId>,
 }
 
 impl Parts {
@@ -1159,7 +1212,21 @@ impl Parts {
         seen: &mut [bool],
         roots: &[ScalarId],
     ) -> Result<(), Stop> {
-        for id in schedule::scalars(graph, roots, seen) {
+        let mut scheduled = std::mem::take(&mut self.scheduled);
+        scheduled.clear();
+        schedule::scalars_into(graph, roots, seen, &mut scheduled);
+        let done = self.emit_scheduled(lowering, graph, &scheduled);
+        self.scheduled = scheduled;
+        done
+    }
+
+    fn emit_scheduled(
+        &mut self,
+        lowering: &mut Lowering,
+        graph: &Graph,
+        scheduled: &[ScalarId],
+    ) -> Result<(), Stop> {
+        for &id in scheduled {
             let before = lowering.ops.len();
             match &graph.scalars[id].operation {
                 Operation::Constant(value) => lowering.constant(id, *value),
@@ -1176,6 +1243,7 @@ impl Parts {
                     let call = Call {
                         function: helper.0.function,
                         condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
+                        registers: crate::helpers::in_registers_of(helper.0),
                         args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                         results: vec![(lowering.place(id), result_mask(graph, id))],
                     };
@@ -1201,9 +1269,14 @@ impl Parts {
         seen: &mut [bool],
         roots: &[ScalarId],
     ) -> Result<ColdPath, Stop> {
-        let scheduled = schedule::scalars(graph, roots, seen);
-        let main = std::mem::take(&mut lowering.ops);
-        let mut inputs = Vec::new();
+        let mut scheduled = std::mem::take(&mut self.scheduled);
+        scheduled.clear();
+        schedule::scalars_into(graph, roots, seen, &mut scheduled);
+        // The cold operations go after those of the block, and then into a
+        // list of their own size.
+        let main = lowering.ops.len();
+        let mut inputs = std::mem::take(&mut self.cold_inputs);
+        inputs.clear();
         let mut done = Ok(());
         for &id in &scheduled {
             match &graph.scalars[id].operation {
@@ -1224,6 +1297,7 @@ impl Parts {
                         let call = Call {
                             function: helper.0.function,
                             condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
+                            registers: crate::helpers::in_registers_of(helper.0),
                             args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                             results: vec![(lowering.place(id), result_mask(graph, id))],
                         };
@@ -1239,8 +1313,11 @@ impl Parts {
             }
             seen[id] = false;
         }
-        let cold = std::mem::replace(&mut lowering.ops, main);
-        done.map(|()| (cold, inputs))
+        let cold = lowering.ops.split_off(main);
+        let cold_inputs = inputs.clone();
+        self.cold_inputs = inputs;
+        self.scheduled = scheduled;
+        done.map(|()| (cold, cold_inputs))
     }
 }
 
@@ -1298,18 +1375,19 @@ fn skip_truncations(graph: &mut Graph) {
 }
 
 fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
-    let mut roots: Vec<ScalarId> = exit
-        .writeback
-        .writes
-        .iter()
-        .map(|(_, scalar)| *scalar)
-        .collect();
+    let mut roots = Vec::new();
+    push_exit_roots(exit, &mut roots);
+    roots
+}
+
+/// `exit_roots`, appended to `roots`.
+fn push_exit_roots(exit: &A64Exit, roots: &mut Vec<ScalarId>) {
+    roots.extend(exit.writeback.writes.iter().map(|(_, scalar)| *scalar));
     match &exit.next {
         A64Next::Pc(next) | A64Next::Relative(next) => roots.push(*next),
         A64Next::Exception { syndrome, .. } => roots.extend(syndrome),
         A64Next::Trap { .. } => {}
     }
-    roots
 }
 
 /// Static operation counts summed over translations, including retranslations.
@@ -1393,6 +1471,7 @@ impl BlockCounts {
     }
 }
 
+#[cfg(test)]
 fn compile(
     phys: u64,
     context: Context,
@@ -1400,35 +1479,77 @@ fn compile(
     mut block: BlockOf<A64Exit>,
     counts: Option<&mut BlockCounts>,
 ) -> Result<Compiled, Stop> {
+    compile_with(
+        phys,
+        context,
+        instructions,
+        &mut block,
+        &mut Translator::default(),
+        counts,
+    )
+}
+
+/// Lower `block`, which the lifter made, into the block that the loop runs,
+/// with the buffers of `translator` (3e DESIGN.md J11). `block` is pruned in
+/// place.
+fn compile_with(
+    phys: u64,
+    context: Context,
+    instructions: u32,
+    block: &mut BlockOf<A64Exit>,
+    translator: &mut Translator,
+    counts: Option<&mut BlockCounts>,
+) -> Result<Compiled, Stop> {
     skip_truncations(&mut block.graph);
-    dce::prune_scalars(&mut block);
+    dce::prune_scalars_with(block, &mut translator.prune);
+    let block = &*block;
     let graph = &block.graph;
-    let mut lowering = Lowering::new(graph).ok_or_else(|| host("a block with too many slots"))?;
-    let mut seen = vec![false; graph.scalars.len()];
-    let mut parts = Parts {
-        op_counts: counts.as_ref().map(|_| vec![0; graph.scalars.len()]),
-        ..Parts::default()
-    };
+    let Translator {
+        lowering,
+        parts,
+        seen,
+        leave_of,
+        roots,
+        ..
+    } = translator;
+    lowering
+        .reset(graph)
+        .ok_or_else(|| host("a block with too many slots"))?;
+    seen.clear();
+    seen.resize(graph.scalars.len(), false);
+    parts.clear();
+    parts.op_counts = counts.as_ref().map(|_| vec![0; graph.scalars.len()]);
     let mut block_outputs = None;
     let mut terminal = None;
     let mut next_pc = None;
     // The exits that events leave through, by their number in the block.
-    let mut leave_of = vec![None; block.exits.len()];
+    leave_of.clear();
+    leave_of.resize(block.exits.len(), None);
     for event in &block.events {
         if block_outputs.is_some() {
             return Err(host("an event after the exit of a block"));
         }
-        let (exit, mut roots) = match event {
+        roots.clear();
+        let exit = match event {
             Event::Guard {
                 condition, exit, ..
-            } => (*exit, vec![*condition]),
-            Event::ReadMemory { address, error, .. } => (*error, vec![*address]),
+            } => {
+                roots.push(*condition);
+                *exit
+            }
+            Event::ReadMemory { address, error, .. } => {
+                roots.push(*address);
+                *error
+            }
             Event::WriteMemory {
                 address,
                 value,
                 error,
                 ..
-            } => (*error, vec![*address, *value]),
+            } => {
+                roots.extend([*address, *value]);
+                *error
+            }
             // An ordered helper call, after what its arguments need. It
             // leaves through no exit.
             Event::Call {
@@ -1442,23 +1563,24 @@ fn compile(
                 {
                     return Err(host("an ordered call of a helper that is not one"));
                 }
-                parts.emit(&mut lowering, graph, &mut seen, args)?;
+                parts.emit(lowering, graph, seen, args)?;
                 for result in results {
                     seen[*result] = true;
                 }
                 let call = Call {
                     function: helper.0.function,
                     condition: false,
+                    registers: None,
                     args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                     results: results
                         .iter()
                         .map(|result| (lowering.place(*result), result_mask(graph, *result)))
                         .collect(),
                 };
-                parts.call(&mut lowering, call)?;
+                parts.call(lowering, call)?;
                 continue;
             }
-            Event::Exit(exit) => (*exit, Vec::new()),
+            Event::Exit(exit) => *exit,
             Event::Checkpoint(_) => return Err(host("an aarch64 block has no checkpoint")),
         };
         let payload = &block.exits[exit];
@@ -1488,10 +1610,10 @@ fn compile(
         // Only the end computes its writeback on the way: an exit before it
         // computes what it needs when it is taken.
         if is_end {
-            roots.extend(exit_roots(payload));
+            push_exit_roots(payload, roots);
         }
-        parts.emit(&mut lowering, graph, &mut seen, &roots)?;
-        let mut outputs = Vec::new();
+        parts.emit(lowering, graph, seen, roots)?;
+        let mut outputs = Vec::with_capacity(payload.writeback.writes.len());
         for (register, scalar) in &payload.writeback.writes {
             outputs.push((narrow(*register)?, lowering.place(*scalar)));
         }
@@ -1520,8 +1642,9 @@ fn compile(
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let leave = narrow(parts.leaves.len())?;
-                let (ops, inputs) =
-                    parts.emit_cold(&mut lowering, graph, &mut seen, &exit_roots(payload))?;
+                roots.clear();
+                push_exit_roots(payload, roots);
+                let (ops, inputs) = parts.emit_cold(lowering, graph, seen, roots)?;
                 parts.leaves.push(Leave {
                     ops,
                     inputs,
@@ -1651,7 +1774,7 @@ fn compile(
         return Err(host("a block without an exit"));
     };
     if let (Some(counts), Some(op_counts)) = (counts, &parts.op_counts) {
-        counts.translated(&block, op_counts, lowering.ops.len());
+        counts.translated(block, op_counts, lowering.ops.len());
     }
     // The loop reads the words of an operation without a check.
     let words = lowering.frame.len();
@@ -1667,19 +1790,20 @@ fn compile(
             "an operation of a block names a word outside its frame",
         ));
     }
+    // The block takes lists of its own size, and the buffers keep theirs.
     Ok(Compiled {
         phys,
         context,
         stamp: None,
         epoch: 0,
         instructions,
-        ops: lowering.ops,
-        generics: lowering.generics,
-        accesses: parts.accesses,
-        leaves: parts.leaves,
-        frame: lowering.frame,
-        calls: parts.calls,
-        inputs: parts.inputs,
+        ops: lowering.ops.clone(),
+        generics: lowering.generics.clone(),
+        accesses: parts.accesses.clone(),
+        leaves: moved(&mut parts.leaves),
+        frame: lowering.frame.clone(),
+        calls: moved(&mut parts.calls),
+        inputs: parts.inputs.clone(),
         outputs,
         terminal,
         next: next_pc,
@@ -1687,7 +1811,16 @@ fn compile(
         refused: false,
         written: Vec::new(),
         checks: 0,
+        origin: Origin::First,
     })
+}
+
+/// The items of `list` in a list of their own size: `list` is left empty
+/// with its memory, for the next block.
+fn moved<T>(list: &mut Vec<T>) -> Vec<T> {
+    let mut items = Vec::with_capacity(list.len());
+    items.append(list);
+    items
 }
 
 fn bits_mask(bytes: u8) -> u128 {
@@ -2382,6 +2515,82 @@ struct Env<'a, M> {
     /// The replay of K3, when the block is checked: its loads and stores
     /// are served from it and not made.
     replay: Option<&'a mut Replay>,
+    /// What a miss of the jump cache looks in (`jit::JUMP`, card J10), when
+    /// the run serves them.
+    lookup: Option<JumpLookup>,
+    /// The misses that it served with code.
+    served: u64,
+}
+
+/// What a run of compiled code serves a miss of the jump cache from (card
+/// J10): the blocks of the CPU, the epoch and the count of changes of the
+/// MMU of when the run started, the JIT that runs the code, and the runs of
+/// each block that K3 checks.
+#[derive(Clone, Copy)]
+struct JumpLookup {
+    blocks: *mut Cache,
+    jit: *const jit::Jit,
+    epoch: u64,
+    changes: u64,
+    check: u32,
+}
+
+/// Serve a miss of the jump cache from the thunk (`jit::JUMP`, card J10):
+/// the code of the block at the PC of the state, when the loop would run
+/// that block's code next without a step of its own. That is: the TLB
+/// holds the page of the PC for an instruction fetch, the block is in its
+/// entry of the cache for the same context as the block that left, it was
+/// seen in this epoch, its code is current, and K3 has no check of it left.
+/// Nothing moved since the run started: no store into translated code, no
+/// change of the MMU. The entry of the jump cache is filled as `make_link`
+/// fills it. 0: the block leaves with `LOOKUP`, and the loop does it all.
+///
+/// The loop also reads the interrupt lines, the mail and the timer before a
+/// block; a hit of the jump cache does not, and neither does this: a kick
+/// ends the run at the next block head for those (H10c).
+///
+/// # Safety
+/// As for `thunk`, and `tag` is the block that left. The blocks of the
+/// lookup and the JIT live while the code runs, and nothing holds a
+/// reference into them.
+unsafe fn serve_jump<M: Memory>(env: &mut Env<M>, tag: *mut std::ffi::c_void) -> u64 {
+    let Some(lookup) = env.lookup else {
+        return 0;
+    };
+    if env.side.code_written || env.side.mmu.changes() != lookup.changes {
+        return 0;
+    }
+    // SAFETY: the caller's promise.
+    let (from, state) = unsafe { (&*tag.cast::<Compiled>(), &*env.state) };
+    let pc = state.pc();
+    let context = state.context;
+    let key = context_key(context);
+    if key != context_key(from.context) || pc & 3 != 0 || !mmu::canonical(pc) {
+        return 0;
+    }
+    let need = mmu::needed(Kind::Execute, context.el == 0);
+    let Some((phys, _)) = env.side.mmu.hit(pc, 4, need) else {
+        return 0;
+    };
+    // SAFETY: the caller's promise. Only the entry is read.
+    let (cache, jit) = unsafe { (&*lookup.blocks, &*lookup.jit) };
+    let Some(block) = cache.entries[Cache::index(phys)].as_deref() else {
+        return 0;
+    };
+    if block.phys != phys
+        || block.context != context
+        || block.epoch != lookup.epoch
+        || block.checks < lookup.check
+    {
+        return 0;
+    }
+    match block.code {
+        Some(code) if jit.fill_shared(pc, key, &code) => {
+            env.served += 1;
+            code.address
+        }
+        _ => 0,
+    }
 }
 
 /// What the thunk returns when the block leaves.
@@ -2404,6 +2613,10 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
     // SAFETY: the caller's promise. Compiled code holds no reference into
     // the environment or the block while it calls.
     let env = unsafe { &mut *env.cast::<Env<M>>() };
+    if index == jit::JUMP {
+        // SAFETY: as above.
+        return unsafe { serve_jump(env, tag) };
+    }
     // SAFETY: as above: the block is alive while its code runs.
     let compiled = unsafe { &mut *tag.cast::<Compiled>() };
     let request = index & !u64::from(u32::MAX);
@@ -2604,6 +2817,10 @@ unsafe extern "sysv64" fn replay_thunk<M: Memory>(
     index: u64,
     tag: *mut std::ffi::c_void,
 ) -> u64 {
+    // A replay checks one block, and serves no miss of the jump cache.
+    if index == jit::JUMP {
+        return 0;
+    }
     // SAFETY: the caller's promise. The references end before `thunk`
     // makes its own.
     let done = unsafe {
@@ -2839,6 +3056,24 @@ fn place_words(place: Place) -> impl Iterator<Item = Slot> {
     std::iter::once(place.slot).chain(place.wide.then_some(place.slot + 1))
 }
 
+/// The call of `call` with its words in registers (3e DESIGN.md J13): for
+/// a helper with such a function, whose arguments and result are values of
+/// 128 bits, two words each, and whose result needs no mask.
+fn register_call(call: &Call) -> Option<jit::Registers> {
+    let function = call.registers?;
+    let [(result, u128::MAX)] = call.results[..] else {
+        return None;
+    };
+    if !result.wide || !call.args.iter().all(|place| place.wide) {
+        return None;
+    }
+    Some(jit::Registers {
+        function: function as usize as u64,
+        args: call.args.iter().copied().flat_map(place_words).collect(),
+        results: place_words(result).collect(),
+    })
+}
+
 /// What K3 writes into the written words of the frame before a replay: a
 /// word that the compiled code reads before it writes it shows.
 const POISON: u64 = 0x6b33_dead_6b33_dead;
@@ -2847,107 +3082,97 @@ impl Compiled {
     /// Compile the block, or mark it as one that the emitter refuses. `pc`
     /// is the address that it is entered at now, for the perf map. With
     /// `check`, the block keeps what K3 needs. With `sites` and `jumps`, its
-    /// exits look for the code of the next block (3e DESIGN.md H5, H6).
+    /// exits look for the code of the next block (3e DESIGN.md H5, H6), and
+    /// with `serve` a miss of the jump cache asks the thunk first (J10).
+    #[allow(clippy::too_many_arguments)]
     fn compile_code(
         &mut self,
         jit: &mut jit::Jit,
+        buffers: &mut ShapeBuffers,
         pc: u64,
         check: bool,
         sites: bool,
         jumps: bool,
         verify: bool,
+        serve: bool,
     ) {
         // What a leave reads from the frame: its outputs, its address, and
         // every word that its own operations read (card S4). A word that
         // those operations compute first is in the list too, which costs a
-        // store of a stale value that they then overwrite.
+        // store of a stale value that they then overwrite. The lists go
+        // into the buffers of the CPU (3e DESIGN.md J11).
         let generics = &self.generics;
         let calls_of = &self.calls;
-        let leaves: Vec<Vec<Slot>> = self
-            .leaves
-            .iter()
-            .map(|leave| {
-                let cold = leave.ops.iter().flat_map(|op| {
-                    let words: Vec<Slot> = match op.code {
-                        Code::Generic => generics[op.imm as usize]
-                            .args()
-                            .into_iter()
-                            .flat_map(place_words)
-                            .collect(),
-                        Code::Call => calls_of[op.imm as usize]
-                            .args
-                            .iter()
-                            .copied()
-                            .flat_map(place_words)
-                            .collect(),
-                        Code::Select => vec![op.a, op.b, op.imm as Slot],
-                        _ => vec![op.a, op.b],
-                    };
-                    words
-                });
-                leave
-                    .outputs
-                    .iter()
-                    .flat_map(|(_, place)| place_words(*place))
-                    .chain(leave.address)
-                    .chain(cold)
-                    .collect()
-            })
-            .collect();
-        let accesses: Vec<jit::Effect> = self
-            .accesses
-            .iter()
-            .map(|access| match *access {
+        let leaves = refill(&mut buffers.leaves, self.leaves.len());
+        for (leave, words) in self.leaves.iter().zip(leaves.iter_mut()) {
+            for (_, place) in &leave.outputs {
+                words.extend(place_words(*place));
+            }
+            words.extend(leave.address);
+            for op in &leave.ops {
+                match op.code {
+                    Code::Generic => {
+                        for place in generics[op.imm as usize].args() {
+                            words.extend(place_words(place));
+                        }
+                    }
+                    Code::Call => {
+                        for place in &calls_of[op.imm as usize].args {
+                            words.extend(place_words(*place));
+                        }
+                    }
+                    Code::Select => words.extend([op.a, op.b, op.imm as Slot]),
+                    _ => words.extend([op.a, op.b]),
+                }
+            }
+        }
+        let accesses = refill_effects(&mut buffers.accesses, self.accesses.len());
+        for (access, effect) in self.accesses.iter().zip(accesses.iter_mut()) {
+            match *access {
                 Access16::Read {
                     address,
                     result,
                     exit,
                     ..
-                } => jit::Effect {
-                    reads: vec![address],
-                    writes: place_words(result).collect(),
-                    leave: Some(exit),
-                    direct: None,
-                    condition: None,
-                },
+                } => {
+                    effect.reads.push(address);
+                    effect.writes.extend(place_words(result));
+                    effect.leave = Some(exit);
+                }
                 Access16::Write {
                     address,
                     value,
                     exclusive,
                     exit,
                     ..
-                } => jit::Effect {
-                    reads: std::iter::once(address).chain(place_words(value)).collect(),
-                    writes: exclusive.into_iter().collect(),
-                    leave: Some(exit),
-                    direct: None,
-                    condition: None,
+                } => {
+                    effect.reads.push(address);
+                    effect.reads.extend(place_words(value));
+                    effect.writes.extend(exclusive);
+                    effect.leave = Some(exit);
+                }
+            }
+        }
+        let calls = refill_effects(&mut buffers.calls, self.calls.len());
+        for (index, (call, effect)) in self.calls.iter().zip(calls.iter_mut()).enumerate() {
+            for place in &call.args {
+                effect.reads.extend(place_words(*place));
+            }
+            for (place, _) in &call.results {
+                effect.writes.extend(place_words(*place));
+            }
+            // H12: compiled code calls the helper of its kind itself.
+            effect.direct = Some((
+                match call.function {
+                    HelperFn::Pure(_) => pure_call as jit::Thunk as usize as u64,
+                    HelperFn::Ordered(_) => ordered_call as jit::Thunk as usize as u64,
                 },
-            })
-            .collect();
-        let calls: Vec<jit::Effect> = self
-            .calls
-            .iter()
-            .enumerate()
-            .map(|(index, call)| jit::Effect {
-                reads: call.args.iter().copied().flat_map(place_words).collect(),
-                writes: call
-                    .results
-                    .iter()
-                    .flat_map(|(place, _)| place_words(*place))
-                    .collect(),
-                leave: None,
-                // H12: compiled code calls the helper of its kind itself.
-                direct: Some((
-                    match call.function {
-                        HelperFn::Pure(_) => pure_call as jit::Thunk as usize as u64,
-                        HelperFn::Ordered(_) => ordered_call as jit::Thunk as usize as u64,
-                    },
-                    index as u64,
-                )),
-                condition: self.lazy_condition(call),
-            })
-            .collect();
+                index as u64,
+            ));
+            effect.condition = self.lazy_condition(call);
+            effect.registers = register_call(call);
+        }
+        let (leaves, accesses, calls) = (&*leaves, &*accesses, &*calls);
         // The compiled code sets the PC (3e DESIGN.md H5): the last
         // instruction that the loop runs, else the next PC of the block.
         let next = match (self.terminal, self.next) {
@@ -2965,14 +3190,15 @@ impl Compiled {
             sites,
             jumps,
             verify,
+            serve,
         };
         let shape = jit::Shape {
             ops: &self.ops,
             generics: &self.generics,
             frame: &self.frame,
-            accesses: &accesses,
-            calls: &calls,
-            leaves: &leaves,
+            accesses,
+            calls,
+            leaves,
             inputs: &self.inputs,
             outputs: &self.outputs,
             instructions: self.instructions,
@@ -3006,6 +3232,46 @@ impl Compiled {
             }
         }
     }
+}
+
+/// The lists of a block that the emitter reads (`jit::Shape`), kept by the
+/// CPU from one compile to the next (3e DESIGN.md J11): once they have grown
+/// to the size of the blocks, a compile makes no heap call for them.
+#[derive(Default)]
+struct ShapeBuffers {
+    leaves: Vec<Vec<Slot>>,
+    accesses: Vec<jit::Effect>,
+    calls: Vec<jit::Effect>,
+}
+
+/// The first `len` lists of `lists`, empty, with the memory that they had.
+fn refill<T>(lists: &mut Vec<Vec<T>>, len: usize) -> &mut [Vec<T>] {
+    if lists.len() < len {
+        lists.resize_with(len, Vec::new);
+    }
+    let lists = &mut lists[..len];
+    for list in lists.iter_mut() {
+        list.clear();
+    }
+    lists
+}
+
+/// The first `len` effects of `effects`, empty, with the memory that their
+/// lists had.
+fn refill_effects(effects: &mut Vec<jit::Effect>, len: usize) -> &mut [jit::Effect] {
+    if effects.len() < len {
+        effects.resize_with(len, jit::Effect::default);
+    }
+    let effects = &mut effects[..len];
+    for effect in effects.iter_mut() {
+        effect.reads.clear();
+        effect.writes.clear();
+        effect.leave = None;
+        effect.direct = None;
+        effect.condition = None;
+        effect.registers = None;
+    }
+    effects
 }
 
 /// The key of a context in the jump cache (3e DESIGN.md H6): every field,
@@ -3047,6 +3313,9 @@ struct Chaining {
     /// Hits of the jump cache come back to the loop, which compares them
     /// with its own lookup (`VMLAB_HV_JIT_CHAIN=verify`).
     verify: bool,
+    /// A miss of the jump cache is served from the thunk where it can be
+    /// (card J10), unless `VMLAB_HV_JIT_SERVE` is `0`, `off` or `false`.
+    serve: bool,
     /// Hits that named other code than the lookup found.
     mismatches: u64,
     pending: Option<Pending>,
@@ -3055,7 +3324,7 @@ struct Chaining {
     epoch: u64,
     mmu: u64,
     /// The count of changes of the MMU that the jump cache holds entries
-    /// of.
+    /// of (`Mmu::jump_changes`).
     seen: u64,
 }
 
@@ -3090,6 +3359,7 @@ unsafe fn run_chained<M: Memory>(
     counts: &mut JitCounts,
     replay: Option<&mut Replay>,
     seat: Option<&jit::seat::Seat>,
+    lookup: Option<JumpLookup>,
 ) -> Option<Ran> {
     // SAFETY: the caller's promise.
     let context_el = unsafe { (*first).context.el };
@@ -3107,6 +3377,8 @@ unsafe fn run_chained<M: Memory>(
         failed: None,
         stop: None,
         replay,
+        lookup,
+        served: 0,
     };
     let thunk: jit::Thunk = if env.replay.is_some() {
         replay_thunk::<M>
@@ -3155,6 +3427,9 @@ unsafe fn run_chained<M: Memory>(
     };
     let failed = env.failed.take();
     let stop = env.stop.take();
+    counts.jump_served += env.served;
+    // SAFETY: as above.
+    let kicked = unsafe { jit::seat::kicked(context) };
     // SAFETY: as above.
     let left = unsafe { jit::seat::left(context) };
     // SAFETY: as above. Only the budget is shared.
@@ -3180,21 +3455,37 @@ unsafe fn run_chained<M: Memory>(
     let key = context_key(last.context);
     let pc = state.pc();
     let ran = match code {
-        jit::DONE => Ran {
-            count: taken,
-            halt: None,
-            terminal: last.terminal.map(|(_, trap)| trap),
-            pending: None,
-        },
+        jit::DONE => {
+            // The exit of a block that the loop ends itself (H5c), else of
+            // one whose next PC is a constant distance or that has no link.
+            if last.terminal.is_some() {
+                counts.returns_terminal += 1;
+            } else {
+                counts.returns_done += 1;
+            }
+            Ran {
+                count: taken,
+                halt: None,
+                terminal: last.terminal.map(|(_, trap)| trap),
+                pending: None,
+            }
+        }
         jit::BUDGET if taken == 0 => return None,
         // The run stopped at the head of `last`, which did not run: the PC
         // is its entry.
-        jit::BUDGET => Ran {
-            count: taken,
-            halt: None,
-            terminal: None,
-            pending: None,
-        },
+        jit::BUDGET => {
+            if kicked {
+                counts.returns_kicked += 1;
+            } else {
+                counts.returns_budget += 1;
+            }
+            Ran {
+                count: taken,
+                halt: None,
+                terminal: None,
+                pending: None,
+            }
+        }
         jit::VERIFY => Ran {
             count: taken,
             halt: None,
@@ -3276,7 +3567,7 @@ impl Compiled {
             code: code.slot,
             code_value,
             result: result.slot,
-            cases: crate::flags::host_forms(condition),
+            cases: std::borrow::Cow::Borrowed(crate::flags::host_forms_of(condition)),
         })
     }
 
@@ -3311,6 +3602,7 @@ impl Compiled {
                 budget,
                 &mut counts,
                 replay,
+                None,
                 None,
             )
         };
@@ -3578,13 +3870,30 @@ pub struct JitCounts {
     /// Runs that K3 checked (`VMLAB_HV_JIT_CHECK`), and their instructions.
     pub checked_runs: u64,
     pub checked_instructions: u64,
-    /// Blocks compiled and refused, the bytes of code, the resets of the
-    /// region and the host time of the compiles.
+    /// Blocks compiled and refused, the bytes of code, the drops of the
+    /// part of a full region written longest ago (`jit::region::PARTS`) and
+    /// the host time of the compiles.
     pub compiled: u64,
     pub refused: u64,
     pub bytes: u64,
     pub resets: u64,
     pub compile_ns: u64,
+    /// The compiles by cause (3e DESIGN.md J11): a block translated for the
+    /// first time, a block whose code went with a drop of the region (H13c)
+    /// or a change of how the code reaches memory, a block translated again
+    /// after its code stamp failed (a write into its page, an epoch), and a
+    /// block translated again after the store of the cache dropped it.
+    pub compiles_first: u64,
+    pub compiles_region: u64,
+    pub compiles_invalidated: u64,
+    pub compiles_evicted: u64,
+    /// Drops of the region for a change of how the code reaches memory
+    /// (`resets` counts those of a full region).
+    pub memory_resets: u64,
+    /// Blocks translated and the host time of the translations, as
+    /// `Cpu::translations` and `Cpu::translation_ns`.
+    pub translations: u64,
+    pub translation_ns: u64,
     /// Comparisons compiled as the host flags that the next operation
     /// reads, and lazy conditions compiled inline (3e DESIGN.md H8).
     pub fused: u64,
@@ -3599,6 +3908,21 @@ pub struct JitCounts {
     pub jump_hits: u64,
     pub unlinked: u64,
     pub lookups: u64,
+    /// Misses of the jump cache that the thunk served with code, so that
+    /// the run went on (card J10). They are not in `lookups`.
+    pub jump_served: u64,
+    /// The other returns to the loop after the end of a block (card J10):
+    /// a block that the loop ends itself (H5c: a system instruction, an
+    /// exception return, a call of the machine), a block that leaves with
+    /// nothing to chain to, and a run that stopped at a block head with
+    /// its budget spent, or kicked by another thread (H10c).
+    pub returns_terminal: u64,
+    pub returns_done: u64,
+    pub returns_budget: u64,
+    pub returns_kicked: u64,
+    /// Changes of the translation that kept the jump cache, because a new
+    /// ASID came with the new table base (`Mmu::jump_changes`).
+    pub jump_spaces: u64,
     /// Jumps linked and set back to their stubs, and entries of the jump
     /// cache filled.
     pub links: u64,
@@ -3694,6 +4018,10 @@ struct JitRun<'a> {
     chaining: &'a mut Chaining,
     /// Where the context of the run is, for a kick from another thread.
     seat: &'a jit::seat::Seat,
+    /// The blocks that a miss of the jump cache is served from (J10).
+    blocks: *mut Cache,
+    /// The lists that a compile hands to the emitter.
+    buffers: &'a mut ShapeBuffers,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -3721,6 +4049,8 @@ unsafe fn execute<M: Memory>(
         check,
         chaining,
         seat,
+        blocks,
+        buffers,
     } = run;
     let Some(jit) = jit.as_mut() else {
         // SAFETY: the caller's promise.
@@ -3734,12 +4064,16 @@ unsafe fn execute<M: Memory>(
             pending: None,
         };
     };
-    // The jump cache holds the translations of the MMU as they were.
-    let mmu = side.mmu.changes();
-    if chaining.seen != mmu {
+    // The jump cache holds the translations of the MMU as they were, in
+    // the address space of each entry: a new table base with a new ASID
+    // keeps it (card J10).
+    let jumps = side.mmu.jump_changes();
+    if chaining.seen != jumps {
         jit.clear_jumps();
-        chaining.seen = mmu;
+        chaining.seen = jumps;
     }
+    jit.set_jump_space(side.mmu.asid());
+    let mmu = side.mmu.changes();
     // Inline over the fast TLB, and with every hit kept while the CPU keeps
     // its accesses (H7, K1). A change drops the code of the region.
     jit.set_memory(if side.mmu.fast().is_none() {
@@ -3753,13 +4087,24 @@ unsafe fn execute<M: Memory>(
         // SAFETY: the caller's promise.
         let compiled = unsafe { &mut *block };
         if !compiled.refused && !compiled.code.is_some_and(|entry| jit.current(&entry)) {
+            if compiled.code.is_some() {
+                counts.compiles_region += 1;
+            } else {
+                match compiled.origin {
+                    Origin::First => counts.compiles_first += 1,
+                    Origin::Invalidated => counts.compiles_invalidated += 1,
+                    Origin::Evicted => counts.compiles_evicted += 1,
+                }
+            }
             compiled.compile_code(
                 jit,
+                buffers,
                 state.pc(),
                 check > 0,
                 chaining.sites && !single,
                 chaining.jumps && !single,
                 chaining.verify,
+                chaining.serve,
             );
         }
         if let Some(pending) = pending
@@ -3812,6 +4157,13 @@ unsafe fn execute<M: Memory>(
                 counts,
                 None,
                 Some(seat),
+                (chaining.serve && !chaining.verify && !single).then_some(JumpLookup {
+                    blocks,
+                    jit: &raw const *jit,
+                    epoch,
+                    changes: mmu,
+                    check,
+                }),
             )
         } {
             counts.exit(&ran.halt);
@@ -4069,6 +4421,11 @@ pub struct Cpu<M> {
     pub translations: u64,
     /// The host time that the translations took, in nanoseconds.
     pub translation_ns: u64,
+    /// The blocks that the CPU translated, by the physical address and the
+    /// key of the context, with 1 << 32 for a block of one instruction: a
+    /// block that is translated again is told from a first one (3e
+    /// DESIGN.md J11).
+    translated: FastSet<(u64, u64)>,
     /// Enabled by the owner for an instrumented boot.
     pub block_counts: Option<BlockCounts>,
     /// What the guest asked for that the CPU does not have, each once. The
@@ -4106,6 +4463,10 @@ pub struct Cpu<M> {
     pub jit_error: Option<String>,
     /// Chaining of compiled blocks (3e DESIGN.md H5, H6).
     chaining: Chaining,
+    /// The lists that a compile hands to the emitter (3e DESIGN.md J11).
+    shape_buffers: ShapeBuffers,
+    /// The buffers of a translation (3e DESIGN.md J11).
+    translator: Translator,
 }
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
@@ -4139,6 +4500,7 @@ impl<M: Memory> Cpu<M> {
             instructions: 0,
             translations: 0,
             translation_ns: 0,
+            translated: FastSet::default(),
             block_counts: None,
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
@@ -4159,12 +4521,18 @@ impl<M: Memory> Cpu<M> {
                 sites: chaining_from_environment().0,
                 jumps: chaining_from_environment().1,
                 verify: matches!(std::env::var("VMLAB_HV_JIT_CHAIN").as_deref(), Ok("verify")),
+                serve: !matches!(
+                    std::env::var("VMLAB_HV_JIT_SERVE").as_deref(),
+                    Ok("0" | "off" | "false")
+                ),
                 mismatches: 0,
                 pending: None,
                 epoch: 0,
                 mmu: 0,
                 seen: 0,
             },
+            shape_buffers: ShapeBuffers::default(),
+            translator: Translator::default(),
         };
         let started = if jit_check_from_environment() {
             cpu.set_jit_check(true)
@@ -4304,6 +4672,7 @@ impl<M: Memory> Cpu<M> {
             counts.bytes = jit.stats.bytes;
             counts.resets = jit.stats.resets;
             counts.compile_ns = jit.stats.compile_ns;
+            counts.memory_resets = jit.stats.memory_resets;
             counts.fused = jit.stats.fused;
             counts.lazy = jit.stats.lazy;
             counts.links = jit.stats.links;
@@ -4311,6 +4680,7 @@ impl<M: Memory> Cpu<M> {
             counts.fills = jit.stats.fills;
             counts.clears = jit.stats.clears;
         }
+        counts.jump_spaces = self.side.mmu.spaces();
         if let Some(fast) = self.side.mmu.fast() {
             counts.tlb_fills = fast.fills;
             counts.tlb_flushes = fast.flushes;
@@ -4318,6 +4688,8 @@ impl<M: Memory> Cpu<M> {
             counts.tlb_flush_ns = fast.flush_ns;
         }
         counts.machine = self.side.machine;
+        counts.translations = self.translations;
+        counts.translation_ns = self.translation_ns;
         counts
     }
 
@@ -4382,7 +4754,7 @@ impl<M: Memory> Cpu<M> {
         self.side.mmu.set_fast(self.jit.is_some());
         // Compiled code chains to the blocks that go now (3e DESIGN.md K7).
         self.unlink_all();
-        self.chaining.seen = self.side.mmu.changes();
+        self.chaining.seen = self.side.mmu.jump_changes();
         if let Some(jit) = &mut self.jit {
             jit.clear_jumps();
         }
@@ -4798,7 +5170,14 @@ impl<M: Memory> Cpu<M> {
                 .broadcast(Some(Invalidation::CodePage(phys & !0xfff)));
         }
         let stamp = self.memory.code_stamp(phys, self.stamp_len(phys));
-        let mut builder = Builder::new(context, pc);
+        // The lifter fills the block of the translation before, which the
+        // translator keeps (3e DESIGN.md J11).
+        let mut builder = Builder::with_block(
+            std::mem::take(&mut self.translator.block),
+            std::mem::take(&mut self.translator.spare),
+            context,
+            pc,
+        );
         let mut at = pc;
         let mut count = 0;
         let mut ldp_x = 0;
@@ -4878,14 +5257,20 @@ impl<M: Memory> Cpu<M> {
         }
         self.translations += 1;
         self.side.mark_code(phys);
-        let mut compiled = compile(
+        let (mut block, spare) = builder.finish_keeping(at);
+        self.translator.spare = spare;
+        let compiled = compile_with(
             phys,
             context,
             count,
-            builder.finish(at),
+            &mut block,
+            &mut self.translator,
             self.block_counts.as_mut(),
-        )
-        .map_err(Refused::Stop)?;
+        );
+        self.translator.spare.keep(&mut block);
+        block.clear();
+        self.translator.block = block;
+        let mut compiled = compiled.map_err(Refused::Stop)?;
         if let Some(counts) = &mut self.block_counts {
             counts.ldp_x += ldp_x;
             counts.stp_x += stp_x;
@@ -5042,13 +5427,20 @@ impl<M: Memory> Cpu<M> {
         };
         let index = Cache::index(phys);
         let mut ready = self.usable(single, index, phys, context);
+        // The cache held a block of the code whose stamp failed.
+        let mut stale = false;
         if !ready {
             let cache = if single {
                 &mut self.singles
             } else {
                 &mut self.blocks
             };
-            ready = cache.revive(index, phys, context) && self.usable(single, index, phys, context);
+            stale = cache.entries[index]
+                .as_ref()
+                .is_some_and(|block| block.phys == phys && block.context == context);
+            let revived = cache.revive(index, phys, context);
+            ready = revived && self.usable(single, index, phys, context);
+            stale |= revived && !ready;
         }
         if !ready {
             let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
@@ -5056,7 +5448,17 @@ impl<M: Memory> Cpu<M> {
             let translated = self.translate(phys, limit);
             self.translation_ns += started.elapsed().as_nanos() as u64;
             let compiled = match translated {
-                Ok(compiled) => Box::new(compiled),
+                Ok(mut compiled) => {
+                    let key = (phys, context_key(context) | u64::from(single) << 32);
+                    compiled.origin = if stale {
+                        Origin::Invalidated
+                    } else if self.translated.insert(key) {
+                        Origin::First
+                    } else {
+                        Origin::Evicted
+                    };
+                    Box::new(compiled)
+                }
                 Err(Refused::Stop(stop)) => return Err(stop),
                 Err(Refused::Exception(exception)) => {
                     self.raise(exception, pc);
@@ -5102,6 +5504,8 @@ impl<M: Memory> Cpu<M> {
                         Some(lines) => &lines.seat,
                         None => &self.seat,
                     },
+                    blocks: &raw mut self.blocks,
+                    buffers: &mut self.shape_buffers,
                 },
                 pending,
                 self.epoch,
@@ -5279,6 +5683,8 @@ impl<M: Memory> Cpu<M> {
                                 Some(lines) => &lines.seat,
                                 None => &self.seat,
                             },
+                            blocks: &raw mut self.blocks,
+                            buffers: &mut self.shape_buffers,
                         },
                         pending,
                         self.epoch,
@@ -5427,6 +5833,209 @@ mod tests {
         };
         let quiet = runs(false);
         assert_eq!(runs(true), quiet + 1, "the run after the TLBI");
+    }
+
+    /// 3e card J13: the inline forms of `ADD`, `SUB`, `CMEQ`, `CMTST` and
+    /// `REV` of vectors, and the crypto helpers with their words in
+    /// registers, give what the lane helper and the crypto function give,
+    /// in the interpreter and in compiled code, for every arrangement.
+    #[test]
+    fn inline_lanes_and_register_helpers_give_what_the_helpers_give() {
+        use crate::helpers::crypto::{Crypto, crypto};
+        use crate::helpers::simd::{Code as Lanes, Op as LaneOp, eval};
+        let mut seed = 0x3e_0013_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // A vector, and one that has some lanes of it, for the compares.
+        let mut vector = |bits: u32| -> (u128, u128) {
+            let a = u128::from(next()) | u128::from(next()) << 64;
+            let kind = next() % 4;
+            let a = match kind {
+                0 => a,
+                1 => !0,
+                2 => a & u128::from_le_bytes([0x80; 16]),
+                _ => 0,
+            };
+            let keep = u128::from(next()) | u128::from(next()) << 64;
+            let mut lanes = 0u128;
+            for lane in 0..128 / bits {
+                if keep >> lane & 1 != 0 {
+                    lanes |= ((1u128 << bits) - 1) << (lane * bits);
+                }
+            }
+            let b = u128::from(next()) | u128::from(next()) << 64;
+            (a, (a & lanes) | (b & !lanes))
+        };
+        // (word without size, Q and registers, operation, sizes, container
+        // of a REV, reads Rm, compares with zero).
+        let forms: [(u32, LaneOp, u32, u16, bool, bool); 8] = [
+            (0x0e20_8400, LaneOp::Add, 4, 0, true, false),
+            (0x2e20_8400, LaneOp::Sub, 4, 0, true, false),
+            (0x2e20_8c00, LaneOp::CmEq, 4, 0, true, false),
+            (0x0e20_8c00, LaneOp::CmTst, 4, 0, true, false),
+            (0x0e20_9800, LaneOp::CmEq, 4, 0, false, true),
+            (0x0e20_0800, LaneOp::Rev, 3, 64, false, false),
+            (0x2e20_0800, LaneOp::Rev, 2, 32, false, false),
+            (0x0e20_1800, LaneOp::Rev, 1, 16, false, false),
+        ];
+        let mut cases = Vec::new();
+        for (base, op, sizes, container, reads_m, zero) in forms {
+            for size in 0..sizes {
+                for q in [false, true] {
+                    if size == 3 && !q {
+                        continue;
+                    }
+                    let lanes = (if q { 128 } else { 64 }) / (8u32 << size);
+                    // The forms of two registers have no Rm.
+                    let rm = if reads_m { 2 << 16 } else { 0 };
+                    let word = base | u32::from(q) << 30 | size << 22 | rm | 1 << 5;
+                    let code = Lanes::new(op, size as u8, lanes as u8).imm(container);
+                    cases.push((word, code, reads_m, zero));
+                }
+            }
+        }
+        // ADD and SUB of the scalar D registers.
+        for (word, op) in [(0x5ee0_8400, LaneOp::Add), (0x7ee0_8400, LaneOp::Sub)] {
+            cases.push((word | 2 << 16 | 1 << 5, Lanes::new(op, 3, 1), true, false));
+        }
+        for (word, code, reads_m, zero) in cases {
+            for round in 0..64 {
+                let (n, m) = vector(8 << code.size);
+                let m = if reads_m { m } else { 0 };
+                let expected = eval(code, n, m, 0, 0).0;
+                for jit in [false, true] {
+                    // The instruction, then `b .`.
+                    let mut cpu = cpu(&[word, 0x1400_0000]);
+                    cpu.state.enable_fp();
+                    cpu.set_jit(jit).unwrap();
+                    cpu.state.set_v(0, u128::MAX);
+                    cpu.state.set_v(1, n);
+                    cpu.state.set_v(2, m);
+                    assert_eq!(cpu.run(2), Stop::Budget);
+                    assert_eq!(
+                        cpu.state.v(0),
+                        expected,
+                        "{word:#010x} {code:?} zero {zero} jit {jit} round {round}: {n:#x} {m:#x}"
+                    );
+                    if jit {
+                        assert_eq!(cpu.jit_counts().interpreted_instructions, 0);
+                    }
+                }
+            }
+        }
+        // The crypto operations: `SHA256H q0, q1, v2.4s` and the others of
+        // the 3d set, through their own helpers.
+        let crypto_words: [(u32, Crypto); 14] = [
+            (0x4e28_4820, Crypto::AesE),
+            (0x4e28_5820, Crypto::AesD),
+            (0x4e28_6820, Crypto::AesMc),
+            (0x4e28_7820, Crypto::AesImc),
+            (0x5e02_0020, Crypto::Sha1C),
+            (0x5e02_1020, Crypto::Sha1P),
+            (0x5e02_2020, Crypto::Sha1M),
+            (0x5e28_0820, Crypto::Sha1H),
+            (0x5e02_3020, Crypto::Sha1Su0),
+            (0x5e28_1820, Crypto::Sha1Su1),
+            (0x5e02_4020, Crypto::Sha256H),
+            (0x5e02_5020, Crypto::Sha256H2),
+            (0x5e28_2820, Crypto::Sha256Su0),
+            (0x5e02_6020, Crypto::Sha256Su1),
+        ];
+        for (word, operation) in crypto_words {
+            let record = crate::generated::decode::decode(word)
+                .expect("a crypto record")
+                .record;
+            let (planned, plan_d, plan_m) =
+                crate::lift::crypto::plan(record).expect("a crypto plan");
+            assert_eq!(planned, operation, "{word:#010x}");
+            for _ in 0..16 {
+                let (d, n) = vector(32);
+                let (m, _) = vector(32);
+                let expected = crypto(
+                    operation,
+                    if plan_d { d } else { 0 },
+                    n,
+                    if plan_m { m } else { 0 },
+                );
+                for jit in [false, true] {
+                    let mut cpu = cpu(&[word, 0x1400_0000]);
+                    cpu.state.enable_fp();
+                    cpu.set_jit(jit).unwrap();
+                    cpu.state.set_v(0, d);
+                    cpu.state.set_v(1, n);
+                    cpu.state.set_v(2, m);
+                    assert_eq!(cpu.run(2), Stop::Budget);
+                    assert_eq!(cpu.state.v(0), expected, "{operation:?} jit {jit}");
+                }
+            }
+        }
+    }
+
+    /// Card J10: two blocks 16 KiB apart take the same entry of the jump
+    /// cache, so that each exit misses it. The thunk serves the miss with
+    /// the code of the other block, and the run does not come back to the
+    /// loop for it. The registers are those of the interpreter, and of a
+    /// run that comes back for every miss.
+    #[test]
+    fn a_miss_of_the_jump_cache_is_served_without_a_return_to_the_loop() {
+        const OTHER: u64 = BASE + 0x4000;
+        assert_eq!(jit::jump_index(BASE), jit::jump_index(OTHER));
+        let make = |jit: bool, serve: bool| {
+            let mut data = vec![0u8; 0x8000];
+            // add x0, x0, #1 ; br x2 / add x1, x1, #1 ; br x3
+            for (at, words) in [
+                (0usize, [0x9100_0400u32, 0xd61f_0040]),
+                (0x4000, [0x9100_0421, 0xd61f_0060]),
+            ] {
+                for (n, word) in words.iter().enumerate() {
+                    data[at + n * 4..at + n * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            let mut cpu = Cpu::new(FlatMemory::new(BASE, data), State::reset(BASE));
+            cpu.state.set_x(2, OTHER);
+            cpu.state.set_x(3, BASE);
+            if jit {
+                cpu.set_jit(true).unwrap();
+                cpu.set_chaining(true).unwrap();
+                cpu.chaining.serve = serve;
+            }
+            cpu
+        };
+        let mut interpreted = make(false, false);
+        let mut served = make(true, true);
+        let mut returned = make(true, false);
+        for cpu in [&mut interpreted, &mut served, &mut returned] {
+            assert_eq!(cpu.run(4000), Stop::Budget);
+        }
+        for cpu in [&served, &returned] {
+            assert_eq!(
+                (
+                    cpu.state.x(0),
+                    cpu.state.x(1),
+                    cpu.state.pc(),
+                    cpu.instructions
+                ),
+                (
+                    interpreted.state.x(0),
+                    interpreted.state.x(1),
+                    interpreted.state.pc(),
+                    interpreted.instructions
+                )
+            );
+        }
+        assert_eq!(interpreted.state.x(0) + interpreted.state.x(1), 2000);
+        let (served, returned) = (served.jit_counts(), returned.jit_counts());
+        // Without the thunk every exit after the first ones misses and
+        // comes back; with it only the first ones do.
+        assert_eq!(returned.jump_served, 0);
+        assert!(returned.lookups > 1900, "{returned:?}");
+        assert!(served.lookups <= 4, "{served:?}");
+        assert!(served.jump_served > 1900, "{served:?}");
+        assert!(served.compiled_runs <= 8, "{served:?}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod stream;
 pub mod system;
 pub mod testfloat;
 pub mod translate;
+pub mod window;
 
 use crate::state::{State, slot};
 use crate::sysreg;

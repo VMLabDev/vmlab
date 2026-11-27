@@ -26,7 +26,11 @@
  * The stream, little-endian:
  *   header        "A64LOCK1", u32 flags (bit 0: vectors), u32 count of sysregs
  *   instruction   u32 1, u32 encoding, u64 x[31], u64 sp, u64 pc, u64 cpsr
- *                 (pc is the address of the instruction, not the PC register)
+ *                 (pc is the address of the instruction: the PC register at
+ *                 the start of its block, and the offset of the instruction
+ *                 in the block. A block of QEMU can serve two virtual
+ *                 addresses of the same code (card C13b), so the address that
+ *                 it was translated at is not the address that it runs at.)
  *                 with vectors: u8 v[32][16], u64 fpsr, u64 fpcr
  *                 with sysregs: u64 for each, in the order of the argument
  *   memory write  u32 2, u32 size in bytes, u64 vaddr, u64 low, u64 high
@@ -58,7 +62,7 @@ static int out_fd = -1;
 static int vectors;
 static int io_reads;
 static int pipe_bytes;
-static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_cpsr;
+static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_cpsr, *reg_pc;
 static struct qemu_plugin_register *reg_v[32], *reg_fpsr, *reg_fpcr;
 enum { MAX_SYSREGS = 96 };
 static char *sys_name[MAX_SYSREGS];
@@ -189,8 +193,17 @@ static void discon(unsigned int vcpu, enum qemu_plugin_discon_type type,
 
 static void tb_exec(unsigned int vcpu, void *udata)
 {
-    if (vcpu == 0) {
-        tb_base = (uint64_t)(uintptr_t)udata;
+    uint64_t pc = 0;
+    if (vcpu != 0) {
+        return;
+    }
+    tb_base = (uint64_t)(uintptr_t)udata;
+    /* The block runs at the PC register, which can be another virtual
+     * address than the one that it was translated at. */
+    g_byte_array_set_size(scratch, 0);
+    if (reg_pc && ready && qemu_plugin_read_register(reg_pc, scratch) && scratch->len >= 8) {
+        memcpy(&pc, scratch->data, 8);
+        tb_base = pc;
     }
 }
 
@@ -198,7 +211,7 @@ static void tb_trans(struct qemu_plugin_tb *tb, void *udata)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
     uint64_t base = qemu_plugin_tb_vaddr(tb);
-    qemu_plugin_register_vcpu_tb_exec_cb(tb, tb_exec, QEMU_PLUGIN_CB_NO_REGS,
+    qemu_plugin_register_vcpu_tb_exec_cb(tb, tb_exec, QEMU_PLUGIN_CB_R_REGS,
                                          (void *)(uintptr_t)base);
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -244,6 +257,8 @@ static void vcpu_init(unsigned int vcpu, void *udata)
         }
         if (!strcmp(n, "sp")) {
             reg_sp = r->handle;
+        } else if (!strcmp(n, "pc")) {
+            reg_pc = r->handle;
         } else if (!strcmp(n, "cpsr")) {
             reg_cpsr = r->handle;
         } else if (!strcmp(n, "fpsr")) {
@@ -262,7 +277,7 @@ static void vcpu_init(unsigned int vcpu, void *udata)
     for (int i = 0; i < 31; i++) {
         missing += !reg_x[i];
     }
-    missing += !reg_sp + !reg_cpsr;
+    missing += !reg_sp + !reg_cpsr + !reg_pc;
     if (vectors) {
         for (int i = 0; i < 32; i++) {
             missing += !reg_v[i];

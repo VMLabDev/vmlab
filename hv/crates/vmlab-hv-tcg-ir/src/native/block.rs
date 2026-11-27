@@ -167,6 +167,18 @@ pub trait ExitScalars {
 }
 
 impl<X> BlockOf<X> {
+    /// Empty the block, keeping the memory of its lists and of its graph,
+    /// for the next block of a translator (3e DESIGN.md J11).
+    pub fn clear(&mut self) {
+        self.graph.clear();
+        self.values.clear();
+        self.events.clear();
+        self.exits.clear();
+        self.checkpoints.clear();
+        self.code_guards.clear();
+        self.context_guards.clear();
+    }
+
     pub fn value(&mut self, recipe: Recipe) -> ValueId {
         let id = self.values.len();
         self.values.push(recipe);
