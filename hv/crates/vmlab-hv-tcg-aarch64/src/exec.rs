@@ -2899,7 +2899,11 @@ mod tests {
     /// The flags of `a + b + carry` in `width` bits, from the definitions of
     /// N, Z, C and V, as the bits 3 to 0.
     fn sum_flags(width: u32, a: u64, b: u64, carry: bool) -> u8 {
-        let mask = if width == 64 { u64::MAX } else { u64::from(u32::MAX) };
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
         let (a, b) = (a & mask, b & mask);
         let result = a.wrapping_add(b).wrapping_add(u64::from(carry)) & mask;
         let sign = |value: u64| -> i128 {
@@ -2930,17 +2934,26 @@ mod tests {
             0x8000_0000_0000_0000,
             u64::MAX,
         ];
-        let ccmp = |sf: u32, cond: u32, nzcv: u32| sf << 31 | 0x7a40_0000 | 1 << 16 | cond << 12 | nzcv;
+        let ccmp =
+            |sf: u32, cond: u32, nzcv: u32| sf << 31 | 0x7a40_0000 | 1 << 16 | cond << 12 | nzcv;
         let mut case = 0u32;
         for width in [32u32, 64] {
             let sf = u32::from(width == 64);
             // (encoding with rd 9, rn 0 and rm 1, its flags).
             type Setter = (u32, fn(u32, u64, u64, u8) -> u8);
             let setters: [Setter; 6] = [
-                (sf << 31 | 0x6b00_0009 | 1 << 16, |w, a, b, _| sum_flags(w, a, !b, true)),
-                (sf << 31 | 0x2b00_0009 | 1 << 16, |w, a, b, _| sum_flags(w, a, b, false)),
+                (sf << 31 | 0x6b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, !b, true)
+                }),
+                (sf << 31 | 0x2b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, b, false)
+                }),
                 (sf << 31 | 0x6a00_0009 | 1 << 16, |w, a, b, _| {
-                    let mask = if w == 64 { u64::MAX } else { u64::from(u32::MAX) };
+                    let mask = if w == 64 {
+                        u64::MAX
+                    } else {
+                        u64::from(u32::MAX)
+                    };
                     let result = a & b & mask;
                     u8::from(result >> (w - 1) & 1 == 1) << 3 | u8::from(result == 0) << 2
                 }),
@@ -2973,12 +2986,21 @@ mod tests {
                                 (*encoding, flags(width, a, b, before))
                             };
                             let csinc = |rd: u32| 0x9a9f_07e0 | cond << 12 | rd;
-                            let mut cpu = cpu(&[0xd51b_420c, encoding, csinc(2), 0x1400_0001, csinc(3), 0x1400_0000]);
+                            let mut cpu = cpu(&[
+                                0xd51b_420c,
+                                encoding,
+                                csinc(2),
+                                0x1400_0001,
+                                csinc(3),
+                                0x1400_0000,
+                            ]);
                             cpu.state.set_x(0, a);
                             cpu.state.set_x(1, b);
                             cpu.state.set_x(12, u64::from(before) << 28);
                             assert_eq!(cpu.run(6), Stop::Budget);
-                            let what = format!("{encoding:#010x} {a:#x} {b:#x} cond {cond} flags {before:04b}");
+                            let what = format!(
+                                "{encoding:#010x} {a:#x} {b:#x} cond {cond} flags {before:04b}"
+                            );
                             assert_eq!(cpu.state.nzcv(), expected, "{what}");
                             let holds = u64::from(!flags::holds(cond as u8, expected));
                             assert_eq!(cpu.state.x(2), holds, "in the block: {what}");

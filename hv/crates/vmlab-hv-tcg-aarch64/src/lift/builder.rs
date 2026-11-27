@@ -154,7 +154,10 @@ pub struct Sum {
 pub enum Flags {
     Sum(Sum),
     /// N and Z of `result`, C and V clear.
-    Logical { width: u16, result: ScalarId },
+    Logical {
+        width: u16,
+        result: ScalarId,
+    },
     /// NZCV as four bits, N the highest.
     Explicit(ScalarId),
     /// The flags of `sum` where the Bool `holds`, else `otherwise` (NZCV).
@@ -715,14 +718,13 @@ impl Builder {
 
     /// The flag slots of a sum: its kind and its two operands.
     fn sum_slots(&mut self, sum: Sum) -> (ScalarId, ScalarId, ScalarId) {
-        let operation = if sum.subtract {
-            flags::SUB
-        } else {
-            flags::ADD
-        };
+        let operation = if sum.subtract { flags::SUB } else { flags::ADD };
         let base = flags::kind(operation, sum.width);
         let kind = match self.block.graph.literal(sum.carry) {
-            Some(carry) => self.imm(4, u64::from(base | if carry != 0 { flags::CARRY } else { 0 })),
+            Some(carry) => self.imm(
+                4,
+                u64::from(base | if carry != 0 { flags::CARRY } else { 0 }),
+            ),
             None => {
                 let base = self.imm(4, base.into());
                 let carry = self.zero_extend(sum.carry, 4);

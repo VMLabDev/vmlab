@@ -45,13 +45,18 @@ pub fn nzcv(kind: u8, a: u64, b: u64) -> u8 {
     } else {
         (32, u64::from(u32::MAX))
     };
-    let negative_zero = |result: u64| ((result >> (width - 1) & 1) as u8) << 3 | u8::from(result == 0) << 2;
+    let negative_zero =
+        |result: u64| ((result >> (width - 1) & 1) as u8) << 3 | u8::from(result == 0) << 2;
     match kind & 3 {
         EXPLICIT => a as u8 & 15,
         LOGICAL => negative_zero(a & mask),
         operation => {
             let a = a & mask;
-            let b = if operation == SUB { !b & mask } else { b & mask };
+            let b = if operation == SUB {
+                !b & mask
+            } else {
+                b & mask
+            };
             let carry_in = u128::from(kind >> 3 & 1);
             let sum = u128::from(a) + u128::from(b) + carry_in;
             let result = sum as u64 & mask;
@@ -106,7 +111,11 @@ mod tests {
 
     /// The flags of `a + b + carry` in `width` bits, computed bit by bit.
     fn reference(width: u32, a: u64, b: u64, carry: bool) -> u8 {
-        let mask = if width == 64 { u64::MAX } else { u64::from(u32::MAX) };
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
         let (a, b) = (a & mask, b & mask);
         let result = a.wrapping_add(b).wrapping_add(u64::from(carry)) & mask;
         let unsigned = u128::from(a) + u128::from(b) + u128::from(carry);

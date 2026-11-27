@@ -136,7 +136,11 @@ impl SavedCpu {
         for (index, saved) in places.zip(others) {
             state.slots[index] = value(saved);
         }
-        state.set_nzcv(flags.iter().fold(0, |nzcv, saved| nzcv << 1 | value(saved) as u8));
+        state.set_nzcv(
+            flags
+                .iter()
+                .fold(0, |nzcv, saved| nzcv << 1 | value(saved) as u8),
+        );
         state.context = Context {
             el: self.el,
             sp_sel: self.sp_sel,
