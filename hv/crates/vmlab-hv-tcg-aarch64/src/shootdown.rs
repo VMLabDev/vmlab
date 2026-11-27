@@ -149,6 +149,12 @@ impl Shootdown {
         Some(std::mem::take(&mut *mail))
     }
 
+    /// Whether `cpu` has mail that it has not taken.
+    #[cfg(test)]
+    pub(crate) fn has_mail(&self, cpu: usize) -> bool {
+        self.cpus[cpu].pending.load(Ordering::Acquire)
+    }
+
     /// Whether some CPU but `from` that runs has mail that it has not taken.
     pub(crate) fn outstanding(&self, from: usize) -> bool {
         self.cpus.iter().enumerate().any(|(id, mailbox)| {

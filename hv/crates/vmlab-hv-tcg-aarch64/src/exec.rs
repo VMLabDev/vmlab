@@ -2436,9 +2436,12 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
                 env.memory
                     .wrote_straight(phys | (at & 0xfff), usize::from(bytes));
                 env.side.own_writes += 1;
+                let changes = env.side.mmu.changes();
                 env.side.tell_code(env.memory);
-                // Code mail that the CPU took while it waited.
-                if env.side.code_written {
+                // Code mail, or an invalidation of the TLB, that the CPU
+                // took while it waited: the links and the jump cache of the
+                // run follow translations that are gone.
+                if env.side.code_written || env.side.mmu.changes() != changes {
                     // SAFETY: the context of the run, which compiled code
                     // does not hold while it calls.
                     unsafe { jit::seat::kick(env.context) };
@@ -2494,6 +2497,7 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
     // while it calls.
     let state = unsafe { &mut *env.state };
     let written = env.side.code_written;
+    let changes = env.side.mmu.changes();
     let done = Compiled::effect(
         op,
         frame,
@@ -2518,8 +2522,12 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
             // A block of one instruction made a store into a page of
             // translated code: no block after it may run before the loop
             // looked at the code again (H11).
-            // So did code mail that the CPU took while it waited.
-            if !written && env.side.code_written {
+            // So did code mail that the CPU took while it waited (a store
+            // tells the other CPUs and waits for them, J7c). An
+            // invalidation of the TLB that it took then leaves the links
+            // and the jump cache of the run on translations that are gone:
+            // the run ends, and the next one empties the jump cache.
+            if (!written && env.side.code_written) || env.side.mmu.changes() != changes {
                 // SAFETY: the context of the run, which compiled code does
                 // not hold while it calls.
                 unsafe { jit::seat::kick(env.context) };
@@ -5345,6 +5353,56 @@ mod tests {
 
     // add x0, x0, #1 ; subs x1, x1, #1 ; b.ne -8
     const LOOP: [u32; 3] = [0x9100_0400, 0xf100_0421, 0x54ff_ffc1];
+
+    /// 3e card J7: a store of compiled code into a page that another CPU
+    /// holds code of waits for that CPU (J7c). An invalidation of the TLB
+    /// that the waiting CPU takes then ends its chained run, so that the
+    /// next run empties the jump cache; without one the run goes on. The
+    /// other CPU is a thread that answers the mailbox: it posts
+    /// `TLBI VMALLE1IS` while the store waits, waits until it was taken,
+    /// and then takes the code mail.
+    #[test]
+    fn a_tlbi_taken_while_a_store_waits_ends_the_chained_run() {
+        use crate::shootdown::{Invalidation, Shootdown};
+        use std::sync::Arc;
+        const PAGE: u64 = BASE + 0x1000;
+        let runs = |tlbi: bool| -> u64 {
+            // str w1, [x2] ; b -4
+            let mut cpu = cpu(&[0xb900_0041, 0x17ff_ffff]);
+            cpu.set_jit(true).unwrap();
+            cpu.set_chaining(true).unwrap();
+            let shootdown = Arc::new(Shootdown::new(2));
+            cpu.shootdown = Some((shootdown.clone(), 0));
+            cpu.state.set_x(2, PAGE);
+            // Compiled and linked, with the page of the store unwatched.
+            assert_eq!(cpu.run(200), Stop::Budget);
+            let before = cpu.jit_counts().compiled_runs;
+            // The other CPU translated code in the page and runs.
+            assert!(cpu.memory.watch_code(PAGE).is_some());
+            shootdown.set_running(1, true);
+            let other = std::thread::spawn({
+                let shootdown = shootdown.clone();
+                move || {
+                    while !shootdown.has_mail(1) {
+                        std::hint::spin_loop();
+                    }
+                    if tlbi {
+                        shootdown.post(1, Invalidation::All);
+                        while shootdown.has_mail(0) {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    assert!(shootdown.take(1).is_some_and(|mail| mail.code));
+                }
+            });
+            assert_eq!(cpu.run(2000), Stop::Budget);
+            other.join().unwrap();
+            assert_eq!(cpu.jit_counts().machine.code_mails, 1);
+            cpu.jit_counts().compiled_runs - before
+        };
+        let quiet = runs(false);
+        assert_eq!(runs(true), quiet + 1, "the run after the TLBI");
+    }
 
     #[test]
     fn a_counted_loop_runs_to_its_end_with_the_flags_of_the_last_compare() {
