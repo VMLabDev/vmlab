@@ -315,7 +315,6 @@ struct Side {
     pub blocks_run: u64,
     pub generic_run: u64,
     pub inputs_run: u64,
-    pub histogram: [u64; 48],
 }
 
 impl Side {
@@ -335,7 +334,6 @@ impl Side {
             blocks_run: 0,
             generic_run: 0,
             inputs_run: 0,
-            histogram: [0; 48],
         }
     }
 
@@ -1448,7 +1446,6 @@ impl Compiled {
         side.generic_run += self.generics.len() as u64;
         side.inputs_run += (self.inputs.len() + self.outputs.len()) as u64;
         for op in &self.ops {
-            side.histogram[op.code as usize] += 1;
             if (op.code as u8) < FIRST_EFFECT {
                 // SAFETY: `compile` checked every operation against the
                 // frame and the generic operations of the block, and
@@ -1710,10 +1707,6 @@ impl<M: Memory> Cpu<M> {
     /// WIP: operations, blocks, generic operations and register copies run.
     pub fn run_counts(&self) -> (u64, u64, u64, u64) {
         (self.side.ops_run, self.side.blocks_run, self.side.generic_run, self.side.inputs_run)
-    }
-
-    pub fn histogram(&self) -> [u64; 48] {
-        self.side.histogram
     }
 
     pub fn tlb_entries(&self) -> usize {
