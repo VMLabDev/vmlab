@@ -503,8 +503,11 @@ fn an_exclusive_store_is_a_compare_and_exchange_and_a_stamp_still_fails_it() {
     assert!(bus.compare_and_store(at, &wide, &[8; 16]).unwrap());
     assert!(!bus.compare_and_store(at, &wide, &[9; 16]).unwrap());
     for len in [1, 2, 4, 8] {
-        let now = [8u8; 16];
-        assert!(bus.compare_and_store(at, &now[..len], &[len as u8; 16][..len]).unwrap());
+        let mut now = [0u8; 8];
+        bus.read(at, &mut now[..len]).unwrap();
+        let new = [len as u8; 8];
+        assert!(bus.compare_and_store(at, &now[..len], &new[..len]).unwrap());
+        assert!(!bus.compare_and_store(at, &now[..len], &new[..len]).unwrap());
     }
 
     // A device write moves the stamp of the page, which fails the

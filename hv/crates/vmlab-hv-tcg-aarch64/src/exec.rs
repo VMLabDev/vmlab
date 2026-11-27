@@ -3359,4 +3359,27 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn another_memory_under_the_cpu_drops_the_host_pages_of_the_old_one() {
+        // ldr x1, [x0] ; str x1, [x0, #8] ; hvc #0
+        let mut cpu = cpu(&[0xf940_0001, 0xf900_0401, HVC_0]);
+        cpu.state.set_x(0, BASE + 0x1800);
+        cpu.memory.write(BASE + 0x1800, &7u64.to_le_bytes()).unwrap();
+        assert!(matches!(cpu.run(10), Stop::Hypercall { .. }));
+        assert_eq!(cpu.state.x(1), 7);
+        // The store went straight into the page: the bytes are there, and no
+        // code is in that page, so it moved no stamp.
+        let mut bytes = [0u8; 8];
+        cpu.memory.read(BASE + 0x1808, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), 7);
+        let mut data = cpu.memory.bytes().to_vec();
+        data[0x1800..0x1808].copy_from_slice(&9u64.to_le_bytes());
+        cpu.memory = FlatMemory::new(BASE, data);
+        cpu.state.set_pc(BASE);
+        assert!(matches!(cpu.run(10), Stop::Hypercall { .. }));
+        assert_eq!(cpu.state.x(1), 9);
+        cpu.memory.read(BASE + 0x1808, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), 9);
+    }
 }
