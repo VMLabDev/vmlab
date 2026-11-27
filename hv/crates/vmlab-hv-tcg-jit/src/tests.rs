@@ -583,6 +583,7 @@ impl Looping {
     }
 
     fn compile(&mut self, jit: &mut Jit, kind: NextPc, key: u64) -> Entry {
+        let frame = self.frame.as_mut_ptr() as u64;
         let shape = Shape {
             ops: &self.ops,
             generics: &[],
@@ -594,7 +595,7 @@ impl Looping {
             outputs: &self.outputs,
             instructions: 1,
             chain: Some(Chain {
-                frame: self.frame.as_mut_ptr() as u64,
+                frame,
                 tag: 0x7a6,
                 key,
                 page_offset: 0x100,
@@ -683,7 +684,6 @@ fn the_jump_cache_serves_its_pc_and_its_key_and_is_dropped_with_the_region() {
     let (code, _) = block.run(&jit, &entry, &mut slots, 20);
     assert_eq!(code, LOOKUP);
     // A full region drops the jump cache with the code.
-    slots[2] = u128::from(pc);
     let mut other = Looping::new();
     let resets = jit.stats.resets;
     while jit.stats.resets == resets {
