@@ -2724,7 +2724,6 @@ impl<M: Memory> Cpu<M> {
         self.jit_check_runs
     }
 
-
     /// Put a defect into every block that the JIT compiles from now on, to
     /// show that K2 and K3 catch it (3e DESIGN.md J2). For tests only.
     pub fn seed_jit_defect(&mut self, defect: JitDefect) {
@@ -3567,10 +3566,10 @@ impl<M: Memory> Cpu<M> {
                         jit: &mut self.jit,
                         counts: &mut self.jit_counts,
                         check: if self.jit_check {
-                    self.jit_check_runs
-                } else {
-                    0
-                },
+                            self.jit_check_runs
+                        } else {
+                            0
+                        },
                     },
                     left,
                 );
