@@ -2358,12 +2358,10 @@ impl Replay {
             ),
             // A pair is one access of 16 bytes in the log, as
             // `load_pair` and `store_pair` make it there.
-            Code::LoadPair => self
-                .load(exit, frame[usize::from(op.a)], 16)
-                .map(|value| {
-                    frame[usize::from(op.dst)] = value as u64;
-                    frame[usize::from(op.dst) + 1] = (value >> 64) as u64;
-                }),
+            Code::LoadPair => self.load(exit, frame[usize::from(op.a)], 16).map(|value| {
+                frame[usize::from(op.dst)] = value as u64;
+                frame[usize::from(op.dst) + 1] = (value >> 64) as u64;
+            }),
             Code::StorePair => self.store(
                 exit,
                 frame[usize::from(op.a)],
