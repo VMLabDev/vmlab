@@ -2374,8 +2374,12 @@ struct Env<'a, M> {
     /// The context of the run. The thunk spends its budget, and takes its
     /// write table away when an exclusive load sets a mark (H7a).
     context: *mut jit::Context,
-    /// The inlined loads and stores that missed the fast TLB.
+    /// The inlined loads and stores that missed the fast TLB, and of them
+    /// those not aligned to their size (or a pair in the last 8 bytes of
+    /// its page), those whose entry was empty, and those whose entry held
+    /// another page (3e DESIGN.md J12).
     misses: u64,
+    miss_kinds: [u64; 3],
     /// Why the block left, when an effect did not complete.
     failed: Option<(u32, Failed)>,
     stop: Option<Stop>,
@@ -2386,6 +2390,37 @@ struct Env<'a, M> {
 
 /// What the thunk returns when the block leaves.
 const THUNK_LEFT: u64 = 2;
+
+/// Why an inlined access of `bytes` bytes at `at` missed the fast TLB, as
+/// an index of `Env::miss_kinds`: 0 not aligned to its size (a pair: not
+/// aligned to 8, or in the last 8 bytes of its page), 1 its entry was
+/// empty, 2 its entry held another page. `None`: none of these.
+fn miss_kind(context: *const jit::Context, at: u64, bytes: u8, write: bool) -> Option<usize> {
+    let unaligned = if bytes == 16 {
+        at & 7 != 0 || at & 0xff8 == 0xff8
+    } else {
+        at & (u64::from(bytes) - 1) != 0
+    };
+    if unaligned {
+        return Some(0);
+    }
+    if context.is_null() {
+        return None;
+    }
+    // SAFETY: the context of the run, whose tables compiled code read for
+    // this access; compiled code holds neither while it calls.
+    let entry = unsafe {
+        let table = if write { (*context).writes } else { (*context).reads };
+        *table.add((at >> 12) as usize & (jit::tlb::ENTRIES - 1))
+    };
+    if entry.tag == jit::tlb::EMPTY {
+        Some(1)
+    } else if entry.tag != at & !0xfff {
+        Some(2)
+    } else {
+        None
+    }
+}
 
 /// The thunk of compiled code (3e DESIGN.md J1): it runs the operation
 /// `index` of `block` as the interpreter does. The emitter put every word
@@ -2418,7 +2453,17 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
     };
     match request {
         0 => {}
-        jit::MISS => env.misses += 1,
+        jit::MISS => {
+            env.misses += 1;
+            let at = frame[usize::from(op.a)];
+            let write = matches!(
+                op.code,
+                Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 | Code::StorePair
+            );
+            if let Some(kind) = miss_kind(env.context, at, bytes(), write) {
+                env.miss_kinds[kind] += 1;
+            }
+        }
         jit::WATCHED => {
             // An inlined store into a page whose watch word it found odd
             // after its write: the stamps move, as `store` moves them.
@@ -3104,6 +3149,7 @@ unsafe fn run_chained<M: Memory>(
         side,
         context: std::ptr::null_mut(),
         misses: 0,
+        miss_kinds: [0; 3],
         failed: None,
         stop: None,
         replay,
@@ -3173,6 +3219,9 @@ unsafe fn run_chained<M: Memory>(
     counts.jump_hits += hits;
     counts.tlb_accesses += accesses;
     counts.tlb_misses += env.misses;
+    counts.tlb_miss_unaligned += env.miss_kinds[0];
+    counts.tlb_miss_empty += env.miss_kinds[1];
+    counts.tlb_miss_conflict += env.miss_kinds[2];
     let last = last.cast::<Compiled>();
     // SAFETY: the head of the block that ran last stored it, and it is
     // alive (above). Nothing else refers to it now.
@@ -3613,6 +3662,11 @@ pub struct JitCounts {
     /// makes the rate a little higher than it is.
     pub tlb_accesses: u64,
     pub tlb_misses: u64,
+    /// The misses not aligned to their size, those with an empty entry and
+    /// those whose entry held another page (`miss_kind`).
+    pub tlb_miss_unaligned: u64,
+    pub tlb_miss_empty: u64,
+    pub tlb_miss_conflict: u64,
     pub tlb_fills: u64,
     pub tlb_flushes: u64,
     /// The searches of the write tables for a page that gets code, and the

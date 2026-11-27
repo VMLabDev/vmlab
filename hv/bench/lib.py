@@ -940,6 +940,8 @@ JIT_REPORT = re.compile(
     r"(?:, (?P<clears>\d+) clears of the jump cache)?)?"
     # The fast TLB of card J3, when the line has it.
     r"(?:; fast TLB: (?P<tlb_accesses>\d+) accesses, (?P<tlb_misses>\d+) misses"
+    r"(?: \((?P<tlb_miss_unaligned>\d+) not aligned, (?P<tlb_miss_empty>\d+) empty, "
+    r"(?P<tlb_miss_conflict>\d+) of another page\))?"
     # The flushes of card J12 and what they cost, when the line has them.
     r"(?:, (?P<tlb_flushes>\d+) flushes, (?P<tlb_scans>\d+) scans, (?P<tlb_flush_ms>\d+) ms "
     r"flushing)?)?"
