@@ -671,7 +671,8 @@ mod tests {
                 }
             }
             for value in [1u32, 0x7f, 0x80, 0xffff_ff80, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
-                add(format!("cmp {}, {value}", NAMES32[d]), &|a| {
+                // llvm-mc prints a 32-bit immediate as a signed one.
+                add(format!("cmp {}, {}", NAMES32[d], value as i32), &|a| {
                     a.alu_imm32(Alu::Cmp, Rm::Reg(dst), value)
                 });
             }
@@ -712,10 +713,10 @@ mod tests {
             add(format!("cmp {text32}, 3"), &|a| {
                 a.alu_imm32(Alu::Cmp, *mem, 3)
             });
-            add(format!("cmp {text32}, 4294967295"), &|a| {
+            add(format!("cmp {text32}, -1"), &|a| {
                 a.alu_imm32(Alu::Cmp, *mem, u32::MAX)
             });
-            add(format!("cmp {text32}, 2147483648"), &|a| {
+            add(format!("cmp {text32}, -2147483648"), &|a| {
                 a.alu_imm32(Alu::Cmp, *mem, 0x8000_0000)
             });
             add(format!("call {text}"), &|a| a.call_indirect(*mem));
