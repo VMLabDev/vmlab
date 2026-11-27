@@ -1181,6 +1181,7 @@ impl Parts {
 #[derive(Default)]
 struct Translator {
     block: BlockOf<A64Exit>,
+    spare: crate::lift::builder::Spare,
     prune: dce::PruneBuffers,
     lowering: Lowering,
     parts: Parts,
@@ -4985,6 +4986,7 @@ impl<M: Memory> Cpu<M> {
         // translator keeps (3e DESIGN.md J11).
         let mut builder = Builder::with_block(
             std::mem::take(&mut self.translator.block),
+            std::mem::take(&mut self.translator.spare),
             context,
             pc,
         );
@@ -5067,7 +5069,8 @@ impl<M: Memory> Cpu<M> {
         }
         self.translations += 1;
         self.side.mark_code(phys);
-        let mut block = builder.finish(at);
+        let (mut block, spare) = builder.finish_keeping(at);
+        self.translator.spare = spare;
         let compiled = compile_with(
             phys,
             context,
@@ -5076,6 +5079,7 @@ impl<M: Memory> Cpu<M> {
             &mut self.translator,
             self.block_counts.as_mut(),
         );
+        self.translator.spare.keep(&mut block);
         block.clear();
         self.translator.block = block;
         let mut compiled = compiled.map_err(Refused::Stop)?;
