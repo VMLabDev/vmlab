@@ -100,6 +100,13 @@ class JitReportTests(unittest.TestCase):
         self.assertEqual(report["instructions"], 2000)
         self.assertEqual(report["interpreted_instructions"], 7)
         self.assertEqual(report["compile_ms"], 3)
+        self.assertNotIn("tlb_accesses", report)
+        with tempfile.TemporaryDirectory() as run_dir:
+            with open(Path(run_dir) / "stderr.log", "w") as log:
+                log.write(line.replace("{n}", "3000").replace(
+                    'compiling"', 'compiling; fast TLB: 900 accesses, 12 misses"'))
+            report = lib.last_jit_report(run_dir)
+        self.assertEqual((report["tlb_accesses"], report["tlb_misses"]), (900, 12))
 
 
 if __name__ == "__main__":

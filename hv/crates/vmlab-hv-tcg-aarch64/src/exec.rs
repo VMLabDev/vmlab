@@ -43,6 +43,19 @@
 //! does so only while no CPU holds code of the page, which its watch word
 //! says, and it moves no stamp then.
 //!
+//! With the JIT on, those same two paths fill the fast TLB of compiled code
+//! (3e DESIGN.md H7, `Side::fill_fast`), whose inlined loads and stores of
+//! 1 to 8 bytes reach the host mapping without a call. What H7a asks of an
+//! entry is what the paths above ask of their own hits: a read entry for a
+//! page of RAM with the read permission of the level, a write entry also
+//! for a page with a watch word that is even, which no translated code of
+//! this CPU is in (H11a), and only while no exclusive mark is set. An
+//! unprivileged access, an exclusive one and one of 16 bytes never fill and
+//! never hit. A store through the fast TLB reads the watch word after its
+//! write and tells the memory when it is odd, as a store of the path above
+//! does. The dirty marking of the memory (H7e) is the stamps of card S3:
+//! a write that skips it is one that the path above makes straight too.
+//!
 //! A block is kept under its virtual PC, its context and the physical
 //! address of its code, so a new mapping of the same PC finds no old block.
 //! It also keeps the code stamp of the memory for its bytes
@@ -352,6 +365,10 @@ impl Side {
     /// The page of the physical address holds translated code from now on.
     fn mark_code(&mut self, address: u64) {
         if self.code_set.insert(address >> 12) {
+            // No store of compiled code reaches the page straight (H11a).
+            if let Some(fast) = self.mmu.fast_mut() {
+                fast.drop_writes(address);
+            }
             let (word, bit) = Self::page_bit(address);
             self.code_pages[word] |= bit;
             let count = &mut self.code_counts[(address >> 12) as usize & (CODE_PAGE_BITS - 1)];
@@ -380,6 +397,49 @@ impl Side {
     fn maybe_code(&self, address: u64) -> bool {
         let (word, bit) = Self::page_bit(address);
         self.code_pages[word] & bit != 0
+    }
+
+    /// Whether the page of the physical address holds translated code of
+    /// this CPU, exactly.
+    fn holds_code(&self, address: u64) -> bool {
+        self.maybe_code(address) && self.code_set.contains(&(address >> 12))
+    }
+
+    /// Keep the page of `va`, whose TLB entry is `entry`, in the fast TLB
+    /// of compiled code for the level of the block, when H7a lets it (the
+    /// header). The caller found `entry` with the permission of that level.
+    #[inline]
+    fn fill_fast(&mut self, va: u64, entry: &vmlab_hv_tcg::tlb::Entry, write: bool) {
+        if self.mmu.fast().is_none() || entry.host == 0 {
+            return;
+        }
+        if write
+            && (self.exclusive.is_some()
+                || entry_watch(entry).is_none_or(|watch| watch.load(Ordering::Relaxed) & 1 != 0)
+                || self.holds_code(entry.phys))
+        {
+            return;
+        }
+        let level = usize::from(!self.user);
+        let watch = if write { entry.watch } else { 0 };
+        if let Some(fast) = self.mmu.fast_mut() {
+            fast.fill(level, write, va, entry.host, watch, entry.phys, entry.span);
+        }
+    }
+
+    /// `fill_fast` after an access of the general path, which may have
+    /// filled the TLB with the page of `va`.
+    #[cold]
+    fn fill_fast_after(&mut self, va: u64, bytes: u64, kind: Kind) {
+        if self.mmu.fast().is_none() {
+            return;
+        }
+        if let Some(&entry) = self
+            .mmu
+            .hit_host(va, bytes, mmu::needed(kind, self.user))
+        {
+            self.fill_fast(va, &entry, kind == Kind::Write);
+        }
     }
 
     /// Whether the bytes at `spot` are in a page that holds translated code.
@@ -758,8 +818,10 @@ enum Access16 {
     },
 }
 
-/// The bit of `Op::aux` of a load or a store that is made as EL0.
+/// The bit of `Op::aux` of a load or a store that is made as EL0. Compiled
+/// code makes such an access through the thunk (H7a).
 const UNPRIVILEGED: u8 = 0x80;
+const _: () = assert!(UNPRIVILEGED == jit::emit::THUNK_ACCESS);
 
 /// Where a block can leave before its end.
 #[derive(Clone, Debug)]
@@ -851,6 +913,12 @@ struct Compiled {
     /// The compiled code of the block, when the JIT is on (3e DESIGN.md
     /// J1). Code of an older generation of the region is none.
     code: Option<jit::Entry>,
+    /// How the compiled code reaches memory (H7): the code is compiled
+    /// again when the CPU starts or stops keeping its accesses.
+    code_memory: jit::Memory,
+    /// The loads and stores that the compiled code makes inline, for the
+    /// hit rate of the fast TLB.
+    inline_accesses: u32,
     /// The emitter has no form for an operation of the block on this host:
     /// it runs in the interpreter (H2b).
     refused: bool,
@@ -1279,6 +1347,8 @@ fn compile(
         terminal,
         next: next_pc,
         code: None,
+        code_memory: jit::Memory::Thunk,
+        inline_accesses: 0,
         refused: false,
     })
 }
@@ -1363,13 +1433,17 @@ fn load<M: Memory, const N: usize>(
     let need = mmu::needed(Kind::Read, user);
     // The common case: the TLB holds the page with the permission and its
     // host address, and nothing keeps the accesses.
+    let privileged = op.aux & UNPRIVILEGED == 0;
     if side.log.is_none() {
-        if let Some(entry) = side.mmu.hit_host(at, N as u64, need) {
+        if let Some(&entry) = side.mmu.hit_host(at, N as u64, need) {
             // SAFETY: `hit_host` found the access inside the page, whose
             // host mapping lives while the memory names it (`sync_memory`).
             let value = unsafe { host_load::<N>(entry.host + (at & 0xfff) as usize) };
             // SAFETY: as above.
             unsafe { block::set_word(frame, usize::from(op.dst), value) };
+            if privileged && side.mmu.fast().is_some() {
+                side.fill_fast(at, &entry, false);
+            }
             return Ok(());
         }
         // A page that the memory serves itself. A read that fails has
@@ -1386,6 +1460,9 @@ fn load<M: Memory, const N: usize>(
     match side.load(memory, at, N as u8, false, user) {
         Ok(value) => {
             frame[usize::from(op.dst)] = value as u64;
+            if privileged && side.mmu.fast().is_some() {
+                side.fill_fast_after(at, N as u64, Kind::Read);
+            }
             Ok(())
         }
         Err(fault) => Err((op.imm as u32, Failed::Access(fault, false))),
@@ -1409,7 +1486,8 @@ fn store<M: Memory, const N: usize>(
         )
     };
     let exit = op.imm as u32;
-    let user = side.user || op.aux & UNPRIVILEGED != 0;
+    let privileged = op.aux & UNPRIVILEGED == 0;
+    let user = side.user || !privileged;
     let need = mmu::needed(Kind::Write, user);
     // The common case: the TLB holds the page with the permission, the page
     // holds no translated code, there is no exclusive mark to carry over
@@ -1434,6 +1512,8 @@ fn store<M: Memory, const N: usize>(
             if watch.load(Ordering::Relaxed) & 1 != 0 {
                 memory.wrote_straight(entry.phys | offset, N);
                 side.own_writes += 1;
+            } else if privileged && side.mmu.fast().is_some() {
+                side.fill_fast(at, &entry, true);
             }
             return Ok(());
         }
@@ -1449,7 +1529,11 @@ fn store<M: Memory, const N: usize>(
     }
     let value = u128::from(value) & bits_mask(N as u8);
     side.store(memory, at, N as u8, value, user, single)
-        .map_err(|refused| (exit, Failed::store(refused)))
+        .map_err(|refused| (exit, Failed::store(refused)))?;
+    if privileged && side.mmu.fast().is_some() {
+        side.fill_fast_after(at, N as u64, Kind::Write);
+    }
+    Ok(())
 }
 
 impl Compiled {
@@ -1739,6 +1823,11 @@ struct Env<'a, M> {
     memory: &'a mut M,
     side: &'a mut Side,
     single: bool,
+    /// The context of the compiled code, whose write table the thunk takes
+    /// away when an exclusive load sets a mark.
+    context: *mut jit::Context,
+    /// The inlined loads and stores that missed the fast TLB.
+    misses: u64,
     /// Why the block left, when an effect did not complete.
     failed: Option<(u32, Failed)>,
     stop: Option<Stop>,
@@ -1759,10 +1848,52 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
     // SAFETY: the caller's promise. Compiled code holds no reference into
     // the environment while it calls.
     let env = unsafe { &mut *env.cast::<Env<M>>() };
-    let op = &env.ops[index as usize];
+    let request = index & !u64::from(u32::MAX);
+    let op = &env.ops[(index & u64::from(u32::MAX)) as usize];
     // SAFETY: the frame of the block, which nothing else touches while the
     // thunk runs.
     let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
+    match request {
+        0 => {}
+        jit::MISS => env.misses += 1,
+        jit::WATCHED => {
+            // An inlined store into a page whose watch word it found odd
+            // after its write: the stamps move, as `store` moves them.
+            let at = frame[usize::from(op.a)];
+            let bytes = op.aux & !UNPRIVILEGED;
+            let level = usize::from(!env.side.user);
+            if let Some(entry) = env
+                .side
+                .mmu
+                .fast()
+                .and_then(|fast| fast.lookup(level, true, at, bytes))
+            {
+                env.memory
+                    .wrote_straight(entry.phys | (at & 0xfff), usize::from(bytes));
+                env.side.own_writes += 1;
+            }
+            return 0;
+        }
+        jit::LOGGED => {
+            // A hit of a block compiled for a CPU that keeps its accesses.
+            let bytes = op.aux & !UNPRIVILEGED;
+            let write = op.code as u8 >= Code::Store1 as u8 && op.code as u8 <= Code::Store8 as u8;
+            let value = frame[usize::from(if write { op.b } else { op.dst })];
+            if let Some(log) = &mut env.side.log {
+                log.push(Access {
+                    address: frame[usize::from(op.a)],
+                    bytes,
+                    value: u128::from(value) & bits_mask(bytes),
+                    write,
+                });
+            }
+            return 0;
+        }
+        _ => {
+            env.stop = Some(host("compiled code asked the thunk for nothing it knows"));
+            return THUNK_LEFT;
+        }
+    }
     if (op.code as u8) < FIRST_EFFECT {
         // SAFETY: `compile` checked every operation against the frame and
         // the generic operations of the block.
@@ -1775,7 +1906,7 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
     // SAFETY: the state of the CPU, which compiled code does not touch
     // while it calls.
     let state = unsafe { &mut *env.state };
-    match Compiled::effect(
+    let done = Compiled::effect(
         op,
         frame,
         env.accesses,
@@ -1785,7 +1916,15 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
         env.memory,
         env.side,
         env.single,
-    ) {
+    );
+    // A store with a mark set must carry it (`Side::store`), so the
+    // compiled code writes through the thunk until the block ends.
+    if env.side.exclusive.is_some() {
+        // SAFETY: the context of the code that called, which reads its
+        // tables again at each access.
+        unsafe { (*env.context).writes = jit::tlb::EMPTY_TABLE.as_ptr() };
+    }
+    match done {
         Ok(()) => 0,
         Err(failed) => {
             env.failed = Some(failed);
@@ -1800,8 +1939,9 @@ fn place_words(place: Place) -> impl Iterator<Item = Slot> {
 }
 
 impl Compiled {
-    /// Compile the block, or mark it as one that the emitter refuses.
-    fn compile_code(&mut self, jit: &mut jit::Jit) {
+    /// Compile the block, with its loads and stores reaching memory as
+    /// `memory` says, or mark it as one that the emitter refuses.
+    fn compile_code(&mut self, jit: &mut jit::Jit, memory: jit::Memory) {
         let leaves: Vec<Vec<Slot>> = self
             .leaves
             .iter()
@@ -1870,6 +2010,28 @@ impl Compiled {
             inputs: &self.inputs,
             outputs: &outputs,
             instructions: self.instructions,
+            memory,
+        };
+        self.code_memory = memory;
+        self.inline_accesses = if memory == jit::Memory::Thunk {
+            0
+        } else {
+            self.ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op.code,
+                        Code::Load1
+                            | Code::Load2
+                            | Code::Load4
+                            | Code::Load8
+                            | Code::Store1
+                            | Code::Store2
+                            | Code::Store4
+                            | Code::Store8
+                    ) && op.aux & UNPRIVILEGED == 0
+                })
+                .count() as u32
         };
         match jit.compile(&shape) {
             Ok(entry) => self.code = Some(entry),
@@ -1882,6 +2044,7 @@ impl Compiled {
 
     /// Run the compiled code of the block. `None`: the budget did not hold
     /// the block, and nothing ran.
+    #[allow(clippy::too_many_arguments)]
     fn run_code<M: Memory>(
         &mut self,
         entry: &jit::Entry,
@@ -1890,11 +2053,27 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
         budget: u64,
+        counts: &mut JitCounts,
     ) -> Option<(u32, Option<Halt>)> {
         let pc = state.pc();
         side.user = self.context.el == 0;
         let state_pointer: *mut State = state;
         let frame = self.frame.as_mut_ptr();
+        // The tables of the level of the block (H7). None hits while the CPU
+        // keeps no fast TLB, and no store while an exclusive mark is set.
+        let empty = jit::tlb::EMPTY_TABLE.as_ptr();
+        let level = usize::from(self.context.el != 0);
+        let (reads, writes) = match side.mmu.fast() {
+            Some(fast) if self.code_memory != jit::Memory::Thunk => (
+                fast.table(level, false),
+                if side.exclusive.is_some() {
+                    empty
+                } else {
+                    fast.table(level, true)
+                },
+            ),
+            _ => (empty, empty),
+        };
         let mut env = Env {
             ops: &self.ops,
             generics: &self.generics,
@@ -1907,6 +2086,8 @@ impl Compiled {
             memory,
             side,
             single: self.instructions == 1,
+            context: std::ptr::null_mut(),
+            misses: 0,
             failed: None,
             stop: None,
         };
@@ -1914,7 +2095,10 @@ impl Compiled {
             budget: budget.min(i64::MAX as u64) as i64,
             thunk: thunk::<M>,
             env: (&raw mut env).cast(),
+            reads,
+            writes,
         };
+        env.context = &raw mut context;
         // SAFETY: `entry` is current and was compiled from this block, whose
         // frame and register slots are as large as its shape names. While
         // the code runs, only it and the thunk touch the frame and the
@@ -1929,8 +2113,10 @@ impl Compiled {
         };
         let failed = env.failed.take();
         let stop = env.stop.take();
+        counts.tlb_misses += env.misses;
         match code {
             jit::DONE => {
+                counts.tlb_accesses += u64::from(self.inline_accesses);
                 if let Some((_, true)) = self.next {
                     state.set_pc(pc.wrapping_add(state.pc()));
                 }
@@ -1972,6 +2158,16 @@ pub struct JitCounts {
     pub bytes: u64,
     pub resets: u64,
     pub compile_ns: u64,
+    /// The fast TLB (H7): the inlined loads and stores of the compiled
+    /// blocks that ran to their end, those that missed, of every block,
+    /// and the fills and the flushes of everything. The hit rate is one
+    /// less the misses over the accesses: a block that leaves before its
+    /// end counts its misses and not its accesses, which makes the rate a
+    /// little lower than it is.
+    pub tlb_accesses: u64,
+    pub tlb_misses: u64,
+    pub tlb_fills: u64,
+    pub tlb_flushes: u64,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -1988,11 +2184,24 @@ fn execute<M: Memory>(
     let Some(jit) = jit.as_mut() else {
         return block.run(state, memory, side);
     };
-    if !block.refused && !block.code.is_some_and(|entry| jit.current(&entry)) {
-        block.compile_code(jit);
+    // Inline over the fast TLB, and with every hit kept while the CPU keeps
+    // its accesses (H7, K1).
+    let wanted = if side.mmu.fast().is_none() {
+        jit::Memory::Thunk
+    } else if side.log.is_some() {
+        jit::Memory::Logged
+    } else {
+        jit::Memory::Inline
+    };
+    if !block.refused
+        && !block
+            .code
+            .is_some_and(|entry| jit.current(&entry) && block.code_memory == wanted)
+    {
+        block.compile_code(jit, wanted);
     }
     if let Some(entry) = block.code
-        && let Some(done) = block.run_code(&entry, jit, state, memory, side, budget)
+        && let Some(done) = block.run_code(&entry, jit, state, memory, side, budget, counts)
     {
         counts.compiled_runs += 1;
         counts.compiled_instructions += u64::from(done.0);
@@ -2228,6 +2437,7 @@ impl<M: Memory> Cpu<M> {
             return Ok(());
         }
         self.jit = if on { Some(jit::Jit::new()?) } else { None };
+        self.side.mmu.set_fast(on);
         Ok(())
     }
 
@@ -2244,6 +2454,10 @@ impl<M: Memory> Cpu<M> {
             counts.bytes = jit.stats.bytes;
             counts.resets = jit.stats.resets;
             counts.compile_ns = jit.stats.compile_ns;
+        }
+        if let Some(fast) = self.side.mmu.fast() {
+            counts.tlb_fills = fast.fills;
+            counts.tlb_flushes = fast.flushes;
         }
         counts
     }
@@ -2265,6 +2479,11 @@ impl<M: Memory> Cpu<M> {
     /// The count of translations that the TLB of the CPU holds.
     pub fn tlb_entries(&self) -> usize {
         self.side.mmu.entries()
+    }
+
+    /// The fast TLB of compiled code (3e DESIGN.md H7), while the JIT is on.
+    pub fn fast_tlb(&self) -> Option<&jit::tlb::FastTlb> {
+        self.side.mmu.fast()
     }
 
     /// Keep the loads and stores of the CPU from now on, or stop keeping
@@ -2301,6 +2520,7 @@ impl<M: Memory> Cpu<M> {
         let log = self.side.log.take();
         self.side = Side::new(&self.state);
         self.side.log = log;
+        self.side.mmu.set_fast(self.jit.is_some());
         self.blocks = Cache::new();
         self.singles = Cache::new();
         self.generation = self.memory.generation();

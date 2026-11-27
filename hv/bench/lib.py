@@ -896,7 +896,8 @@ JIT_REPORT = re.compile(
     r"JIT: (?P<instructions>\d+) instructions, (?P<interpreted_instructions>\d+) of them in the "
     r"interpreter in (?P<interpreted_blocks>\d+) blocks; (?P<compiled_blocks>\d+) blocks compiled, "
     r"(?P<refused_blocks>\d+) refused, (?P<code_bytes>\d+) bytes of code, (?P<resets>\d+) resets "
-    r"of the region, (?P<compile_ms>\d+) ms of compiling")
+    r"of the region, (?P<compile_ms>\d+) ms of compiling"
+    r"(?:; fast TLB: (?P<tlb_accesses>\d+) accesses, (?P<tlb_misses>\d+) misses)?")
 
 
 def last_jit_report(run_dir):
@@ -908,7 +909,8 @@ def last_jit_report(run_dir):
             for line in log_file:
                 match = JIT_REPORT.search(line)
                 if match:
-                    last = {key: int(value) for key, value in match.groupdict().items()}
+                    last = {key: int(value) for key, value in match.groupdict().items()
+                            if value is not None}
     except OSError:
         return None
     return last

@@ -251,6 +251,10 @@ def run_interpreter_backend(args, commit, dirty, host, log, pin):
         noise["jit"] = bool(raw[0].get("jit"))
         noise["interpreted_blocks"] = raw[0].get("interpreted_blocks", 0)
         noise["interpreted_instructions"] = raw[0].get("interpreted_instructions", 0)
+        # The fast TLB of the JIT (3e DESIGN.md H7): its hit rate.
+        if "tlb_accesses" in raw[0]:
+            noise["tlb_accesses"] = raw[0]["tlb_accesses"]
+            noise["tlb_misses"] = raw[0]["tlb_misses"]
         noise["loadavg_end"] = lib.read_loadavg()
         rec = record(args.backend, name, commit, dirty, host, samples, mips, noise, raw)
         rec["qemu_baseline"] = lib.latest_baseline(lib.read_history("aarch64"), "aarch64",

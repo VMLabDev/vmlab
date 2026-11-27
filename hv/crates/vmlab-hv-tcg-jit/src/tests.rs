@@ -1,9 +1,57 @@
 //! The emitter against the interpreter of the block form: every inline
 //! form on random operands, and random blocks long enough to spill, with
-//! thunk calls and guards between the operations.
+//! thunk calls, guards, and loads and stores over the fast TLB between the
+//! operations.
 
 use super::*;
+use std::sync::atomic::AtomicU32;
+use tlb::FastTlb;
 use vmlab_hv_tcg_ir::block::{Code, Op, Place, Slot, op_in_frame, step_unchecked};
+
+/// The guest memory of the tests: `PAGES` pages at the virtual address
+/// `RAM`. The page `WATCHED_PAGE` has an odd watch word.
+const RAM: u64 = 0x7000_0000;
+const PAGES: usize = 4;
+const WATCHED_PAGE: usize = 2;
+
+/// Where an access of `bytes` at `va` is in the memory of the tests, when it
+/// is there.
+fn offset_of(va: u64, bytes: u8) -> Option<usize> {
+    let offset = va.checked_sub(RAM)?;
+    (offset + u64::from(bytes) <= (PAGES * 4096) as u64).then_some(offset as usize)
+}
+
+fn access_size(code: Code) -> Option<(u8, bool)> {
+    Some(match code {
+        Code::Load1 => (1, false),
+        Code::Load2 => (2, false),
+        Code::Load4 => (4, false),
+        Code::Load8 => (8, false),
+        Code::Store1 => (1, true),
+        Code::Store2 => (2, true),
+        Code::Store4 => (4, true),
+        Code::Store8 => (8, true),
+        _ => return None,
+    })
+}
+
+/// A load or a store of the tests on `ram`. `false`: the address is outside
+/// it, and the access leaves the block.
+fn access(op: &Op, frame: &mut [u64], ram: &mut [u8]) -> bool {
+    let (bytes, store) = access_size(op.code).expect("an access");
+    let Some(offset) = offset_of(frame[usize::from(op.a)], bytes) else {
+        return false;
+    };
+    let part = &mut ram[offset..offset + usize::from(bytes)];
+    if store {
+        part.copy_from_slice(&frame[usize::from(op.b)].to_le_bytes()[..usize::from(bytes)]);
+    } else {
+        let mut value = [0u8; 8];
+        value[..usize::from(bytes)].copy_from_slice(part);
+        frame[usize::from(op.dst)] = u64::from_le_bytes(value);
+    }
+    true
+}
 
 /// xorshift64, so that a failure repeats.
 struct Random(u64);
@@ -102,15 +150,25 @@ fn operation(random: &mut Random, code: Code, dst: Slot, a: Slot, b: Slot, c: Sl
     }
 }
 
-/// The environment of the test thunk: the block and its frame.
+/// The environment of the test thunk: the block and its frame, and the
+/// memory with its fast TLB.
 struct Env {
     ops: Vec<Op>,
     frame: *mut u64,
     words: usize,
     calls: Vec<Effect>,
     thunk_calls: u64,
-    /// The guard that left the block.
+    /// The guard or the access that left the block.
     left_at: Option<usize>,
+    ram: *mut u8,
+    tlb: Box<FastTlb>,
+    watch: Vec<AtomicU32>,
+    /// A miss fills the TLB.
+    fill: bool,
+    misses: u64,
+    watched: u64,
+    /// The accesses that hits asked to keep: address, size, value, store.
+    logged: Vec<(u64, u8, u64, bool)>,
 }
 
 /// A helper call of the test: the first word that it writes gets a mix of
@@ -136,7 +194,52 @@ unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64) -> u64 {
     env.thunk_calls += 1;
     // SAFETY: the frame of the test, as long as its `words`.
     let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
+    let request = index & !0xffff_ffff;
+    let index = index & 0xffff_ffff;
     let op = env.ops[index as usize];
+    // SAFETY: the memory of the test, `PAGES` pages.
+    let ram = unsafe { std::slice::from_raw_parts_mut(env.ram, PAGES * 4096) };
+    if let Some((bytes, store)) = access_size(op.code) {
+        let va = frame[usize::from(op.a)];
+        match request {
+            WATCHED => {
+                assert!(store);
+                assert_eq!(offset_of(va, bytes).map(|at| at / 4096), Some(WATCHED_PAGE));
+                env.watched += 1;
+                return 0;
+            }
+            LOGGED => {
+                let value = if store {
+                    frame[usize::from(op.b)]
+                } else {
+                    frame[usize::from(op.dst)]
+                };
+                let mask = u64::MAX >> (64 - 8 * u32::from(bytes));
+                env.logged.push((va, bytes, value & mask, store));
+                return 0;
+            }
+            MISS => env.misses += 1,
+            0 => {}
+            _ => panic!("a request {request:#x} of an access"),
+        }
+        if !access(&op, frame, ram) {
+            env.left_at = Some(index as usize);
+            return LEFT;
+        }
+        if env.fill {
+            let page = offset_of(va, bytes).expect("the access was made") / 4096;
+            let watch = if store {
+                &env.watch[page] as *const AtomicU32 as usize
+            } else {
+                0
+            };
+            let host = env.ram as usize + page * 4096;
+            env.tlb
+                .fill(1, store, va, host, watch, page as u64 * 4096, 12);
+        }
+        return 0;
+    }
+    assert_eq!(request, 0);
     match op.code {
         Code::Guard => {
             if (frame[usize::from(op.a)] != 0) != (op.aux != 0) {
@@ -167,16 +270,27 @@ struct Block {
     leaves: Vec<Vec<Slot>>,
     inputs: Vec<(Place, u32)>,
     outputs: Vec<(u32, Place)>,
+    memory: Memory,
 }
 
-/// The block in the interpreter: the slots after it, and the leave and
-/// the words of the frame that it names when it left through one.
-fn interpret(block: &Block, slots: &mut [u128]) -> (u64, Vec<u64>) {
+/// The block in the interpreter, on `ram`: the slots after it, and the
+/// leave and the words of the frame that it names when it left through one.
+fn interpret(block: &Block, slots: &mut [u128], ram: &mut [u8]) -> (u64, Vec<u64>) {
     let mut frame = block.frame.clone();
     for (place, register) in &block.inputs {
         place.write(&mut frame, slots[*register as usize]);
     }
     for op in &block.ops {
+        if access_size(op.code).is_some() {
+            if !access(op, &mut frame, ram) {
+                let words = block.leaves[op.imm as usize]
+                    .iter()
+                    .map(|word| frame[usize::from(*word)])
+                    .collect();
+                return (LEFT, words);
+            }
+            continue;
+        }
         match op.code {
             Code::Guard => {
                 if (frame[usize::from(op.a)] != 0) != (op.aux != 0) {
@@ -201,7 +315,32 @@ fn interpret(block: &Block, slots: &mut [u128]) -> (u64, Vec<u64>) {
     (DONE, Vec::new())
 }
 
+/// What a compiled run did beside its slots.
+struct Ran {
+    code: u64,
+    words: Vec<u64>,
+    thunk_calls: u64,
+    misses: u64,
+    watched: u64,
+    logged: Vec<(u64, u8, u64, bool)>,
+}
+
 fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u64, Vec<u64>, u64) {
+    let mut ram = vec![0u8; PAGES * 4096];
+    let ran = compiled_on(jit, block, slots, budget, &mut ram, None);
+    (ran.code, ran.words, ran.thunk_calls)
+}
+
+/// Run `block` compiled on `ram`, with the fast TLB `tlb`, which a miss
+/// fills, or with an empty one that stays empty.
+fn compiled_on(
+    jit: &mut Jit,
+    block: &Block,
+    slots: &mut [u128],
+    budget: i64,
+    ram: &mut [u8],
+    tlb: Option<Box<FastTlb>>,
+) -> Ran {
     let shape = Shape {
         ops: &block.ops,
         generics: &[],
@@ -212,9 +351,11 @@ fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u
         inputs: &block.inputs,
         outputs: &block.outputs,
         instructions: 1,
+        memory: block.memory,
     };
     let entry = jit.compile(&shape).expect("a block that the emitter takes");
     let mut frame = block.frame.clone();
+    let fill = tlb.is_some();
     let mut env = Env {
         ops: block.ops.clone(),
         frame: frame.as_mut_ptr(),
@@ -222,14 +363,27 @@ fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u
         calls: block.calls.clone(),
         thunk_calls: 0,
         left_at: None,
+        ram: ram.as_mut_ptr(),
+        tlb: tlb.unwrap_or_else(FastTlb::new),
+        watch: (0..PAGES)
+            .map(|page| AtomicU32::new(u32::from(page == WATCHED_PAGE)))
+            .collect(),
+        fill,
+        misses: 0,
+        watched: 0,
+        logged: Vec::new(),
     };
+    let reads = env.tlb.table(1, false);
+    let writes = env.tlb.table(1, true);
     let mut context = Context {
         budget,
         thunk,
         env: (&raw mut env).cast(),
+        reads,
+        writes,
     };
     // SAFETY: the entry was just compiled from this block, and the slots
-    // and the frame are as large as it names.
+    // and the frame are as large as it names. The tables live in `env`.
     let code = unsafe { jit.enter(&entry, &mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
     let mut words = Vec::new();
     if code == LEFT {
@@ -239,7 +393,14 @@ fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u
             .map(|word| frame[usize::from(*word)])
             .collect();
     }
-    (code, words, env.thunk_calls)
+    Ran {
+        code,
+        words,
+        thunk_calls: env.thunk_calls,
+        misses: env.misses,
+        watched: env.watched,
+        logged: env.logged,
+    }
 }
 
 #[test]
@@ -291,6 +452,7 @@ fn every_inline_form_computes_what_the_interpreter_computes() {
                         wide: false,
                     },
                 )],
+                memory: Memory::Thunk,
             };
             let mut slots = [0u128; 4];
             for slot in &mut slots {
@@ -298,7 +460,7 @@ fn every_inline_form_computes_what_the_interpreter_computes() {
             }
             // A slot holds a value of one word.
             let mut expected = slots;
-            interpret(&block, &mut expected);
+            interpret(&block, &mut expected, &mut []);
             let mut got = slots;
             compiled(&mut jit, &block, &mut got, 100);
             assert_eq!(
@@ -315,6 +477,24 @@ fn every_inline_form_computes_what_the_interpreter_computes() {
 /// results before them, with helper calls and guards, and outputs of the
 /// last results and of some inputs.
 fn random_block(random: &mut Random, count: usize) -> Block {
+    random_block_with(random, count, Memory::Thunk)
+}
+
+/// An address for an access of `bytes` of the tests: mostly aligned and in
+/// the memory, sometimes not aligned, sometimes across a page, sometimes
+/// outside.
+fn address(random: &mut Random, bytes: u8) -> u64 {
+    let page = RAM + 4096 * random.below(PAGES as u64);
+    match random.below(16) {
+        0 => page + 4096 - u64::from(bytes) / 2 - 1 + u64::from(bytes == 1),
+        1 => page + random.below(4096 - u64::from(bytes)),
+        2 => RAM - 4096 + random.below(4096),
+        3 => RAM + (PAGES * 4096) as u64 - u64::from(bytes) / 2,
+        _ => page + random.below(4096 / u64::from(bytes)) * u64::from(bytes),
+    }
+}
+
+fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block {
     let inputs = 1 + random.below(12) as u16;
     let constants = 1 + random.below(6) as u16;
     let mut frame = vec![0u64; usize::from(1 + inputs + constants)];
@@ -337,7 +517,46 @@ fn random_block(random: &mut Random, count: usize) -> Block {
             }
         };
         let dst = frame.len() as Slot;
-        match random.below(12) {
+        match random.below(if memory == Memory::Thunk { 12 } else { 16 }) {
+            12..=15 => {
+                // A load or a store at an address of a constant word, with
+                // a leave like a guard's.
+                let bytes = [1u8, 2, 4, 8][random.below(4) as usize];
+                let store = random.below(2) == 0;
+                let at = frame.len() as Slot;
+                frame.push(address(random, bytes));
+                let leave: Vec<Slot> = (0..random.below(5))
+                    .map(|_| any(random, &defined))
+                    .collect();
+                let code = match (bytes, store) {
+                    (1, false) => Code::Load1,
+                    (2, false) => Code::Load2,
+                    (4, false) => Code::Load4,
+                    (8, false) => Code::Load8,
+                    (1, true) => Code::Store1,
+                    (2, true) => Code::Store2,
+                    (4, true) => Code::Store4,
+                    _ => Code::Store8,
+                };
+                let (dst, b) = if store {
+                    (0, any(random, &defined))
+                } else {
+                    frame.push(0);
+                    (at + 1, 0)
+                };
+                ops.push(Op {
+                    code,
+                    aux: bytes,
+                    dst,
+                    a: at,
+                    b,
+                    imm: leaves.len() as u64,
+                });
+                leaves.push(leave);
+                if !store {
+                    defined.push(dst);
+                }
+            }
             0 => {
                 let reads: Vec<Slot> = (0..random.below(4))
                     .map(|_| any(random, &defined))
@@ -411,6 +630,7 @@ fn random_block(random: &mut Random, count: usize) -> Block {
             })
             .collect(),
         outputs,
+        memory,
     }
 }
 
@@ -427,7 +647,7 @@ fn random_blocks_spill_call_and_leave_as_the_interpreter_does() {
             *slot = u128::from(random.value());
         }
         let mut expected = slots;
-        let (code, words) = interpret(&block, &mut expected);
+        let (code, words) = interpret(&block, &mut expected, &mut []);
         let mut got = slots;
         let (got_code, got_words, _) = compiled(&mut jit, &block, &mut got, 100);
         assert_eq!(got_code, code, "round {round}");
@@ -504,6 +724,7 @@ fn a_form_that_the_host_lacks_is_refused() {
         inputs: &inputs,
         outputs: &outputs,
         instructions: 1,
+        memory: Memory::Thunk,
     };
     assert_eq!(jit.compile(&shape), Err(Refused::Form(Code::PopCount)));
     let rbit = Op {
@@ -534,6 +755,7 @@ fn a_full_region_starts_a_new_generation() {
             inputs: &block.inputs,
             outputs: &block.outputs,
             instructions: 1,
+            memory: Memory::Thunk,
         };
         let entry = jit.compile(&shape).expect("a block");
         let first = *first.get_or_insert(entry);
@@ -543,4 +765,295 @@ fn a_full_region_starts_a_new_generation() {
         }
     }
     panic!("the region never filled");
+}
+
+/// The memory of the tests with a pattern in it.
+fn pattern(random: &mut Random) -> Vec<u8> {
+    (0..PAGES * 4096).map(|_| random.next() as u8).collect()
+}
+
+#[test]
+fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
+    let mut jit = Jit::with_capacity(16 << 20).expect("a code region");
+    let mut random = Random(0x3e_0003);
+    let (mut hits, mut misses, mut watched, mut left) = (0u64, 0u64, 0u64, 0);
+    for round in 0..3000 {
+        let count = 1 + random.below(if round % 10 == 0 { 300 } else { 60 }) as usize;
+        let memory = if round % 4 == 0 {
+            Memory::Logged
+        } else {
+            Memory::Inline
+        };
+        let block = random_block_with(&mut random, count, memory);
+        let accesses = block
+            .ops
+            .iter()
+            .filter(|op| access_size(op.code).is_some())
+            .count() as u64;
+        let mut slots = [0u128; 16];
+        for slot in &mut slots {
+            *slot = u128::from(random.value());
+        }
+        let ram = pattern(&mut random);
+        let mut expected = slots;
+        let mut expected_ram = ram.clone();
+        let (code, words) = interpret(&block, &mut expected, &mut expected_ram);
+        let mut got = slots;
+        let mut got_ram = ram.clone();
+        // Some rounds start with every page in the read table. The write
+        // entries need the watch words of the run, so a miss fills them.
+        let mut tlb = FastTlb::new();
+        if round % 3 != 0 {
+            for page in 0..PAGES {
+                let host = got_ram.as_ptr() as usize + page * 4096;
+                let va = RAM + page as u64 * 4096;
+                tlb.fill(1, false, va, host, 0, page as u64 * 4096, 12);
+            }
+        }
+        let ran = compiled_on(&mut jit, &block, &mut got, 100, &mut got_ram, Some(tlb));
+        assert_eq!(ran.code, code, "round {round}");
+        assert!(got_ram == expected_ram, "round {round}: the memories differ");
+        if code == DONE {
+            assert_eq!(got, expected, "round {round}");
+        } else {
+            left += 1;
+            assert_eq!(got, slots, "round {round}");
+            assert_eq!(ran.words, words, "round {round}");
+        }
+        if memory == Memory::Logged {
+            // Every hit kept its access, in order, and a miss none: the
+            // owner keeps those itself.
+            assert!(ran.logged.len() as u64 <= accesses);
+        }
+        misses += ran.misses;
+        hits += ran.logged.len() as u64;
+        watched += ran.watched;
+    }
+    assert!(left > 100, "{left} blocks left");
+    assert!(misses > 1000 && hits > 1000, "{misses} misses, {hits} logged hits");
+    assert!(watched > 100, "{watched} stores into the watched page");
+}
+
+/// One block of `ops` over the constant words `frame`, with leaves of no
+/// words, that writes the word `result` to the slot 0.
+fn access_block(ops: Vec<Op>, frame: Vec<u64>, result: Slot, memory: Memory) -> Block {
+    let leaves = vec![Vec::new(); ops.len()];
+    Block {
+        ops,
+        frame,
+        calls: Vec::new(),
+        leaves,
+        inputs: Vec::new(),
+        outputs: vec![(
+            0,
+            Place {
+                slot: result,
+                wide: false,
+            },
+        )],
+        memory,
+    }
+}
+
+#[test]
+fn a_hit_asks_nothing_and_a_miss_fills_the_tlb_for_the_next_run() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    // Load8 [RAM + 8] into word 2, Store4 of word 3 at [RAM + 0x1004].
+    let ops = vec![
+        Op {
+            code: Code::Load8,
+            aux: 8,
+            dst: 2,
+            a: 1,
+            b: 0,
+            imm: 0,
+        },
+        Op {
+            code: Code::Store4,
+            aux: 4,
+            dst: 0,
+            a: 4,
+            b: 3,
+            imm: 1,
+        },
+    ];
+    let frame = vec![0, RAM + 8, 0, 0xaabb_ccdd_eeff_1122, RAM + 0x1004];
+    let block = access_block(ops, frame, 2, Memory::Inline);
+    let mut random = Random(9);
+    let mut ram = pattern(&mut random);
+    let want = u64::from_le_bytes(ram[8..16].try_into().expect("eight bytes"));
+    // An empty TLB: both miss.
+    let mut slots = [0u128; 1];
+    let ran = compiled_on(&mut jit, &block, &mut slots, 10, &mut ram, Some(FastTlb::new()));
+    assert_eq!((ran.code, ran.misses, ran.thunk_calls), (DONE, 2, 2));
+    assert_eq!(slots[0], u128::from(want));
+    assert_eq!(&ram[0x1004..0x1008], &0xeeff_1122u32.to_le_bytes());
+    // A TLB that holds both pages: no call at all.
+    let mut tlb = FastTlb::new();
+    let watch = AtomicU32::new(0);
+    let host = ram.as_ptr() as usize;
+    tlb.fill(1, false, RAM, host, 0, 0, 12);
+    tlb.fill(1, true, RAM + 0x1000, host + 0x1000, &watch as *const _ as usize, 0x1000, 12);
+    ram[8] ^= 0xff;
+    let mut slots = [0u128; 1];
+    let shape = Shape {
+        ops: &block.ops,
+        generics: &[],
+        frame: &block.frame,
+        accesses: &[],
+        calls: &[],
+        leaves: &block.leaves,
+        inputs: &[],
+        outputs: &block.outputs,
+        instructions: 1,
+        memory: Memory::Inline,
+    };
+    let entry = jit.compile(&shape).expect("a block");
+    let mut code_frame = block.frame.clone();
+    let mut env = Env {
+        ops: block.ops.clone(),
+        frame: code_frame.as_mut_ptr(),
+        words: code_frame.len(),
+        calls: Vec::new(),
+        thunk_calls: 0,
+        left_at: None,
+        ram: ram.as_mut_ptr(),
+        tlb: FastTlb::new(),
+        watch: Vec::new(),
+        fill: false,
+        misses: 0,
+        watched: 0,
+        logged: Vec::new(),
+    };
+    let mut context = Context {
+        budget: 10,
+        thunk,
+        env: (&raw mut env).cast(),
+        reads: tlb.table(1, false),
+        writes: tlb.table(1, true),
+    };
+    ram[0x1004..0x1008].fill(0);
+    // SAFETY: as in `compiled_on`, with the tables of `tlb`, which outlives
+    // the run.
+    let code = unsafe {
+        jit.enter(
+            &entry,
+            &mut context,
+            slots.as_mut_ptr(),
+            code_frame.as_mut_ptr(),
+        )
+    };
+    assert_eq!((code, env.thunk_calls), (DONE, 0));
+    assert_eq!(slots[0], u128::from(want ^ 0xff));
+    assert_eq!(&ram[0x1004..0x1008], &0xeeff_1122u32.to_le_bytes());
+    // The same with the write table of nothing: the store misses alone.
+    context.writes = tlb::EMPTY_TABLE.as_ptr();
+    context.budget = 10;
+    // SAFETY: as above.
+    let code = unsafe {
+        jit.enter(
+            &entry,
+            &mut context,
+            slots.as_mut_ptr(),
+            code_frame.as_mut_ptr(),
+        )
+    };
+    assert_eq!((code, env.thunk_calls, env.misses), (DONE, 1, 1));
+    // An access that is not aligned misses also in a page that the TLB
+    // holds, and one outside the memory leaves the block.
+    for (address, calls, done) in [(RAM + 9, 2, DONE), (RAM - 8, 3, LEFT)] {
+        code_frame[1] = address;
+        context.writes = tlb.table(1, true);
+        context.budget = 10;
+        // SAFETY: as above.
+        let code = unsafe {
+            jit.enter(
+                &entry,
+                &mut context,
+                slots.as_mut_ptr(),
+                code_frame.as_mut_ptr(),
+            )
+        };
+        assert_eq!((code, env.thunk_calls), (done, calls));
+    }
+}
+
+#[test]
+fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let load = Op {
+        code: Code::Load4,
+        aux: 4,
+        dst: 2,
+        a: 1,
+        b: 0,
+        imm: 0,
+    };
+    let frame = vec![0, RAM + 16, 0];
+    for (op, memory) in [
+        (
+            Op {
+                aux: 4 | THUNK_ACCESS,
+                ..load
+            },
+            Memory::Inline,
+        ),
+        (load, Memory::Thunk),
+    ] {
+        let block = access_block(vec![op], frame.clone(), 2, memory);
+        let mut ram = vec![0u8; PAGES * 4096];
+        let mut tlb = FastTlb::new();
+        tlb.fill(1, false, RAM, ram.as_ptr() as usize, 0, 0, 12);
+        // The test thunk does not know the bit: it reads `aux` only through
+        // the code, so give it the plain load.
+        let mut slots = [0u128; 1];
+        let plain = access_block(vec![load], frame.clone(), 2, memory);
+        let shape = Shape {
+            ops: &block.ops,
+            generics: &[],
+            frame: &block.frame,
+            accesses: &[],
+            calls: &[],
+            leaves: &block.leaves,
+            inputs: &[],
+            outputs: &block.outputs,
+            instructions: 1,
+            memory,
+        };
+        let entry = jit.compile(&shape).expect("a block");
+        let mut code_frame = block.frame.clone();
+        let mut env = Env {
+            ops: plain.ops.clone(),
+            frame: code_frame.as_mut_ptr(),
+            words: code_frame.len(),
+            calls: Vec::new(),
+            thunk_calls: 0,
+            left_at: None,
+            ram: ram.as_mut_ptr(),
+            tlb: FastTlb::new(),
+            watch: Vec::new(),
+            fill: false,
+            misses: 0,
+            watched: 0,
+            logged: Vec::new(),
+        };
+        let mut context = Context {
+            budget: 10,
+            thunk,
+            env: (&raw mut env).cast(),
+            reads: tlb.table(1, false),
+            writes: tlb.table(1, true),
+        };
+        // SAFETY: as in `compiled_on`.
+        let code = unsafe {
+            jit.enter(
+                &entry,
+                &mut context,
+                slots.as_mut_ptr(),
+                code_frame.as_mut_ptr(),
+            )
+        };
+        // One call of the operation itself, not a miss.
+        assert_eq!((code, env.thunk_calls, env.misses), (DONE, 1, 0));
+    }
 }

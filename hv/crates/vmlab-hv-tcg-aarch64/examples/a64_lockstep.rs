@@ -944,8 +944,16 @@ fn main() -> Result<(), Failure> {
     if run.follower.cpu.jit_enabled() {
         let jit = run.follower.cpu.jit_counts();
         println!(
-            "JIT: {} blocks compiled, {} refused, {} instructions compiled, {} in the interpreter",
-            jit.compiled, jit.refused, jit.compiled_instructions, jit.interpreted_instructions
+            "JIT: {} blocks compiled, {} refused, {} instructions compiled, {} in the interpreter; \
+             fast TLB: {} inlined accesses, {} misses, {} fills, {} flushes",
+            jit.compiled,
+            jit.refused,
+            jit.compiled_instructions,
+            jit.interpreted_instructions,
+            jit.tlb_accesses,
+            jit.tlb_misses,
+            jit.tlb_fills,
+            jit.tlb_flushes
         );
     }
     finish(&run.counts, &formats, corpus_out.as_deref(), &header)

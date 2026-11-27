@@ -10,9 +10,19 @@
 //! register is read from the state at its first use, and written to the
 //! state at the exit of the block.
 //!
-//! The thunk runs what the emitter has no inline form for: the loads and
-//! stores, the accesses of 16 bytes and the exclusive ones, the generic
-//! operations, the helper calls, and a guard that fails. Before it runs,
+//! The thunk runs what the emitter has no inline form for: the accesses of
+//! 16 bytes and the exclusive ones, the generic operations, the helper
+//! calls, a guard that fails, and a load or a store of 1 to 8 bytes that
+//! misses the fast TLB (H7) or that its block may not inline.
+//!
+//! A load or a store of 1 to 8 bytes looks up the fast TLB inline (H7, the
+//! layout in `tlb`): the index from the page bits of the address, the tag
+//! compared with the address masked to its page and to the bits below its
+//! size, the addend, and the access of the host. A store then reads the
+//! watch word of its page and asks the thunk to tell the memory when it is
+//! odd (card S3). A miss is a stub after the block (H7c) that puts the words
+//! of the access and of its leave into the frame and runs the access in the
+//! thunk, which can leave the block through the exit of its instruction. Before it runs,
 //! the words that it reads are in the frame. After it, the words that it
 //! wrote are read from the frame. The words that a leave of the block names
 //! are in the frame before every effect that can leave through it, so the
@@ -31,7 +41,11 @@ use crate::asm::{
     Alu, Asm, Cond, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
     Reg, Rm, Shift,
 };
-use crate::{BUDGET, CONTEXT_BUDGET, CONTEXT_ENV, CONTEXT_THUNK, Features};
+use crate::tlb::{ADDEND, ENTRIES, ENTRY_BITS, TAG, WATCH};
+use crate::{
+    BUDGET, CONTEXT_BUDGET, CONTEXT_ENV, CONTEXT_READS, CONTEXT_THUNK, CONTEXT_WRITES, Features,
+    LOGGED, MISS, WATCHED,
+};
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
 
 /// What an effect that the caller describes reads and writes: an access of
@@ -43,6 +57,26 @@ pub struct Effect {
     /// The leave of the block that the effect can leave through.
     pub leave: Option<u32>,
 }
+
+/// How the loads and stores of 1 to 8 bytes of a block reach memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Memory {
+    /// Every one through the thunk.
+    #[default]
+    Thunk,
+    /// Inline over the fast TLB, but those whose `aux` has `THUNK_ACCESS`.
+    Inline,
+    /// As `Inline`, and every hit asks the thunk to keep the access
+    /// (`LOGGED`): for an owner that keeps the accesses of its CPU, such as
+    /// a lockstep against another emulator. The lookup is the same code.
+    Logged,
+}
+
+/// The bit of `Op::aux` of a load or a store that goes through the thunk
+/// whatever the block's `Memory` says. The owner sets it where its fast
+/// TLB does not answer for the access (H7a: an unprivileged access of
+/// aarch64).
+pub const THUNK_ACCESS: u8 = 0x80;
 
 /// A block as the emitter sees it.
 pub struct Shape<'a> {
@@ -61,6 +95,7 @@ pub struct Shape<'a> {
     /// Register slot, words of the frame: written to the state at the end.
     pub outputs: &'a [(u32, Place)],
     pub instructions: u32,
+    pub memory: Memory,
 }
 
 /// Why the emitter made no code for a block. The block runs in the
@@ -499,6 +534,110 @@ impl Emitter<'_> {
         self.release(reads, at);
     }
 
+    /// The words that a stub puts into the frame: those of `reads`, from
+    /// where they are now. The code changes no register but RDX.
+    fn home_all(&mut self, reads: &[Slot]) {
+        for word in reads {
+            let w = self.words[usize::from(*word)];
+            Self::home_code(&mut self.asm, *word, w);
+        }
+    }
+
+    /// The thunk for `request` of the operation `index`, keeping the
+    /// registers of the pool. With `leaves`, a value other than 0 leaves
+    /// the block.
+    fn thunk(&mut self, index: usize, request: u64, leaves: bool) {
+        let saved = self.live_caller_saved();
+        Self::call_thunk(&mut self.asm, index as u64 | request, &saved);
+        if leaves {
+            self.asm.test(RAX, RAX);
+            self.asm.jcc_absolute(Cond::Ne, self.exit);
+        }
+    }
+
+    /// A load or a store of `bytes` bytes over the fast TLB (H7). The
+    /// address is the word `a`, the value of a store the word `b`, the
+    /// result of a load the word `dst`, and the leave `imm`.
+    fn access(&mut self, index: usize, op: &Op, reads: &[Slot], bytes: u8, store: bool) {
+        let at = index as u32;
+        let logged = self.shape.memory == Memory::Logged;
+        let address = self.value(op.a, at);
+        let value = store.then(|| self.value(op.b, at));
+        let miss = self.asm.label();
+        let join = self.asm.label();
+        // RCX: the entry of the page in the table of the block.
+        self.load(RAX, address);
+        self.asm.mov(RCX, Rm::Reg(RAX));
+        self.asm.shift_imm(Shift::Shr, RCX, (12 - ENTRY_BITS) as u8);
+        self.asm
+            .alu_imm(Alu::And, Rm::Reg(RCX), ((ENTRIES - 1) << ENTRY_BITS) as i32);
+        let table = if store { CONTEXT_WRITES } else { CONTEXT_READS };
+        self.asm.alu(Alu::Add, RCX, Rm::Mem(R13, table));
+        // The address in its page and below its size, against the tag.
+        self.asm.mov(RDX, Rm::Reg(RAX));
+        self.asm
+            .alu_imm(Alu::And, Rm::Reg(RDX), !0xfff | (i32::from(bytes) - 1));
+        self.asm.alu(Alu::Cmp, RDX, Rm::Mem(RCX, TAG));
+        self.asm.jcc(Cond::Ne, miss);
+        self.asm.alu(Alu::Add, RAX, Rm::Mem(RCX, ADDEND));
+        if let Some(value) = value {
+            let source = match value {
+                Val::Reg(reg) => reg,
+                Val::Mem(memory) => {
+                    self.asm.mov(RDX, memory);
+                    RDX
+                }
+                Val::Imm(value) => {
+                    self.asm.mov_imm(RDX, value);
+                    RDX
+                }
+            };
+            self.asm.store_sized(Rm::Mem(RAX, 0), source, bytes);
+            // The watch word of the page: odd while a CPU holds code of it.
+            let watched = self.asm.label();
+            let back = self.asm.label();
+            self.asm.mov(RCX, Rm::Mem(RCX, WATCH));
+            self.asm.test_byte_imm(Rm::Mem(RCX, 0), 1);
+            self.asm.jcc(Cond::Ne, watched);
+            self.asm.bind(back);
+            if logged {
+                self.home_all(&[op.a, op.b]);
+                self.thunk(index, LOGGED, false);
+            }
+            self.asm.cold(true);
+            self.asm.bind(watched);
+            self.home_all(&[op.a]);
+            self.thunk(index, WATCHED, false);
+            self.asm.jmp(back);
+            self.asm.cold(false);
+        } else {
+            self.asm.load_sized(RAX, Rm::Mem(RAX, 0), bytes);
+            if logged {
+                self.asm.store(Self::frame(op.dst), RAX);
+                self.home_all(&[op.a]);
+                self.thunk(index, LOGGED, false);
+                self.asm.mov(RAX, Self::frame(op.dst));
+            }
+        }
+        self.asm.bind(join);
+        // The miss, with the places of the words as they are here. The
+        // thunk writes the result of a load into its word of the frame.
+        self.asm.cold(true);
+        self.asm.bind(miss);
+        self.home_all(reads);
+        self.thunk(index, MISS, true);
+        if !store {
+            self.asm.mov(RAX, Self::frame(op.dst));
+        }
+        self.asm.jmp(join);
+        self.asm.cold(false);
+        if store {
+            self.release(reads, at);
+        } else {
+            self.define(op.dst, reads, at);
+        }
+    }
+
     /// One pure operation of one word, inline.
     fn pure(&mut self, index: usize, op: &Op, reads: &[Slot]) -> Result<(), Refused> {
         let at = index as u32;
@@ -807,6 +946,27 @@ impl Emitter<'_> {
     }
 }
 
+/// The size of a load or a store that the block makes inline, and whether
+/// it is a store.
+fn inline_access(op: &Op, memory: Memory) -> Option<(u8, bool)> {
+    if memory == Memory::Thunk || op.aux & THUNK_ACCESS != 0 {
+        return None;
+    }
+    let (bytes, store) = match op.code {
+        Code::Load1 => (1, false),
+        Code::Load2 => (2, false),
+        Code::Load4 => (4, false),
+        Code::Load8 => (8, false),
+        Code::Store1 => (1, true),
+        Code::Store2 => (2, true),
+        Code::Store4 => (4, true),
+        Code::Store8 => (8, true),
+        _ => return None,
+    };
+    // The size is in `aux` too, below the bit of the thunk.
+    (op.aux == bytes).then_some((bytes, store))
+}
+
 /// Emit the code of `shape`. `exit` is the address of the common exit of
 /// the trampoline.
 pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused> {
@@ -907,7 +1067,11 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
     emitter.asm.cold(false);
     for (index, op) in shape.ops.iter().enumerate() {
         let (reads, writes) = &effects[index];
-        if op.code == Code::Generic || (op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard) {
+        if let Some((bytes, store)) = inline_access(op, shape.memory) {
+            emitter.access(index, op, reads, bytes, store);
+        } else if op.code == Code::Generic
+            || (op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard)
+        {
             emitter.effect(index, reads, writes);
         } else if op.code == Code::Guard {
             emitter.guard(index, op, reads);

@@ -4309,6 +4309,7 @@ name = "vmlab-hv-tcg-aarch64"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "parking_lot",
  "vmlab-hv-tcg",
  "vmlab-hv-tcg-ir",
  "vmlab-hv-tcg-jit",

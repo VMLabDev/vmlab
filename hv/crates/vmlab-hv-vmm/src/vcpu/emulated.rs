@@ -265,7 +265,7 @@ impl EmulatedVcpu {
         self.jit_report = self.cpu.instructions + JIT_REPORT;
         let jit = self.cpu.jit_counts();
         log::info!(
-            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling",
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fast TLB: {} accesses, {} misses",
             self.id,
             self.cpu.instructions,
             jit.interpreted_instructions,
@@ -274,7 +274,9 @@ impl EmulatedVcpu {
             jit.refused,
             jit.bytes,
             jit.resets,
-            jit.compile_ns / 1_000_000
+            jit.compile_ns / 1_000_000,
+            jit.tlb_accesses,
+            jit.tlb_misses
         );
     }
 

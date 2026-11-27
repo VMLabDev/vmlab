@@ -11,6 +11,8 @@ fn compiled_blocks_leave_what_the_interpreter_leaves() {
         Ok(report) => {
             eprintln!("K2: seed {seed:#x}: {report:?}");
             assert!(report.compiled_blocks > report.refused_blocks);
+            // The inlined loads and stores hit the fast TLB, and miss it.
+            assert!(report.tlb_accesses > report.tlb_misses && report.tlb_misses > 0);
         }
         Err(difference) => panic!("{difference}"),
     }

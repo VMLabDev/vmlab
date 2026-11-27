@@ -6,8 +6,10 @@
 //! - `asm`: the assembler.
 //! - `region`: the code memory, one `memfd` mapped twice (H13d, Q3).
 //! - `emit`: the one-pass allocator with its spill (H3), the inline forms of
-//!   the operations of one word, the guards and their stubs (H9), and the
-//!   thunk through which every effect runs.
+//!   the operations of one word, the guards and their stubs (H9), the
+//!   inlined loads and stores of 1 to 8 bytes over the fast TLB (H7), and
+//!   the thunk through which every other effect runs.
+//! - `tlb`: the layout of the fast TLB and its fill and flush (H7).
 //! - The trampoline here (H4): `enter` saves the registers that the System V
 //!   ABI keeps, loads the context, and jumps to a block. A block leaves by a
 //!   jump to the common exit, which restores them and returns the exit code.
@@ -24,9 +26,10 @@
 pub mod asm;
 pub mod emit;
 pub mod region;
+pub mod tlb;
 
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
-pub use emit::{Effect, Refused, Shape};
+pub use emit::{Effect, Memory, Refused, Shape};
 use region::Region;
 use std::ffi::c_void;
 
@@ -36,9 +39,24 @@ pub const DONE: u64 = 0;
 pub const BUDGET: u64 = 1;
 
 /// The function that runs an operation of a block for its code: `env` is
-/// what the context holds, `index` the operation. 0: go on. Anything else:
-/// the block leaves with that value.
+/// what the context holds, `index` the operation in the low 32 bits and
+/// what is asked of it in the high ones (`MISS`, `WATCHED`, `LOGGED`; none:
+/// run the operation). 0: go on. Anything else: the block leaves with that
+/// value.
 pub type Thunk = unsafe extern "sysv64" fn(env: *mut c_void, index: u64) -> u64;
+
+/// An inlined load or store missed the fast TLB: run it as the operation,
+/// which fills the TLB where H7a lets it.
+pub const MISS: u64 = 1 << 32;
+/// An inlined store wrote its bytes and found the watch word of its page
+/// odd (card S3): the owner tells its memory. The address is in the frame.
+/// Nothing else happens, and the block goes on.
+pub const WATCHED: u64 = 2 << 32;
+/// An inlined load or store hit, in a block compiled for a CPU that keeps
+/// its accesses (`Memory::Logged`): the address, and the value of a store,
+/// are in the frame, and the value of a load is in its result word. The
+/// owner keeps the access. The block goes on.
+pub const LOGGED: u64 = 4 << 32;
 
 /// What compiled code reads through R13.
 #[repr(C)]
@@ -47,11 +65,23 @@ pub struct Context {
     pub budget: i64,
     pub thunk: Thunk,
     pub env: *mut c_void,
+    /// The read and the write table of the fast TLB for the level of the
+    /// block (`tlb::FastTlb::table`), or `tlb::EMPTY_TABLE`. The thunk may
+    /// change them while the block runs.
+    pub reads: *const tlb::Entry,
+    pub writes: *const tlb::Entry,
 }
 
 pub(crate) const CONTEXT_BUDGET: i32 = 0;
 pub(crate) const CONTEXT_THUNK: i32 = 8;
 pub(crate) const CONTEXT_ENV: i32 = 16;
+pub(crate) const CONTEXT_READS: i32 = 24;
+pub(crate) const CONTEXT_WRITES: i32 = 32;
+
+const _: () = {
+    assert!(std::mem::offset_of!(Context, reads) == CONTEXT_READS as usize);
+    assert!(std::mem::offset_of!(Context, writes) == CONTEXT_WRITES as usize);
+};
 
 /// The instructions of the host that the emitter may use beyond x86-64.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -8,8 +8,9 @@
 //! `HVC` behind it, so an exception stops the run as a hypercall does, and
 //! a budget that ends a run that loops. The integer, branch, load and
 //! store, FP and AdvSIMD classes are in the streams: the inline forms of
-//! the emitter, its spills and guards, and the thunk with its loads,
-//! stores, accesses of 16 bytes, generic operations and helper calls.
+//! the emitter, its spills and guards, the loads and stores over its fast
+//! TLB with their misses, and the thunk with its accesses of 16 bytes,
+//! generic operations and helper calls.
 //!
 //! `ci::check` runs a bounded number of rounds with a fixed seed (the test
 //! `tests/jit.rs`); `just tcg-a64-jit-diff` runs as many as it is asked.
@@ -49,6 +50,10 @@ pub struct Report {
     pub interpreted: u64,
     pub compiled_blocks: u64,
     pub refused_blocks: u64,
+    /// The inlined loads and stores of the compiled side, and those that
+    /// missed its fast TLB (3e DESIGN.md H7).
+    pub tlb_accesses: u64,
+    pub tlb_misses: u64,
 }
 
 /// The first round where the two sides differ.
@@ -193,6 +198,8 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
         report.interpreted += jit.interpreted_instructions;
         report.compiled_blocks += jit.compiled;
         report.refused_blocks += jit.refused;
+        report.tlb_accesses += jit.tlb_accesses;
+        report.tlb_misses += jit.tlb_misses;
     }
     Ok(report)
 }
