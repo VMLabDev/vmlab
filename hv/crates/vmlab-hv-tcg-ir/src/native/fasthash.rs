@@ -108,6 +108,9 @@ mod tests {
             hasher.write_u64(i);
             buckets[(hasher.finish() & 63) as usize] += 1;
         }
-        assert!(buckets.iter().all(|&count| (500..1500).contains(&count)), "{buckets:?}");
+        assert!(
+            buckets.iter().all(|&count| (500..1500).contains(&count)),
+            "{buckets:?}"
+        );
     }
 }

@@ -272,8 +272,12 @@ pub(crate) unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Gene
             Code::BitNot => !a & op.imm,
             Code::Negate => a.wrapping_neg() & op.imm,
             Code::SignExtend => ((a << (64 - width)) as i64 >> (64 - width)) as u64 & op.imm,
-            Code::LeadingZeros => u64::from((a & low(op.aux)).leading_zeros() - (64 - width)) & op.imm,
-            Code::TrailingZeros => u64::from((a & low(op.aux)).trailing_zeros().min(width)) & op.imm,
+            Code::LeadingZeros => {
+                u64::from((a & low(op.aux)).leading_zeros() - (64 - width)) & op.imm
+            }
+            Code::TrailingZeros => {
+                u64::from((a & low(op.aux)).trailing_zeros().min(width)) & op.imm
+            }
             Code::ReverseBits => ((a & low(op.aux)).reverse_bits() >> (64 - width)) & op.imm,
             Code::ReverseBytes => ((a & low(op.aux)).swap_bytes() >> (64 - width)) & op.imm,
             Code::PopCount => u64::from((a & low(op.aux)).count_ones()) & op.imm,
@@ -306,7 +310,7 @@ pub(crate) unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Gene
         };
         set_word(frame, usize::from(op.dst), value);
         true
-        }
+    }
 }
 
 fn is_wide(ty: ScalarType) -> bool {

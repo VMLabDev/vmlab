@@ -3,13 +3,13 @@ mod assume;
 mod bitfield;
 pub mod block;
 pub mod dce;
+pub mod fasthash;
 pub mod linear;
 pub mod liveness;
 mod modular;
 pub mod packed;
 pub mod regfile;
 pub mod schedule;
-pub mod fasthash;
 use fasthash::FastMap as HashMap;
 
 pub type ScalarId = usize;

@@ -300,10 +300,7 @@ impl VcpuBackend for EmulatedVcpu {
         let debug = log::log_enabled!(log::Level::Debug);
         // Short slices cost most of the speed of the CPU, so they follow
         // what the stderr log writes, not what the recorder keeps.
-        let short = crate::diagnostics::report::stderr_enabled(
-            log::Level::Trace,
-            module_path!(),
-        );
+        let short = crate::diagnostics::report::stderr_enabled(log::Level::Trace, module_path!());
         let before = self.cpu.exceptions;
         let stop = self.cpu.run(if short { DEBUG_SLICE } else { SLICE });
         if debug
@@ -384,9 +381,7 @@ impl VcpuBackend for EmulatedVcpu {
             let lines = &self.lines;
             let waker = &self.waker;
             waker.wait(timer.unwrap_or(IDLE).min(IDLE), || {
-                waker.kicked()
-                    || lines.irq.level()
-                    || lines.fiq.level()
+                waker.kicked() || lines.irq.level() || lines.fiq.level()
             });
         }
     }

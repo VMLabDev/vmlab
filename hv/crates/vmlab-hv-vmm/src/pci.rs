@@ -1293,7 +1293,10 @@ mod tests {
 
     #[test]
     fn an_io_bar_at_port_zero_decodes_on_virt_and_not_on_q35() {
-        for (mut root, decodes) in [(PciRoot::virt(1 << 32), true), (PciRoot::q35(1 << 32), false)] {
+        for (mut root, decodes) in [
+            (PciRoot::virt(1 << 32), true),
+            (PciRoot::q35(1 << 32), false),
+        ] {
             let device = FakePci::new(vec![BarInfo {
                 index: 0,
                 size: 0x80,
@@ -1305,7 +1308,14 @@ mod tests {
             root.config_write(0, 1, 0, 4, &1u16.to_le_bytes());
             let mut bytes = [0; 2];
             assert_eq!(root.dispatch_io_read(0x10, &mut bytes), decodes);
-            let placed = device.lock().placements.iter().rev().find(|p| p.0 == 0).unwrap().1;
+            let placed = device
+                .lock()
+                .placements
+                .iter()
+                .rev()
+                .find(|p| p.0 == 0)
+                .unwrap()
+                .1;
             assert_eq!(placed, decodes.then_some(0));
             // With I/O decode off, port 0 is nothing on either root.
             root.config_write(0, 1, 0, 4, &0u16.to_le_bytes());

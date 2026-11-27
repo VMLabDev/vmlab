@@ -126,10 +126,9 @@ unsafe fn copy_out_to(to: usize, bytes: &[u8]) {
     unsafe {
         match (bytes.len(), aligned) {
             (1, _) => std::ptr::write_volatile(to as *mut u8, bytes[0]),
-            (2, true) => std::ptr::write_volatile(
-                to as *mut u16,
-                u16::from_le_bytes([bytes[0], bytes[1]]),
-            ),
+            (2, true) => {
+                std::ptr::write_volatile(to as *mut u16, u16::from_le_bytes([bytes[0], bytes[1]]))
+            }
             (4, true) => std::ptr::write_volatile(
                 to as *mut u32,
                 u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),

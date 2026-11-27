@@ -1114,7 +1114,9 @@ fn compile(
         .iter()
         .all(|op| block::op_in_frame(op, words, generics))
     {
-        return Err(host("an operation of a block names a word outside its frame"));
+        return Err(host(
+            "an operation of a block names a word outside its frame",
+        ));
     }
     Ok(Compiled {
         phys,
@@ -1224,7 +1226,9 @@ impl Compiled {
             + self
                 .leaves
                 .iter()
-                .map(|leave| size_of::<Leave>() + leave.outputs.capacity() * size_of::<(u32, Place)>())
+                .map(|leave| {
+                    size_of::<Leave>() + leave.outputs.capacity() * size_of::<(u32, Place)>()
+                })
                 .sum::<usize>()
             + self.frame.capacity() * size_of::<u64>()
             + self
@@ -2322,8 +2326,7 @@ impl<M: Memory> Cpu<M> {
             } else {
                 &mut self.blocks
             };
-            ready = cache.revive(index, phys, context)
-                && self.usable(single, index, phys, context);
+            ready = cache.revive(index, phys, context) && self.usable(single, index, phys, context);
         }
         if !ready {
             let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
