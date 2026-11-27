@@ -2682,8 +2682,8 @@ mod tests {
         assert_eq!(counts.blocks, 1);
         assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
         assert_eq!(counts.alignment_operations, 6);
-        // The discarded add is still needed to restore X4 on an early exit.
-        assert!(counts.exit_writeback_operations > 0);
+        // The discarded add restores X4. Each access also has its own fault PC.
+        assert_eq!(counts.exit_writeback_operations, 3);
     }
 
     #[test]
