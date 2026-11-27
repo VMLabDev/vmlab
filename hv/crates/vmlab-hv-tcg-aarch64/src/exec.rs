@@ -2975,7 +2975,7 @@ mod tests {
                             // the flags before it.
                             let (encoding, expected) = if index == 5 {
                                 let on = case / 16 % 16;
-                                let given = (case / 7 % 16) as u32;
+                                let given = case / 7 % 16;
                                 let expected = if flags::holds(on as u8, before) {
                                     sum_flags(width, a, !b, true)
                                 } else {
