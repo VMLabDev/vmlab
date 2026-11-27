@@ -347,6 +347,19 @@ impl FwCfgMmio {
     }
 }
 
+/// The item stream and the DMA address are the state of [`FwCfg`].
+impl Snapshot for FwCfgMmio {
+    fn state_id(&self) -> String {
+        self.0.state_id()
+    }
+    fn save_state(&self) -> Result<Vec<u8>, DeviceError> {
+        self.0.save_state()
+    }
+    fn restore_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
+        self.0.restore_state(data)
+    }
+}
+
 impl BusDevice for FwCfgMmio {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         data.fill(0);

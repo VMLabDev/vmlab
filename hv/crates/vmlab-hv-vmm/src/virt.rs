@@ -17,6 +17,7 @@
 
 pub mod fdt;
 pub mod psci;
+mod snapshot;
 pub mod tree;
 
 use std::sync::{Arc, OnceLock};
@@ -135,6 +136,14 @@ impl MachineClock {
                 .saturating_add(state.2.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         }
         state.0 = running;
+        state.2 = Instant::now();
+    }
+
+    /// Put the time back to `ns`, as a snapshot restore does. The clock
+    /// goes on from there when it runs.
+    fn set_now_ns(&self, ns: u64) {
+        let mut state = self.state.lock();
+        state.1 = ns;
         state.2 = Instant::now();
     }
 
@@ -493,6 +502,44 @@ fn read_image(path: &std::path::Path, what: &str, limit: u64) -> Result<Vec<u8>,
     Ok(data)
 }
 
+/// The Image inside an EFI zboot kernel, which Alpine and Fedora ship for
+/// arm64: a PE file whose header says `zimg` at 4, gives the offset and the
+/// size of the compressed Image at 8 and 12, and names the compression at
+/// 0x18, as the bytes of the guest asset's kernel show. Firmware runs its
+/// stub, which unpacks the Image. A
+/// boot without firmware unpacks it here, as a boot loader does. Any other
+/// image is returned as it is.
+fn unpack_zboot(image: Vec<u8>, limit: u64) -> Result<Vec<u8>, VmmError> {
+    if image.get(..2) != Some(b"MZ") || image.get(4..8) != Some(b"zimg") {
+        return Ok(image);
+    }
+    let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap()) as usize;
+    let (offset, size) = (word(8), word(12));
+    let compression = image.get(0x18..0x20).unwrap_or_default();
+    let Some(payload) = offset
+        .checked_add(size)
+        .and_then(|end| image.get(offset..end))
+    else {
+        return Err(invalid("the zboot kernel names a payload outside its file"));
+    };
+    if !compression.starts_with(b"gzip\0") {
+        return Err(invalid(format!(
+            "the zboot kernel is compressed with {:?}, and only gzip is unpacked",
+            String::from_utf8_lossy(compression).trim_end_matches('\0')
+        )));
+    }
+    let mut unpacked = Vec::new();
+    use std::io::Read;
+    flate2::read::GzDecoder::new(payload)
+        .take(limit + 1)
+        .read_to_end(&mut unpacked)
+        .map_err(|e| invalid(format!("unpacking the zboot kernel: {e}")))?;
+    if unpacked.len() as u64 > limit {
+        return Err(invalid("the unpacked zboot kernel does not fit the RAM"));
+    }
+    Ok(unpacked)
+}
+
 /// Where a kernel image is loaded, above the base of RAM: an image with the
 /// arm64 header says so itself.
 fn kernel_offset(image: &[u8]) -> u64 {
@@ -532,7 +579,7 @@ fn images(desc: &MachineDescription, dtb: Option<Vec<u8>>) -> Result<Images, Vmm
             x0: 0,
         });
     };
-    let kernel = read_image(kernel, "kernel", ram_size)?;
+    let kernel = unpack_zboot(read_image(kernel, "kernel", ram_size)?, ram_size)?;
     let kernel_at = map::RAM_BASE + kernel_offset(&kernel);
     let data_at = map::RAM_BASE + (ram_size / 2).min(BOOT_DATA_OFFSET);
     let mut loads = Vec::new();
@@ -926,6 +973,11 @@ pub fn assemble(
 impl Virt {
     pub(crate) fn vcpus(&self) -> usize {
         self.vcpus.len()
+    }
+
+    /// The backend of the vCPU `id`, for the debug port.
+    pub(crate) fn vcpu(&self, id: u8) -> Option<Arc<Mutex<EmulatedVcpu>>> {
+        self.vcpus.get(usize::from(id)).cloned()
     }
 
     pub(crate) fn powered(&self, id: u8) -> bool {

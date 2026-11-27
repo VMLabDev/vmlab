@@ -1,4 +1,5 @@
-//! Whole-machine x86 debugger requests and bounded replies.
+//! Whole-machine debugger requests and bounded replies: x86 on KVM, and
+//! the emulated aarch64 CPUs of the `virt` machine.
 
 use std::collections::BTreeMap;
 
@@ -57,6 +58,23 @@ pub struct X86Registers {
     pub xmm: [[u8; 16]; 16],
     pub mxcsr: u32,
     /// System registers and segment bases, for inspection and named edits.
+    pub system: BTreeMap<String, u64>,
+}
+
+/// The registers of an emulated aarch64 vCPU. `SetRegisters` names them
+/// `x0` to `x30`, `sp` (the stack pointer of the current level), `pc`,
+/// `cpsr`, `fpcr`, `fpsr` and the names of `system`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Aarch64Registers {
+    pub x: [u64; 31],
+    pub sp: u64,
+    pub pc: u64,
+    /// PSTATE in the layout of an SPSR.
+    pub cpsr: u32,
+    pub v: [[u8; 16]; 32],
+    pub fpcr: u32,
+    pub fpsr: u32,
+    /// The stack pointers of each level and the system registers.
     pub system: BTreeMap<String, u64>,
 }
 
@@ -156,6 +174,11 @@ pub enum DebugResponse {
     Registers {
         vcpu: u8,
         registers: Box<X86Registers>,
+    },
+    /// `ReadRegisters` on an emulated aarch64 vCPU.
+    Aarch64Registers {
+        vcpu: u8,
+        registers: Box<Aarch64Registers>,
     },
     Done,
 }

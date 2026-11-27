@@ -345,7 +345,6 @@ pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
             "snapshot name is reserved for internal rollback checkpoints".into(),
         ));
     }
-    emulated_unsupported(handle)?;
     let _op = handle.shared().begin_snapshot();
     save_locked(handle, name)
 }
@@ -426,14 +425,24 @@ fn capture_and_write(
     for node in &reg.nodes {
         sections.extend(node.save().map_err(SnapshotError::Internal)?);
     }
-    save_kernel_state(shared, &mut sections)?;
+    match shared.virt.get() {
+        // An emulated machine: its CPUs, GIC, timers and the devices that
+        // are no PCI function (phase 3d, F6).
+        Some(virt) => {
+            virt.save_sections(&mut sections)
+                .map_err(SnapshotError::Internal)?;
+            sections.push(("pci-root".into(), to_json(&shared.save_pci_bars())?));
+        }
+        None => save_kernel_state(shared, &mut sections)?,
+    }
     // A guest reset the events thread has not run yet is machine state. The
     // vCPUs are parked on it and the chipset already latched the request, so
     // a snapshot without it restores a guest that waits for a reset forever.
     sections.push((RESET_PENDING.into(), to_json(&shared.reset_pending())?));
-    if let Some(pm) = shared
-        .save_direct_kernel_pm()
-        .map_err(SnapshotError::Internal)?
+    if shared.virt.get().is_none()
+        && let Some(pm) = shared
+            .save_direct_kernel_pm()
+            .map_err(SnapshotError::Internal)?
     {
         sections.push(pm);
     }
@@ -679,19 +688,7 @@ pub(crate) fn save_kernel_state(
 /// vmstate header (major version and machine digest), restore RAM then
 /// kernel then devices, and leave the machine in the run state the snapshot
 /// recorded.
-/// The snapshot of an emulated machine comes with card C14 of phase 3d: its
-/// CPU, GIC and timer state has no place in the format yet.
-fn emulated_unsupported(handle: &VmHandle) -> Result<(), SnapshotError> {
-    if handle.shared().kvm.get().is_none() {
-        return Err(SnapshotError::Unsupported(
-            "online snapshots are unavailable for an emulated machine".into(),
-        ));
-    }
-    Ok(())
-}
-
 pub fn load(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
-    emulated_unsupported(handle)?;
     let _op = handle.shared().begin_snapshot();
     load_locked(handle, name)
 }
@@ -962,6 +959,9 @@ fn restore(
     })
     .map_err(SnapshotError::from_format)?;
 
+    if let Some(virt) = shared.virt.get() {
+        return restore_emulated(shared, reg, virt, &sections, header.run_state);
+    }
     // Replacing RAM also replaces page tables. Removing the slots forces
     // KVM to invalidate translations even when the restored CR3 is unchanged.
     if let Some(a20) = &ram.a20 {
@@ -1018,6 +1018,37 @@ fn restore(
             .map_err(SnapshotError::Internal)?;
     }
     Ok(header.run_state)
+}
+
+/// The rest of a load on an emulated machine, after RAM: the machine, the
+/// virtio functions and the BARs. Its CPUs build their caches again from
+/// the restored state and RAM (`Cpu::replace_state`), so no translation of
+/// the running guest survives.
+fn restore_emulated(
+    shared: &crate::vm::VmShared,
+    reg: &SnapshotRegistry,
+    virt: &crate::virt::Virt,
+    sections: &SavedSections,
+    run_state: u8,
+) -> Result<u8, SnapshotError> {
+    virt.restore_sections(sections)
+        .map_err(SnapshotError::Internal)?;
+    for node in &reg.nodes {
+        node.restore(sections).map_err(SnapshotError::Internal)?;
+    }
+    let pci_bars = sections
+        .get("pci-root")
+        .ok_or_else(|| SnapshotError::Internal("snapshot lacks section \"pci-root\"".into()))?;
+    shared
+        .restore_pci_bars(pci_bars)
+        .map_err(SnapshotError::Internal)?;
+    let reset_pending = sections
+        .get(RESET_PENDING)
+        .map(|bytes| from_json(bytes, RESET_PENDING))
+        .transpose()?
+        .unwrap_or(false);
+    shared.restore_reset_pending(reset_pending);
+    Ok(run_state)
 }
 
 // ---- delete ------------------------------------------------------------
