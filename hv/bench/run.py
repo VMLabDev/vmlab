@@ -56,7 +56,7 @@ IDLE_WINDOW = 60.0       # idle host CPU sampling window
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--backend", choices=("qemu", "vmlab-hv", "interpreter", "interpreter-reference", "interpreter-specialized"), default="qemu")
+    p.add_argument("--backend", choices=("qemu", "vmlab-hv", "interpreter", "interpreter-reference", "interpreter-specialized", "jit"), default="qemu")
     p.add_argument("--arch", default="all", help="all, or x86_64,aarch64,riscv64")
     p.add_argument("--vcpus", default=None,
                    help="comma-separated vCPU counts (default: 1,4 TCG, "
@@ -1162,9 +1162,10 @@ def sweep_stale_vms():
 
 def main(argv=None):
     args = parse_args(argv)
-    if (args.backend == "interpreter" and args.arch == "aarch64") or (
+    if (args.backend in ("interpreter", "jit") and args.arch == "aarch64") or (
             args.backend == "qemu" and args.guest == "flat-a64"):
-        # The flat aarch64 images on our interpreter loop and on QEMU TCG.
+        # The flat aarch64 images on our interpreter loop, on its JIT (3e
+        # DESIGN.md J1) and on QEMU TCG.
         if args.arch not in ("all", "aarch64"):
             raise lib.BenchError("the guest flat-a64 is an aarch64 image")
         if args.suite == "boot":
@@ -1172,6 +1173,8 @@ def main(argv=None):
         import micro_a64
         commit, dirty = git_commit()
         return micro_a64.run(args, commit, dirty, os.uname().nodename, log)
+    if args.backend == "jit":
+        raise lib.BenchError("the jit backend runs the flat aarch64 images: --arch aarch64")
     if args.backend in ("interpreter", "interpreter-reference", "interpreter-specialized") or (
             args.backend == "qemu" and args.guest == "flat-rv64gc"):
         if args.suite == "boot":

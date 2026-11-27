@@ -16,6 +16,10 @@ class MicroA64Tests(unittest.TestCase):
                                    "--vcpus", "1", "--dry-run"]), 0)
         self.assertEqual(run.main(["--backend", "qemu", "--arch", "aarch64",
                                    "--guest", "flat-a64", "--vcpus", "1", "--dry-run"]), 0)
+        self.assertEqual(run.main(["--backend", "jit", "--arch", "aarch64",
+                                   "--vcpus", "1", "--dry-run"]), 0)
+        with self.assertRaises(lib.BenchError):
+            run.main(["--backend", "jit", "--arch", "riscv64", "--vcpus", "1", "--dry-run"])
 
     def test_riscv_interpreter_keeps_its_route(self):
         with mock.patch.object(micro_a64, "run") as a64:
