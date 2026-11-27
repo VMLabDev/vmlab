@@ -17,7 +17,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::{BusDevice, DeviceError, Resettable};
+use crate::{BusDevice, DeviceError, Resettable, Snapshot};
 
 /// The size of one bank of `virt`.
 pub const BANK_SIZE: usize = 64 << 20;
@@ -34,7 +34,7 @@ const ERASE_ERROR: u8 = 0x20;
 const PROGRAM_ERROR: u8 = 0x10;
 const PROTECTED: u8 = 0x02;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Mode {
     Array,
     Status,
@@ -397,6 +397,99 @@ impl Resettable for CfiFlash {
     }
 }
 
+/// The first bytes of a saved bank, with the version of the layout.
+const SNAPSHOT_MAGIC: &[u8; 4] = b"CFI\x01";
+
+/// What a saved bank holds beside its array.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    mode: Mode,
+    status: u8,
+    buffer: Vec<(usize, Vec<u8>)>,
+}
+
+impl Snapshot for CfiFlash {
+    fn state_id(&self) -> String {
+        "cfi-flash".into()
+    }
+
+    /// The magic, the length of the JSON of the registers and the JSON,
+    /// then each block that is not erased as its index (four bytes) and
+    /// its bytes. A bank of firmware variables is mostly erased.
+    fn save_state(&self) -> Result<Vec<u8>, DeviceError> {
+        let registers = serde_json::to_vec(&Saved {
+            mode: self.mode,
+            status: self.status,
+            buffer: self.buffer.clone(),
+        })
+        .map_err(|error| DeviceError::State(error.to_string()))?;
+        let mut bytes = SNAPSHOT_MAGIC.to_vec();
+        bytes.extend((registers.len() as u32).to_le_bytes());
+        bytes.extend(registers);
+        for (index, block) in self.bytes.chunks(BLOCK_SIZE).enumerate() {
+            if block.iter().any(|byte| *byte != 0xff) {
+                bytes.extend((index as u32).to_le_bytes());
+                bytes.extend(block);
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// The array becomes the saved one, and so does the image file: a
+    /// restore brings the variables of its moment back, as it brings the
+    /// disks back. Only the blocks that differ are written.
+    fn restore_state(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        let invalid = |what: &str| DeviceError::State(format!("cfi-flash: {what}"));
+        let body = bytes
+            .strip_prefix(SNAPSHOT_MAGIC)
+            .ok_or_else(|| invalid("invalid flash state or version"))?;
+        let (length, body) = body
+            .split_first_chunk::<4>()
+            .ok_or_else(|| invalid("the state ends early"))?;
+        let length = u32::from_le_bytes(*length) as usize;
+        if length > body.len() {
+            return Err(invalid("the state ends early"));
+        }
+        let (registers, mut blocks) = body.split_at(length);
+        let saved: Saved =
+            serde_json::from_slice(registers).map_err(|error| invalid(&error.to_string()))?;
+        if saved.buffer.len() > BUFFER_WRITES
+            || saved
+                .buffer
+                .iter()
+                .any(|(start, data)| data.len() > BANK_WIDTH || start + data.len() > BANK_SIZE)
+        {
+            return Err(invalid("the program buffer is outside the bank"));
+        }
+        let count = BANK_SIZE / BLOCK_SIZE;
+        let mut array: Vec<Option<&[u8]>> = vec![None; count];
+        while !blocks.is_empty() {
+            let (index, rest) = blocks
+                .split_first_chunk::<4>()
+                .ok_or_else(|| invalid("a block ends early"))?;
+            let index = u32::from_le_bytes(*index) as usize;
+            if index >= count || rest.len() < BLOCK_SIZE || array[index].is_some() {
+                return Err(invalid("a block is outside the bank"));
+            }
+            array[index] = Some(&rest[..BLOCK_SIZE]);
+            blocks = &rest[BLOCK_SIZE..];
+        }
+        let erased = vec![0xff; BLOCK_SIZE];
+        for (index, block) in array.into_iter().enumerate() {
+            let block = block.unwrap_or(&erased);
+            let start = index * BLOCK_SIZE;
+            if self.bytes[start..start + BLOCK_SIZE] != *block {
+                self.persist(start, block, PROGRAM_ERROR);
+            }
+        }
+        self.flush()?;
+        self.mode = saved.mode;
+        self.status = saved.status;
+        self.buffer = saved.buffer;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +604,32 @@ mod tests {
         write32(&mut flash, 0, 0x00d0_00d0);
         assert!(flash.reads_array());
         assert_eq!(read32(&mut flash, 0), 0xffff_ffff);
+    }
+
+    #[test]
+    fn a_restore_brings_the_array_and_the_file_back_to_the_save() {
+        let (dir, mut flash) = bank();
+        write32(&mut flash, 0x100, 0x0040_0040);
+        write32(&mut flash, 0x100, 0x1234_5678);
+        write32(&mut flash, 0, 0x00ff_00ff);
+        let saved = flash.save_state().unwrap();
+        // One block of 64 MiB is not erased.
+        let json = u32::from_le_bytes(saved[4..8].try_into().unwrap()) as usize;
+        assert_eq!(saved.len(), 8 + json + 4 + BLOCK_SIZE);
+        // Erase the block and program the other one, then go back.
+        write32(&mut flash, 0, 0x0020_0020);
+        write32(&mut flash, 0, 0x00d0_00d0);
+        write32(&mut flash, BLOCK_SIZE as u64, 0x0040_0040);
+        write32(&mut flash, BLOCK_SIZE as u64, 0);
+        assert!(!flash.reads_array());
+        flash.restore_state(&saved).unwrap();
+        assert!(flash.reads_array());
+        assert_eq!(read32(&mut flash, 0x100), 0x1234_5678);
+        assert_eq!(read32(&mut flash, BLOCK_SIZE as u64), 0xffff_ffff);
+        let file = std::fs::read(dir.path().join("vars")).unwrap();
+        assert_eq!(file[0x100..0x104], 0x1234_5678u32.to_le_bytes());
+        assert_eq!(file[BLOCK_SIZE..BLOCK_SIZE + 4], [0xff; 4]);
+        assert!(flash.restore_state(&saved[..saved.len() - 1]).is_err());
+        assert!(flash.restore_state(b"CFI\x02").is_err());
     }
 }

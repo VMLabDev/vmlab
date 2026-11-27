@@ -1,4 +1,9 @@
 //! Host debugger state is separate from the guest's architectural debug registers.
+//!
+//! An x86 machine is debugged through KVM's guest debugging. An emulated
+//! aarch64 machine (`virt`) is debugged in the process (`emulated`).
+
+mod emulated;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -71,10 +76,11 @@ fn internal(error: impl std::fmt::Display) -> (ErrorCode, String) {
 }
 
 pub(crate) fn handle(shared: &Arc<VmShared>, request: DebugRequest) -> Outcome {
-    if !shared
-        .kvm
-        .get()
-        .is_some_and(|kvm| kvm.kvm.check_extension(kvm_ioctls::Cap::SetGuestDebug))
+    if shared.virt.get().is_none()
+        && !shared
+            .kvm
+            .get()
+            .is_some_and(|kvm| kvm.kvm.check_extension(kvm_ioctls::Cap::SetGuestDebug))
     {
         return Outcome::Error {
             code: ErrorCode::Unsupported,
@@ -93,7 +99,11 @@ fn status(shared: &VmShared) -> DebugResponse {
         status: DebugStatus {
             state: shared.status(),
             stepping: shared.debugger.step.load(Ordering::Acquire) != NO_STEP,
-            vcpus: shared.vcpus.lock().iter().map(|(id, _)| *id).collect(),
+            vcpus: if shared.virt.get().is_some() {
+                emulated::ids(shared)
+            } else {
+                shared.vcpus.lock().iter().map(|(id, _)| *id).collect()
+            },
             breakpoints: state.breakpoints,
             stop: state.stop,
         },
@@ -129,6 +139,15 @@ fn cpu(shared: &VmShared, id: u8) -> Result<Arc<Mutex<VcpuFd>>> {
         .ok_or_else(|| invalid(format!("no vCPU {id}")))
 }
 
+/// Whether the machine has the vCPU `id`.
+fn check_vcpu(shared: &VmShared, id: u8) -> Result<()> {
+    if shared.virt.get().is_some() {
+        emulated::vcpu(shared, id).map(|_| ())
+    } else {
+        cpu(shared, id).map(|_| ())
+    }
+}
+
 fn execute(shared: &Arc<VmShared>, request: DebugRequest) -> Result<DebugResponse> {
     // The public resume path takes this lock itself.
     if matches!(request, DebugRequest::Continue) {
@@ -155,6 +174,10 @@ fn execute(shared: &Arc<VmShared>, request: DebugRequest) -> Result<DebugRespons
             new.enabled = true;
             configure(shared, &old, &new, None)?;
             *shared.debugger.state.lock() = new;
+            if shared.virt.get().is_some() {
+                publish_stop(shared, 0, emulated::pc(shared, 0)?, StopReason::Pause);
+                return Ok(status(shared));
+            }
             let id = shared
                 .vcpus
                 .lock()
@@ -177,7 +200,7 @@ fn execute(shared: &Arc<VmShared>, request: DebugRequest) -> Result<DebugRespons
                 return Err(invalid("select at least one vCPU to continue"));
             }
             for id in &vcpus {
-                cpu(shared, *id)?;
+                check_vcpu(shared, *id)?;
             }
             prepare_continue(shared).map_err(internal)?;
             for (id, runnable) in shared.debugger.runnable.iter().enumerate() {
@@ -185,6 +208,13 @@ fn execute(shared: &Arc<VmShared>, request: DebugRequest) -> Result<DebugRespons
             }
             shared.debugger.selected.store(true, Ordering::Release);
             shared.finish_snapshot(crate::snapshot::format::RUN_RUNNING);
+            Ok(status(shared))
+        }
+        DebugRequest::Step { vcpu } if shared.virt.get().is_some() => {
+            // The step runs here, and the machine stays paused.
+            let pc = emulated::step(shared, vcpu)?;
+            shared.debugger.state.lock().enabled = true;
+            publish_stop(shared, vcpu, pc, StopReason::Step);
             Ok(status(shared))
         }
         DebugRequest::Step { vcpu } => {
@@ -297,6 +327,27 @@ fn execute(shared: &Arc<VmShared>, request: DebugRequest) -> Result<DebugRespons
                 truncated: false,
             })
         }
+        DebugRequest::ReadRegisters { vcpu } if shared.virt.get().is_some() => {
+            Ok(DebugResponse::Aarch64Registers {
+                vcpu,
+                registers: Box::new(emulated::read_registers(shared, vcpu)?),
+            })
+        }
+        DebugRequest::SetRegisters { vcpu, values } if shared.virt.get().is_some() => {
+            emulated::set_registers(shared, vcpu, &values)?;
+            Ok(DebugResponse::Done)
+        }
+        DebugRequest::WriteRegisters { .. }
+        | DebugRequest::AddBreakpoint { .. }
+        | DebugRequest::RemoveBreakpoint { .. }
+            if shared.virt.get().is_some() =>
+        {
+            Err((
+                ErrorCode::Unsupported,
+                "an emulated aarch64 vCPU takes no x86 registers and no breakpoints: use set_registers"
+                    .into(),
+            ))
+        }
         DebugRequest::ReadRegisters { vcpu } => {
             let fd = cpu(shared, vcpu)?;
             let registers = read_registers(&fd.lock())?;
@@ -374,24 +425,31 @@ fn spans(
     length: usize,
     write: bool,
 ) -> Result<Vec<(u64, usize)>> {
+    let emulated = match space {
+        AddressSpace::Virtual { vcpu } if shared.virt.get().is_some() => {
+            Some(emulated::vcpu(shared, vcpu)?)
+        }
+        _ => None,
+    };
     let fd = match space {
-        AddressSpace::Physical => None,
-        AddressSpace::Virtual { vcpu } => Some(cpu(shared, vcpu)?),
+        AddressSpace::Virtual { vcpu } if emulated.is_none() => Some(cpu(shared, vcpu)?),
+        _ => None,
     };
     let fd = fd.as_ref().map(|fd| fd.lock());
     let mut result = Vec::new();
     let mut offset = 0;
     while offset < length {
         let linear = address + offset as u64;
-        let physical = match fd.as_ref() {
-            Some(fd) => {
+        let physical = match (fd.as_ref(), emulated.as_ref()) {
+            (_, Some(vcpu)) => emulated::translate(vcpu, linear)?,
+            (Some(fd), _) => {
                 let translation = fd.translate_gva(linear).map_err(internal)?;
                 if translation.valid == 0 {
                     return Err(invalid(format!("unmapped linear address {linear:#x}")));
                 }
                 translation.physical_address
             }
-            None => linear,
+            (None, None) => linear,
         };
         let count = (4096 - (linear & 4095) as usize).min(length - offset);
         let end = physical

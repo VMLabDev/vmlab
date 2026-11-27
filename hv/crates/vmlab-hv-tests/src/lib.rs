@@ -33,6 +33,9 @@ const VMLAB_GUEST_DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../gu
 /// virtio-blk devices cinit expects.
 pub const CMDLINE: &str = "console=ttyS0 quiet loglevel=3 panic=-1 reboot=t \
                            vmlab.root=/dev/vda vmlab.scratch=/dev/vdb";
+/// The same on the aarch64 `virt` machine, whose console is the PL011.
+pub const CMDLINE_AARCH64: &str = "console=ttyAMA0 quiet loglevel=3 panic=-1 reboot=t \
+                                   vmlab.root=/dev/vda vmlab.scratch=/dev/vdb";
 
 /// Scratch (overlay upper layer) virtual size: vmlab's own container size.
 const SCRATCH_SIZE: u64 = 2 << 30;
@@ -104,6 +107,24 @@ impl Assets {
 /// env var; then the reproducible Alpine image the just recipe caches under
 /// the workspace target dir; then any `rootfs.sqfs` vmlab has pulled under
 /// `~/.local/share/vmlab/oci/images/`.
+/// The assets of an aarch64 guest on the emulated `virt` machine: the
+/// aarch64 guest asset (`guest/build-asset.sh aarch64`, or the directory of
+/// `VMLAB_HV_TEST_GUEST_DIST_AARCH64`) and the rootfs of
+/// [`probe_assets`]. cinit mounts the rootfs and the tests run only the
+/// busybox that cinit injects, so a rootfs of another architecture serves.
+/// The machine needs no KVM.
+pub fn probe_assets_aarch64() -> Assets {
+    let dist = std::env::var_os("VMLAB_HV_TEST_GUEST_DIST_AARCH64")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(VMLAB_GUEST_DIST).join("../aarch64"));
+    Assets {
+        kernel: dist.join("vmlinuz"),
+        initrd: dist.join("initramfs.img"),
+        kvm: true,
+        ..probe_assets()
+    }
+}
+
 pub fn probe_assets() -> Assets {
     let dist = Path::new(VMLAB_GUEST_DIST);
     let rootfs = rootfs_from_env()
@@ -251,6 +272,10 @@ pub struct MachineSpec {
     pub paused: bool,
     pub rtc_base: Option<String>,
     pub extra_ports: Vec<String>,
+    /// Boot the aarch64 guest asset on the emulated `virt` machine (phase
+    /// 3d) in place of the x86_64 one on KVM. The assets come from
+    /// [`probe_assets_aarch64`].
+    pub aarch64: bool,
 }
 
 impl MachineSpec {
@@ -267,6 +292,7 @@ impl MachineSpec {
             paused: false,
             rtc_base: None,
             extra_ports: Vec::new(),
+            aarch64: false,
         }
     }
 
@@ -433,7 +459,11 @@ pub fn launch(spec: &MachineSpec, assets: &Assets) -> Guest {
         fw_cfg: vec![],
         exit_on_reset: false,
         vfio: vec![],
-        machine: Default::default(),
+        machine: if spec.aarch64 {
+            vmlab_hv_proto::machine::Machine::Virt
+        } else {
+            Default::default()
+        },
         cpu: Default::default(),
         cpu_model: None,
         invtsc: false,
@@ -454,14 +484,23 @@ pub fn launch(spec: &MachineSpec, assets: &Assets) -> Guest {
         console_pci: None,
         ahci_pci: None,
         name: spec.name.clone(),
-        arch: Arch::X86_64,
-        accel: Accel::Kvm,
+        arch: if spec.aarch64 {
+            Arch::Aarch64
+        } else {
+            Arch::X86_64
+        },
+        accel: if spec.aarch64 { Accel::Tcg } else { Accel::Kvm },
         vcpus: spec.vcpus,
         memory_mib: spec.memory_mib,
         boot: Boot::Kernel {
             kernel: assets.kernel.clone(),
             initrd: Some(assets.initrd.clone()),
-            cmdline: CMDLINE.to_string(),
+            cmdline: if spec.aarch64 {
+                CMDLINE_AARCH64
+            } else {
+                CMDLINE
+            }
+            .to_string(),
         },
         disks: vec![
             Disk {
