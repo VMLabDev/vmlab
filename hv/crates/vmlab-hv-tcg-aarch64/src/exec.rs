@@ -1454,6 +1454,7 @@ fn compile(
                 let call = Call {
                     function: helper.0.function,
                     condition: false,
+                    registers: None,
                     args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                     results: results
                         .iter()
