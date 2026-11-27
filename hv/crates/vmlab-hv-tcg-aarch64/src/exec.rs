@@ -48,7 +48,6 @@
 //! lockstep of the cards C6 and C8 and the probe of the system registers).
 //! This file holds no other instruction semantics.
 
-use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
@@ -58,11 +57,13 @@ use crate::state::{Context, State};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
+use vmlab_hv_tcg_ir::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
+use vmlab_hv_tcg_jit as jit;
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
@@ -818,6 +819,12 @@ struct Compiled {
     /// the PC at the entry (`A64Next::Relative`). The loop sets the PC from
     /// them after the outputs.
     next: Option<(Place, bool)>,
+    /// The compiled code of the block, when the JIT is on (3e DESIGN.md
+    /// J1). Code of an older generation of the region is none.
+    code: Option<jit::Entry>,
+    /// The emitter has no form for an operation of the block on this host:
+    /// it runs in the interpreter (H2b).
+    refused: bool,
 }
 
 /// The most arguments of a helper.
@@ -1242,6 +1249,8 @@ fn compile(
         outputs,
         terminal,
         next: next_pc,
+        code: None,
+        refused: false,
     })
 }
 
@@ -1596,6 +1605,294 @@ impl Compiled {
     }
 }
 
+/// What the thunk of compiled code reaches: the parts of the block that it
+/// runs an effect with, and the CPU around it.
+struct Env<'a, M> {
+    ops: &'a [Op],
+    generics: &'a [Generic],
+    accesses: &'a [Access16],
+    calls: &'a [Call],
+    leaves: &'a [Leave],
+    frame: *mut u64,
+    words: usize,
+    state: *mut State,
+    memory: &'a mut M,
+    side: &'a mut Side,
+    single: bool,
+    /// Why the block left, when an effect did not complete.
+    failed: Option<(u32, Failed)>,
+    stop: Option<Stop>,
+}
+
+/// What the thunk returns when the block leaves.
+const THUNK_LEFT: u64 = 2;
+
+/// The thunk of compiled code (3e DESIGN.md J1): it runs the operation
+/// `index` of the block as the interpreter does. The emitter put every word
+/// that the operation reads into the frame, and reads what it writes from
+/// there.
+///
+/// # Safety
+/// `env` is the `Env<M>` of the block that runs, and `index` one of its
+/// operations, which `compile` checked against the frame.
+unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u64) -> u64 {
+    // SAFETY: the caller's promise. Compiled code holds no reference into
+    // the environment while it calls.
+    let env = unsafe { &mut *env.cast::<Env<M>>() };
+    let op = &env.ops[index as usize];
+    // SAFETY: the frame of the block, which nothing else touches while the
+    // thunk runs.
+    let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
+    if (op.code as u8) < FIRST_EFFECT {
+        // SAFETY: `compile` checked every operation against the frame and
+        // the generic operations of the block.
+        if unsafe { block::step_unchecked(op, frame, env.generics) } {
+            return 0;
+        }
+        env.stop = Some(host("an arithmetic operation outside its domain"));
+        return THUNK_LEFT;
+    }
+    // SAFETY: the state of the CPU, which compiled code does not touch
+    // while it calls.
+    let state = unsafe { &mut *env.state };
+    match Compiled::effect(
+        op,
+        frame,
+        env.accesses,
+        env.calls,
+        env.leaves,
+        state,
+        env.memory,
+        env.side,
+        env.single,
+    ) {
+        Ok(()) => 0,
+        Err(failed) => {
+            env.failed = Some(failed);
+            THUNK_LEFT
+        }
+    }
+}
+
+/// The words of a place.
+fn place_words(place: Place) -> impl Iterator<Item = Slot> {
+    std::iter::once(place.slot).chain(place.wide.then_some(place.slot + 1))
+}
+
+impl Compiled {
+    /// Compile the block, or mark it as one that the emitter refuses.
+    fn compile_code(&mut self, jit: &mut jit::Jit) {
+        let leaves: Vec<Vec<Slot>> = self
+            .leaves
+            .iter()
+            .map(|leave| {
+                leave
+                    .outputs
+                    .iter()
+                    .flat_map(|(_, place)| place_words(*place))
+                    .chain(leave.address)
+                    .collect()
+            })
+            .collect();
+        let accesses: Vec<jit::Effect> = self
+            .accesses
+            .iter()
+            .map(|access| match *access {
+                Access16::Read {
+                    address,
+                    result,
+                    exit,
+                    ..
+                } => jit::Effect {
+                    reads: vec![address],
+                    writes: place_words(result).collect(),
+                    leave: Some(exit),
+                },
+                Access16::Write {
+                    address,
+                    value,
+                    exclusive,
+                    exit,
+                    ..
+                } => jit::Effect {
+                    reads: std::iter::once(address).chain(place_words(value)).collect(),
+                    writes: exclusive.into_iter().collect(),
+                    leave: Some(exit),
+                },
+            })
+            .collect();
+        let calls: Vec<jit::Effect> = self
+            .calls
+            .iter()
+            .map(|call| jit::Effect {
+                reads: call.args.iter().copied().flat_map(place_words).collect(),
+                writes: call
+                    .results
+                    .iter()
+                    .flat_map(|(place, _)| place_words(*place))
+                    .collect(),
+                leave: None,
+            })
+            .collect();
+        // The compiled code writes the next PC with the outputs, as it is
+        // in the frame: a distance from the entry is added after it runs.
+        let mut outputs = self.outputs.clone();
+        if let Some((place, _)) = self.next {
+            outputs.push((crate::state::slot::PC as u32, place));
+        }
+        let shape = jit::Shape {
+            ops: &self.ops,
+            generics: &self.generics,
+            frame: &self.frame,
+            accesses: &accesses,
+            calls: &calls,
+            leaves: &leaves,
+            inputs: &self.inputs,
+            outputs: &outputs,
+            instructions: self.instructions,
+        };
+        match jit.compile(&shape) {
+            Ok(entry) => self.code = Some(entry),
+            Err(_) => {
+                self.code = None;
+                self.refused = true;
+            }
+        }
+    }
+
+    /// Run the compiled code of the block. `None`: the budget did not hold
+    /// the block, and nothing ran.
+    fn run_code<M: Memory>(
+        &mut self,
+        entry: &jit::Entry,
+        jit: &jit::Jit,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+        budget: u64,
+    ) -> Option<(u32, Option<Halt>)> {
+        let pc = state.pc();
+        side.user = self.context.el == 0;
+        let state_pointer: *mut State = state;
+        let frame = self.frame.as_mut_ptr();
+        let mut env = Env {
+            ops: &self.ops,
+            generics: &self.generics,
+            accesses: &self.accesses,
+            calls: &self.calls,
+            leaves: &self.leaves,
+            frame,
+            words: self.frame.len(),
+            state: state_pointer,
+            memory,
+            side,
+            single: self.instructions == 1,
+            failed: None,
+            stop: None,
+        };
+        let mut context = jit::Context {
+            budget: budget.min(i64::MAX as u64) as i64,
+            thunk: thunk::<M>,
+            env: (&raw mut env).cast(),
+        };
+        // SAFETY: `entry` is current and was compiled from this block, whose
+        // frame and register slots are as large as its shape names. While
+        // the code runs, only it and the thunk touch the frame and the
+        // state, and the thunk reaches them through `env` alone.
+        let code = unsafe {
+            jit.enter(
+                entry,
+                &mut context,
+                (&raw mut (*state_pointer).slots).cast(),
+                frame,
+            )
+        };
+        let failed = env.failed.take();
+        let stop = env.stop.take();
+        match code {
+            jit::DONE => {
+                if let Some((_, true)) = self.next {
+                    state.set_pc(pc.wrapping_add(state.pc()));
+                }
+                // The loop runs the last instruction with the PC at it.
+                if let Some((distance, _)) = self.terminal {
+                    state.set_pc(pc.wrapping_add(distance));
+                }
+                Some((self.instructions, None))
+            }
+            jit::BUDGET => None,
+            _ => Some(match (failed, stop) {
+                (Some((exit, failed)), _) => self.leave(state, exit, failed),
+                (None, stop) => (
+                    0,
+                    Some(Halt::Stop(stop.unwrap_or_else(|| {
+                        host("compiled code left the block without a reason")
+                    }))),
+                ),
+            }),
+        }
+    }
+}
+
+/// What the JIT of a CPU did, for the bench rows and the debug log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitCounts {
+    /// Runs of compiled blocks, and their instructions.
+    pub compiled_runs: u64,
+    pub compiled_instructions: u64,
+    /// Runs of blocks in the interpreter while the JIT is on, and their
+    /// instructions: blocks that the emitter refused (H2b), and blocks that
+    /// the budget did not hold at their head.
+    pub interpreted_runs: u64,
+    pub interpreted_instructions: u64,
+    /// Blocks compiled and refused, the bytes of code, the resets of the
+    /// region and the host time of the compiles.
+    pub compiled: u64,
+    pub refused: u64,
+    pub bytes: u64,
+    pub resets: u64,
+    pub compile_ns: u64,
+}
+
+/// Run `block` on its compiled code when the JIT is on and takes it, else
+/// in the interpreter.
+fn execute<M: Memory>(
+    block: &mut Compiled,
+    state: &mut State,
+    memory: &mut M,
+    side: &mut Side,
+    jit: &mut Option<jit::Jit>,
+    counts: &mut JitCounts,
+    budget: u64,
+) -> (u32, Option<Halt>) {
+    let Some(jit) = jit.as_mut() else {
+        return block.run(state, memory, side);
+    };
+    if !block.refused && !block.code.is_some_and(|entry| jit.current(&entry)) {
+        block.compile_code(jit);
+    }
+    if let Some(entry) = block.code
+        && let Some(done) = block.run_code(&entry, jit, state, memory, side, budget)
+    {
+        counts.compiled_runs += 1;
+        counts.compiled_instructions += u64::from(done.0);
+        return done;
+    }
+    let done = block.run(state, memory, side);
+    counts.interpreted_runs += 1;
+    counts.interpreted_instructions += u64::from(done.0);
+    done
+}
+
+/// Whether `VMLAB_HV_JIT` turns the JIT on: `1`, `on` or `true`. It is off
+/// by default (3e DESIGN.md J1, H2e).
+pub fn jit_from_environment() -> bool {
+    matches!(
+        std::env::var("VMLAB_HV_JIT").as_deref(),
+        Ok("1" | "on" | "true")
+    )
+}
+
 /// The translated blocks of a CPU: an entry for each code address, picked
 /// by the low bits of the physical address, and a store of the blocks that
 /// lost their entry to other code. A kernel and its programs run more code than the entries
@@ -1747,6 +2044,12 @@ pub struct Cpu<M> {
     /// memory holds.
     epoch: u64,
     side: Side,
+    /// The JIT, when it is on (3e DESIGN.md J1).
+    jit: Option<jit::Jit>,
+    jit_counts: JitCounts,
+    /// Why the JIT that `VMLAB_HV_JIT` asked for could not start. The owner
+    /// of the CPU writes it to its log.
+    pub jit_error: Option<String>,
 }
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
@@ -1760,7 +2063,7 @@ impl<M: Memory> Cpu<M> {
     pub fn new(memory: M, state: State) -> Self {
         let generation = memory.generation();
         let side = Side::new(&state);
-        Self {
+        let mut cpu = Self {
             state,
             memory,
             irq: false,
@@ -1782,7 +2085,43 @@ impl<M: Memory> Cpu<M> {
             generation,
             epoch: 1,
             side,
+            jit: None,
+            jit_counts: JitCounts::default(),
+            jit_error: None,
+        };
+        if jit_from_environment()
+            && let Err(error) = cpu.set_jit(true)
+        {
+            cpu.jit_error = Some(error.to_string());
         }
+        cpu
+    }
+
+    /// Turn the JIT on or off. On: every block runs as compiled code where
+    /// the emitter takes it. Off: the code region is dropped.
+    pub fn set_jit(&mut self, on: bool) -> std::io::Result<()> {
+        if on == self.jit.is_some() {
+            return Ok(());
+        }
+        self.jit = if on { Some(jit::Jit::new()?) } else { None };
+        Ok(())
+    }
+
+    pub fn jit_enabled(&self) -> bool {
+        self.jit.is_some()
+    }
+
+    /// What the JIT did since the CPU was made.
+    pub fn jit_counts(&self) -> JitCounts {
+        let mut counts = self.jit_counts;
+        if let Some(jit) = &self.jit {
+            counts.compiled = jit.stats.compiled;
+            counts.refused = jit.stats.refused;
+            counts.bytes = jit.stats.bytes;
+            counts.resets = jit.stats.resets;
+            counts.compile_ns = jit.stats.compile_ns;
+        }
+        counts
     }
 
     /// The physical address of the virtual address `va`, when it has one,
@@ -2489,7 +2828,15 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return Err(host("the block cache lost a block"));
         };
-        let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+        let (count, halt) = execute(
+            block,
+            &mut self.state,
+            &mut self.memory,
+            &mut self.side,
+            &mut self.jit,
+            &mut self.jit_counts,
+            u64::MAX,
+        );
         // The loop runs the last instruction at the PC that the block left.
         let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
         Ok((count, self.finish(halt, terminal)))
@@ -2582,7 +2929,15 @@ impl<M: Memory> Cpu<M> {
                 && let Some(block) = self.blocks.entries[index].as_mut()
                 && u64::from(block.instructions) <= left
             {
-                let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+                let (count, halt) = execute(
+                    block,
+                    &mut self.state,
+                    &mut self.memory,
+                    &mut self.side,
+                    &mut self.jit,
+                    &mut self.jit_counts,
+                    left,
+                );
                 let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
                 (count, self.finish(halt, terminal))
             } else {
