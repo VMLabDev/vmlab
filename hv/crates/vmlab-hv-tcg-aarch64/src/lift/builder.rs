@@ -11,9 +11,7 @@ use crate::flags;
 use crate::state::{Context, REGISTER_FILE, slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitId, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
-use vmlab_hv_tcg_ir::native::{
-    Binary, Helper, HelperRef, Operation, ScalarId, ScalarType, Unary,
-};
+use vmlab_hv_tcg_ir::native::{Binary, Helper, HelperRef, Operation, ScalarId, ScalarType, Unary};
 
 /// A PSTATE field that `MSR` writes with an immediate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -91,7 +91,10 @@ fn superblocks_leave_what_the_interpreter_leaves() {
         Ok(report) => {
             eprintln!("K2 joins: seed {seed:#x}: {report:?}");
             assert!(report.compiled_blocks > report.refused_blocks);
-            assert!(report.joins > 1_000 && report.side_exits > 500, "{report:?}");
+            assert!(
+                report.joins > 1_000 && report.side_exits > 500,
+                "{report:?}"
+            );
         }
         Err(difference) => panic!("{difference}"),
     }
@@ -108,7 +111,10 @@ fn the_replay_check_finds_no_difference_on_superblocks() {
     match jitdiff::run_joins(seed, 1_000, options) {
         Ok(report) => {
             eprintln!("K3 joins: seed {seed:#x}: {report:?}");
-            assert!(report.checked_blocks > 0 && report.side_exits > 0, "{report:?}");
+            assert!(
+                report.checked_blocks > 0 && report.side_exits > 0,
+                "{report:?}"
+            );
         }
         Err(difference) => panic!("{difference}"),
     }

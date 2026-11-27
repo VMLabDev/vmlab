@@ -66,10 +66,9 @@ use crate::asm::{
 use crate::tlb::{ADDEND, ENTRIES, ENTRY_BITS, TAG, WATCH};
 use crate::{
     BUDGET, CHAIN, CONTEXT_ACCESSES, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV,
-    CONTEXT_REFUND,
-    CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_THUNK,
-    CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
-    WATCHED,
+    CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_REFUND,
+    CONTEXT_THUNK, CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS,
+    SITES, VERIFY, WATCHED,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Kind as GenericKind, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::{Binary, ScalarType, Unary};
@@ -1283,14 +1282,14 @@ impl Emitter<'_> {
             .filter(|op| inline_access(op, memory).is_some())
             .count();
         if after != 0 {
-            self.asm.alu_imm(
-                Alu::Sub,
-                Rm::Mem(R13, CONTEXT_ACCESSES),
-                after as i32,
-            );
+            self.asm
+                .alu_imm(Alu::Sub, Rm::Mem(R13, CONTEXT_ACCESSES), after as i32);
         }
         for (_, place) in &side.outputs {
-            for word in [place.slot, place.slot + 1].into_iter().take(1 + usize::from(place.wide)) {
+            for word in [place.slot, place.slot + 1]
+                .into_iter()
+                .take(1 + usize::from(place.wide))
+            {
                 let w = self.words[usize::from(word)];
                 Self::home_code(&mut self.asm, word, w);
             }
@@ -1312,11 +1311,8 @@ impl Emitter<'_> {
             self.asm.alu_imm(Alu::Add, Rm::Mem(R15, pc), distance);
         }
         if side.skipped != 0 {
-            self.asm.alu_imm(
-                Alu::Add,
-                Rm::Mem(R13, CONTEXT_REFUND),
-                side.skipped as i32,
-            );
+            self.asm
+                .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_REFUND), side.skipped as i32);
         }
         let jump = self.asm.label();
         let stub = self.asm.label();
