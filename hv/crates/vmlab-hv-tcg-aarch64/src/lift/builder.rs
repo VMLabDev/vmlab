@@ -656,7 +656,12 @@ impl Builder {
     /// The carry is "no borrow", `a` at least `b` unsigned, and the signed
     /// overflow is the operands differing in sign and the result differing
     /// from `a`.
-    pub fn subtract_with_flags(&mut self, width: u16, a: ScalarId, b: ScalarId) -> (ScalarId, Flags) {
+    pub fn subtract_with_flags(
+        &mut self,
+        width: u16,
+        a: ScalarId,
+        b: ScalarId,
+    ) -> (ScalarId, Flags) {
         let result = self.binary(width, Binary::Sub, a, b);
         let carry_out = self.compare(Binary::LessEqualUnsigned, b, a);
         let operands = self.binary(width, Binary::Xor, a, b);

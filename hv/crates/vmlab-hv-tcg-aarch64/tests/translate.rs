@@ -359,7 +359,13 @@ fn an_access_late_in_a_block_leaves_with_the_registers_before_it() {
     // not in Normal memory (card S4). Where it faults, the three
     // instructions before it are written back and the load is not.
     for (attribute, strict, faults) in [(0u64, false, false), (1, false, true), (0, true, true)] {
-        let mut machine = Machine::new(&[add_x(3, 3, 1), subs(4, 3, 5), sub_w(6, 3, 5), ldr(1, 0), HVC]);
+        let mut machine = Machine::new(&[
+            add_x(3, 3, 1),
+            subs(4, 3, 5),
+            sub_w(6, 3, 5),
+            ldr(1, 0),
+            HVC,
+        ]);
         machine.map(VA, DATA | AF | NO_EXECUTE | attribute << 2);
         if strict {
             machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::A;
@@ -384,7 +390,11 @@ fn an_access_late_in_a_block_leaves_with_the_registers_before_it() {
             assert_eq!(machine.abort(), Some((VA + 3, 0x9600_0021)), "{case}");
             assert_eq!(state.system.regs[sysreg::reg::ELR_EL1], CODE + 12, "{case}");
             // N set, Z, C and V clear: 11 - 20 borrows.
-            assert_eq!(state.system.regs[sysreg::reg::SPSR_EL1] >> 28, 0b1000, "{case}");
+            assert_eq!(
+                state.system.regs[sysreg::reg::SPSR_EL1] >> 28,
+                0b1000,
+                "{case}"
+            );
             assert_eq!(state.x(1), 0x77, "{case}");
         } else {
             assert_eq!(machine.cpu.exceptions, 0, "{case}");
@@ -410,7 +420,10 @@ fn a_pair_of_x_registers_is_one_access() {
         assert_eq!(machine.word(DATA + offset), 0x0102_0304_0506_0708);
         assert_eq!(machine.word(DATA + offset + 8), 0x1112_1314_1516_1718);
         let state = &machine.cpu.state;
-        assert_eq!((state.x(3), state.x(4)), (0x0102_0304_0506_0708, 0x1112_1314_1516_1718));
+        assert_eq!(
+            (state.x(3), state.x(4)),
+            (0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
+        );
     }
     // A pair that crosses into a page without a translation: the fault
     // names the first byte of that page, and no register is written.
@@ -436,7 +449,10 @@ fn a_pair_of_x_registers_is_one_access() {
             assert_eq!(machine.word(DATA + offset), 0);
         } else {
             assert_eq!(machine.cpu.exceptions, 0);
-            assert_eq!((machine.word(DATA + offset), machine.word(DATA + offset + 8)), (0xaa, 0xbb));
+            assert_eq!(
+                (machine.word(DATA + offset), machine.word(DATA + offset + 8)),
+                (0xaa, 0xbb)
+            );
         }
     }
 }

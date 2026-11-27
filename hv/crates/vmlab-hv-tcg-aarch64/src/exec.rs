@@ -1170,7 +1170,9 @@ fn compile(
             _ => (false, 1),
         };
         if !device.is_power_of_two() || device > 16 {
-            return Err(host("an access whose Device alignment is not 1 to 16 bytes"));
+            return Err(host(
+                "an access whose Device alignment is not 1 to 16 bytes",
+            ));
         }
         let mode = (if unprivileged { UNPRIVILEGED } else { 0 }) | (device - 1);
         match event {
@@ -1706,7 +1708,9 @@ impl Compiled {
             } else if !unsafe { block::step_unchecked(op, frame, &self.generics) } {
                 return (
                     0,
-                    Some(Halt::Stop(host("an arithmetic operation outside its domain"))),
+                    Some(Halt::Stop(host(
+                        "an arithmetic operation outside its domain",
+                    ))),
                 );
             }
         }
