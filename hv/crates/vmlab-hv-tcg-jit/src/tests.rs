@@ -5,6 +5,7 @@
 
 use super::*;
 use std::sync::atomic::AtomicU32;
+use emit::THUNK_ACCESS;
 use tlb::FastTlb;
 use vmlab_hv_tcg_ir::block::{Code, Op, Place, Slot, op_in_frame, step_unchecked};
 
@@ -680,6 +681,7 @@ fn the_head_of_a_block_takes_its_count_from_the_budget() {
                 wide: false,
             },
         )],
+        memory: Memory::Thunk,
     };
     let mut slots = [0u128; 1];
     let (code, _, _) = compiled(&mut jit, &block, &mut slots, 0);
