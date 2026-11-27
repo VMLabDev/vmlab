@@ -2267,7 +2267,6 @@ unsafe fn run_code<M: Memory>(
     // Every block head took its instructions from the budget, and gave them
     // back when they did not fit.
     let taken = u32::try_from(budget - left).unwrap_or(u32::MAX);
-    counts.compiled_runs += 1;
     counts.chained += context.chained;
     counts.jump_hits += context.hits;
     let last = context.block.cast::<Compiled>();
@@ -2334,6 +2333,7 @@ unsafe fn run_code<M: Memory>(
             }
         }
     };
+    counts.compiled_runs += 1;
     counts.compiled_instructions += u64::from(ran.count);
     Some(ran)
 }
