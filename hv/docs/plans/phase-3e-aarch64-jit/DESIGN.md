@@ -742,14 +742,15 @@ J1). After: `f286f9b3`. Other cards ran boots and builds at the same time
   card (`01d6a923`, `e8e239ff`), both with heavy work of other processes on
   the host: udev did not find the EFI partition within its 90 s, where the
   other boots needed 22 to 35 s. A boot with only the linked jumps, one with
-  only the jump cache, and one with both passed at low load. Then each clear
-  of the jump cache wrote its 128 KiB, and a phase with many system calls
-  paid two to four of those writes for each. Since `ca9d9be6` a clear moves
-  a generation that every key holds, and the three boots of the rows passed
-  at a load of 15 to 27. The basis that the cause was the clear, not a
-  defect of the chaining, is that (not proven): the failed phase ran the
-  same instructions in more host time, the boots of each half and the boots
-  after the change passed, and no difference showed in K2 or K1.
+  only the jump cache, and one with both passed at low load. At those
+  commits each clear of the jump cache wrote all of its 128 KiB, and a phase
+  with many system calls paid two to four of those writes for each call.
+  Since `ca9d9be6` a clear moves a generation that every key holds, and the
+  three boots of the rows passed at a load of 15 to 27. That the clear was
+  the cause, and not a defect of the chaining, is an explanation and not
+  proven. Its basis: the failed phase ran the same instructions in more host
+  time, the boots of each half and the boots after the change passed, and
+  K1 and K2 found no difference.
 
 ## 8. The cards
 
