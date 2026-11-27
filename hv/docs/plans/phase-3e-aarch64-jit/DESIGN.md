@@ -1130,6 +1130,130 @@ to 27, the two columns side by side.
   with the plugin, so the 18e9 instructions of a Debian boot are about 9.4
   hours. Neither the follower for that boot nor its nightly run was built.
 
+### C13b, measured by card C13b (#1144)
+
+Helios, 2026-11-28, *measured*, `next` at `4af3439a` with the JIT on by
+default. Other cards ran builds and boots at the same time, and so did this
+card: its merge bar, the boot that wrote the windows of O4w and the window
+lockstep (load average 4 to 10 of 32 threads).
+
+**The stack profile.** Debian 13 to agent ready at one vCPU, cores 16 to
+19, a W1 build (line tables, frame pointers), `VMLAB_HV_JIT_PERF_MAP=1`,
+sampled by `measure/ipstack.c` at 1000 Hz with the user call chain over
+frame pointers, every 5 s from the release of the CPUs to agent ready (79.0
+s, 16 windows, 73,954 samples, 99.2 % of them on `vcpu-0`), and resolved by
+`measure/ipstack.py`. Compiled code keeps no frame pointer, so a chain that
+starts in it ends there: the leaf is what the numbers below count.
+
+| Leaf (its caller) | Share of the vCPU |
+|---|---|
+| Compiled code | 17.3 % |
+| `Seat::prepare` (`run_chained`) | 10.7 % |
+| libc, a function that it does not export, with no frame below (called from compiled code or a helper) | 8.4 % |
+| `run_chained` (`execute`) | 5.4 % |
+| `execute` (`run_inner`, and `Cpu::run_block_within`) | 6.0 % |
+| `Cpu::run` (`EmulatedVcpu::run`) | 4.5 % |
+| `thunk` (compiled code) | 3.3 % |
+| `Jit::link` (`make_link`) | 2.5 % |
+| The map of blocks by (address, context): `remove` and `insert` | 2.2 % |
+| libc again, called from `Cpu` (1.4 %), from `asynchronous` (1.1 %), from the translation (1.0 %) and from `Vec` growth (1.3 %) | 4.8 % |
+| `Cache::revive` | 1.2 % |
+| `GuestBus::write` and `load_reserved` behind a store pair, a `DC ZVA` and a load | 2.5 % |
+| The translation (class of `ipclass.py`) | 6.0 % |
+| FP and vector helpers (`simd::same`, `lane`, `eval`, `run`) | 2.7 % |
+
+- **C13b-P1. The three largest costs that remain.**
+  1. *Into and out of compiled code*: `Seat::prepare`, `run_chained`,
+     `execute`, `Cpu::run`, `run_inner` and the thunk, 31.5 % together. The
+     J8 rows count 247 million entries into compiled code in a Debian boot,
+     one for every 73 instructions. `Seat::prepare` writes the budget of the
+     seat with a sequentially consistent store at each entry, which on x86
+     waits for the store buffer of the code before it (basis of the
+     explanation, not measured apart): its 10.7 % of 79 s are about 34 ns
+     an entry.
+  2. *Translation and the code cache*: the lift and the emitter (6.0 %),
+     `Jit::link`, the map of blocks, `Cache::revive` and the allocations of
+     the translation, about 14 % together. J6d counts 0.95 million blocks and 6 drops of the
+     region in a boot, each drop compiling the working set again.
+  3. *Memory behind the fast TLB*: the libc function with no frame (8.4 %),
+     libc under `asynchronous` (1.1 %) and the RAM paths of `GuestBus` (2.5
+     %), about 12 %. Which libc function
+     it is was not resolved: glibc does not export its memmove and memset,
+     and no caller is in the chain.
+- **C13b-P2.** The guest's own work, compiled code, is 17.3 % of the vCPU.
+
+**S1, the boot matrix.** The four templates at 1 and 2 vCPUs, three repeats
+each, to agent ready (`bench/run.py --suite boot`), the 1 vCPU column on
+cores 20 to 23 and the 2 vCPU column on cores 24 to 27, side by side. This
+card adds no row to `bench/history/aarch64.jsonl`: it changed no speed, and
+its rows ran on a host that other cards and this card loaded, so they would
+be a wrong base for the next speed card to compare with.
+
+| Template | 1 vCPU, s (each repeat) | 2 vCPUs, s (each repeat) |
+|---|---|---|
+| alpine-3.23 | 113.6, 124.3, 98.7 | 108.2, 95.0, 88.3 |
+| debian-13 | 76.8, 84.6, 80.5 | 54.8, 54.5, 54.1 |
+| fedora-44 | 172.5, 160.5; 149.6, 157.1, emergency mode; emergency mode; emergency mode | 160.3, 160.4, 182.0 |
+| ubuntu-24.04 | 193.7, 144.2, 188.6 | 123.0, 154.7, 242.0 |
+
+- **C13b-S1. S1 does not hold for Fedora at one vCPU.** Of seven boots
+  (two runs of three, the first cut short by the VM cap of the host after
+  two repeats, and two runs of one), four reached agent ready in 149.6 to
+  172.5 s and three went to emergency mode on the 90 s device timeout of
+  systemd (`dev-disk-by-uuid`, once also `dev-zram0`), the failure of
+  #1048 and J6f. In each of the three the rate of the vCPU fell from 170 to
+  240 MIPS to 90 to 130 MIPS from about 80 s on and to 20 to 50 MIPS after
+  that, against 115 to 170 MIPS in the same phase of a good boot. The host
+  had a load of 7 to 12 then: the boot that wrote the windows (68 copies of
+  2 GiB of RAM), the window lockstep, the merge bar of this card, and the
+  boots and builds of other cards, once a VM of another card pinned to the
+  same cores 20 to 23. J8 had all three Fedora boots at one vCPU at agent
+  ready in 148 to 169 s on a host at a load of 2 to 10. So Fedora at one
+  vCPU reaches agent ready with no margin on a loaded host: the remaining
+  speed is the three costs of C13b-P1.
+- **C13b-S2.** No serial log of the other 21 boots of the matrix has a line
+  of emergency mode, a failed dependency, a timed-out job, an oops or a
+  segfault, and each of them reached agent ready inside 600 s (the longest
+  242.0 s). Repeats that the bench refused for
+  want of a VM slot on the host (the cap of four counts the QEMU leaders of
+  the lockstep too) were run again and are not in the table.
+- **C13b-S3.** The Ubuntu boots of 190 to 242 s ran while the merge bar of
+  this card built and tested on the same host.
+
+**O4, the boot lockstep of Debian.** O4w of 3d (`just
+tcg-a64-window-lockstep`). Debian 13 at one vCPU wrote 68 windows, one every
+250 million instructions from 1e9 to 17.75e9, and reached agent ready in
+124.9 s. The window lockstep, cores 16 to 19, the JIT on, a budget of 40
+million instructions a window, compared 1,821,246,744 instructions in 3,410
+s with no CPU difference: 769 million in 24 windows of the firmware and the
+boot loader, 866 million in 33 windows of the kernel with 47,999 exceptions,
+and 186 million in 11 windows of user space with 14,682 exceptions. 502 of
+the exceptions were taken at a fetch. 39 windows ended at their budget, 28
+at an access outside RAM and one at `WFI`. The boot and the run took 59
+minutes, inside the two hours of the card.
+
+- **C13b-O1. Two defects of the harness**, both found by the first windows
+  and fixed: an instruction abort at the fetch of the next instruction has
+  no record of its own in the stream of the leader, so the follower steps
+  into it; and the plugin wrote the PC of an instruction as the address
+  that QEMU translated its block at, plus the offset. One block of QEMU
+  serves two virtual addresses of the same code (a shared library in two
+  processes), and the record then named the address of the other process.
+  The plugin now takes the PC register at the start of each block. With it
+  the AAVMF run of K4 (J8f) went past 351,352,700 instructions, where the
+  stream of the leader had stopped, sent the four keys of the boot menu,
+  and had no CPU difference in the 469.8 million instructions until this
+  card stopped it after 902 s. The O3 group `c1` gave no difference with
+  the new plugin (29,023 instructions in 1,400 rounds).
+- **C13b-O2. kvm-unit-tests** (`just tcg-a64-kvm-unit-tests`, the JIT on by
+  default; `selftest-smp`, `gicv2-ipi`, `gicv2-mmio`, `gicv2-mmio-3p`,
+  `gicv2-active` and `psci` at 4 vCPUs, `timer` at 1): 5 tests give the
+  results of QEMU, and the two `gicv2-mmio` tests pass subtests that fail on
+  QEMU, as in J7.
+- **C13b-O3. What O4w does not prove** is in 3d O4w (W1 to W5): interrupts,
+  devices and DMA, the instructions between the windows, and a defect of
+  ours earlier in the boot that left a state that is consistent.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same

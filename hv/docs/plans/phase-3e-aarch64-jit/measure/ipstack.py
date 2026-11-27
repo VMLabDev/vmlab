@@ -109,6 +109,19 @@ def symbolise(path, addresses):
     return result
 
 
+def dynamic_symbols(path):
+    """The sorted (address, size, name) of the exported functions of a
+    library. Its internal functions (the memmove and memset that glibc
+    selects at load) have no entry."""
+    out = subprocess.run(["nm", "-D", "-n", "-S", "--defined-only", path], capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[2] in "tTwWiI":
+            found.append((int(parts[0], 16), int(parts[1], 16), parts[3]))
+    return found
+
+
 def classify(function, where):
     text = function + " " + where
     for name, pattern in CLASSES:
@@ -165,8 +178,13 @@ def main():
                 names[(path, address)] = chain
         else:
             short = os.path.basename(path)
+            symbols = dynamic_symbols(path)
+            starts = [address for address, _, _ in symbols]
             for address in addresses:
-                names[(path, address)] = [(short, short)]
+                at = bisect.bisect_right(starts, address) - 1
+                inside = at >= 0 and address < symbols[at][0] + symbols[at][1]
+                name = f"{short}:{symbols[at][2]}" if inside else f"{short}, not exported"
+                names[(path, address)] = [(name, short)]
 
     def chain_of(frame):
         if frame[0] == JIT:
