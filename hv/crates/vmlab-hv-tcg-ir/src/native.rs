@@ -300,8 +300,8 @@ impl Graph {
         // A scalar names only scalars before it, which have their new
         // numbers already, and it moves to a place at or before its own.
         let mut next = 0;
-        for id in 0..self.scalars.len() {
-            if !keep[id] {
+        for (id, retain) in keep.iter().enumerate().take(self.scalars.len()) {
+            if !*retain {
                 continue;
             }
             {
