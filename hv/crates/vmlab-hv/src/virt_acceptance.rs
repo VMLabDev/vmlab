@@ -415,6 +415,7 @@ fn snapshots_of_an_emulated_aarch64_machine_online_and_offline() {
     assert!(size("online").unwrap() > 0);
 
     // A new process loads the online snapshot.
+    std::fs::remove_file(dir.path().join("control.sock")).ok();
     let mut machine = Machine::start(dir.path(), &desc);
     ok(machine
         .client

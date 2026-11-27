@@ -463,8 +463,9 @@ fn a_snapshot_of_an_emulated_machine_brings_its_cpu_gic_timer_and_ram_back() {
     vm.start();
     counted_past(&handle, 1000);
     handle.pause().unwrap();
-    let at_save = count(&handle);
+    // The vCPU ends its slice before it parks: its lock waits for that.
     let cpu_at_save = cpu_state(&vcpus[0]);
+    let at_save = count(&handle);
     let gic_at_save = gic_state(&handle);
     // The pause can fall between the store and the MSR.
     let tpidr = cpu_at_save.system.regs[vmlab_hv_tcg_aarch64::sysreg::index("TPIDR_EL1")];

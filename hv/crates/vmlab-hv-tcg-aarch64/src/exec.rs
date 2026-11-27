@@ -2250,17 +2250,19 @@ mod tests {
         let mut cpu = cpu(&LOOP);
         cpu.state.set_x(1, 10);
         assert_eq!(cpu.run(30), Stop::Budget);
-        assert_eq!(cpu.translations, 1);
+        assert!(cpu.blocks.entries.iter().any(Option::is_some));
+        let translations = cpu.translations;
         let mut state = State::reset(BASE);
         state.set_x(1, 5);
         cpu.replace_state(state);
+        // No block and no translation of the state before is kept.
         assert_eq!(cpu.tlb_entries(), 0);
+        assert!(cpu.blocks.entries.iter().all(Option::is_none));
+        assert!(cpu.singles.entries.iter().all(Option::is_none));
         assert_eq!(cpu.state.x(0), 0);
         assert_eq!(cpu.run(15), Stop::Budget);
         assert_eq!(cpu.state.x(0), 5);
-        // The block of the loop is translated again: no block of the state
-        // before is used.
-        assert_eq!(cpu.translations, 2);
+        assert!(cpu.translations > translations);
     }
 
     #[test]
