@@ -12,6 +12,11 @@
 //! TLB with their misses, and the thunk with its accesses of 16 bytes,
 //! generic operations and helper calls.
 //!
+//! Every other round keeps the accesses on both sides, as the lockstep
+//! does, which compiles the blocks of the compiled side so that their hits
+//! of the fast TLB are kept too, and the two lists of accesses are
+//! compared.
+//!
 //! `ci::check` runs a bounded number of rounds with a fixed seed (the test
 //! `tests/jit.rs`); `just tcg-a64-jit-diff` runs as many as it is asked.
 //!
@@ -163,6 +168,12 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
         .map_err(difference)?;
         let mut compiled =
             cpu(FlatMemory::new(RAM_BASE, bytes), state, true).map_err(difference)?;
+        // Every other round keeps the accesses on both sides, as the
+        // lockstep does: the compiled code then keeps those of its hits
+        // (`jit::Memory::Logged`), and the two lists must be the same.
+        let logged = round % 2 == 1;
+        reference.log_accesses(logged);
+        compiled.log_accesses(logged);
         let expected = reference.run(BUDGET);
         let got = compiled.run(BUDGET);
         if format!("{got:?}") != format!("{expected:?}") {
@@ -181,6 +192,16 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
             return Err(difference(format!(
                 "instructions and exceptions {counts:?}, the interpreter {:?}",
                 (reference.instructions, reference.exceptions)
+            )));
+        }
+        let (ours, theirs) = (compiled.take_accesses(), reference.take_accesses());
+        if ours != theirs {
+            let at = ours.iter().zip(&theirs).position(|(a, b)| a != b);
+            return Err(difference(format!(
+                "the accesses differ{}: compiled {:x?}, the interpreter {:x?}",
+                at.map_or(String::new(), |at| format!(" first at {at}")),
+                at.map_or(&ours[..], |at| &ours[at..(at + 1).min(ours.len())]),
+                at.map_or(&theirs[..], |at| &theirs[at..(at + 1).min(theirs.len())]),
             )));
         }
         let (ours, theirs) = (compiled.memory.bytes(), reference.memory.bytes());
