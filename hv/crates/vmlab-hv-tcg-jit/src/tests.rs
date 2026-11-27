@@ -863,10 +863,64 @@ fn access_block(ops: Vec<Op>, frame: Vec<u64>, result: Slot, memory: Memory) -> 
     }
 }
 
-#[test]
-fn a_hit_asks_nothing_and_a_miss_fills_the_tlb_for_the_next_run() {
-    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
-    // Load8 [RAM + 8] into word 2, Store4 of word 3 at [RAM + 0x1004].
+/// Run `block` once on `ram` with the tables `reads` and `writes`, which
+/// the thunk does not fill, the thunk running the operations of `thunk_ops`.
+/// The exit code, the calls of the thunk, and the misses among them.
+fn run_on_tables(
+    jit: &mut Jit,
+    block: &Block,
+    thunk_ops: &[Op],
+    ram: &mut [u8],
+    reads: *const tlb::Entry,
+    writes: *const tlb::Entry,
+) -> (u64, u64, u64, u64) {
+    let shape = Shape {
+        ops: &block.ops,
+        generics: &[],
+        frame: &block.frame,
+        accesses: &[],
+        calls: &[],
+        leaves: &block.leaves,
+        inputs: &[],
+        outputs: &block.outputs,
+        instructions: 1,
+        memory: block.memory,
+    };
+    let entry = jit.compile(&shape).expect("a block");
+    let mut frame = block.frame.clone();
+    let mut env = Env {
+        ops: thunk_ops.to_vec(),
+        frame: frame.as_mut_ptr(),
+        words: frame.len(),
+        calls: Vec::new(),
+        thunk_calls: 0,
+        left_at: None,
+        ram: ram.as_mut_ptr(),
+        tlb: FastTlb::new(),
+        watch: Vec::new(),
+        fill: false,
+        misses: 0,
+        watched: 0,
+        logged: Vec::new(),
+    };
+    let mut context = Context {
+        budget: 10,
+        thunk,
+        env: (&raw mut env).cast(),
+        reads,
+        writes,
+    };
+    let mut slots = [0u128; 1];
+    // SAFETY: the entry was just compiled from this block, the slots and
+    // the frame are as large as it names, and the caller's tables live
+    // through the run.
+    let code = unsafe { jit.enter(&entry, &mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
+    (code, env.thunk_calls, env.misses, env.watched)
+}
+
+/// A Load8 of the word 2 at the address of the word 1, and a Store4 of the
+/// word 3 at the address of the word 4.
+fn load_and_store(load_at: u64, store_at: u64) -> (Vec<Op>, Vec<u64>) {
     let ops = vec![
         Op {
             code: Code::Load8,
@@ -885,21 +939,20 @@ fn a_hit_asks_nothing_and_a_miss_fills_the_tlb_for_the_next_run() {
             imm: 1,
         },
     ];
-    let frame = vec![0, RAM + 8, 0, 0xaabb_ccdd_eeff_1122, RAM + 0x1004];
-    let block = access_block(ops, frame, 2, Memory::Inline);
+    (ops, vec![0, load_at, 0, 0xaabb_ccdd_eeff_1122, store_at])
+}
+
+#[test]
+fn a_hit_asks_nothing_and_a_miss_runs_the_access_in_the_thunk() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let (ops, frame) = load_and_store(RAM + 8, RAM + 0x1004);
+    let block = access_block(ops.clone(), frame, 2, Memory::Inline);
     let mut random = Random(9);
     let mut ram = pattern(&mut random);
     let want = u64::from_le_bytes(ram[8..16].try_into().expect("eight bytes"));
-    // An empty TLB: both miss.
+    // An empty TLB that the misses fill: both miss.
     let mut slots = [0u128; 1];
-    let ran = compiled_on(
-        &mut jit,
-        &block,
-        &mut slots,
-        10,
-        &mut ram,
-        Some(FastTlb::new()),
-    );
+    let ran = compiled_on(&mut jit, &block, &mut slots, 10, &mut ram, Some(FastTlb::new()));
     assert_eq!((ran.code, ran.misses, ran.thunk_calls), (DONE, 2, 2));
     assert_eq!(slots[0], u128::from(want));
     assert_eq!(&ram[0x1004..0x1008], &0xeeff_1122u32.to_le_bytes());
@@ -908,96 +961,30 @@ fn a_hit_asks_nothing_and_a_miss_fills_the_tlb_for_the_next_run() {
     let watch = AtomicU32::new(0);
     let host = ram.as_ptr() as usize;
     tlb.fill(1, false, RAM, host, 0, 0, 12);
-    tlb.fill(
-        1,
-        true,
-        RAM + 0x1000,
-        host + 0x1000,
-        &watch as *const _ as usize,
-        0x1000,
-        12,
-    );
-    ram[8] ^= 0xff;
-    let mut slots = [0u128; 1];
-    let shape = Shape {
-        ops: &block.ops,
-        generics: &[],
-        frame: &block.frame,
-        accesses: &[],
-        calls: &[],
-        leaves: &block.leaves,
-        inputs: &[],
-        outputs: &block.outputs,
-        instructions: 1,
-        memory: Memory::Inline,
-    };
-    let entry = jit.compile(&shape).expect("a block");
-    let mut code_frame = block.frame.clone();
-    let mut env = Env {
-        ops: block.ops.clone(),
-        frame: code_frame.as_mut_ptr(),
-        words: code_frame.len(),
-        calls: Vec::new(),
-        thunk_calls: 0,
-        left_at: None,
-        ram: ram.as_mut_ptr(),
-        tlb: FastTlb::new(),
-        watch: Vec::new(),
-        fill: false,
-        misses: 0,
-        watched: 0,
-        logged: Vec::new(),
-    };
-    let mut context = Context {
-        budget: 10,
-        thunk,
-        env: (&raw mut env).cast(),
-        reads: tlb.table(1, false),
-        writes: tlb.table(1, true),
-    };
+    let watch_at = &watch as *const AtomicU32 as usize;
+    tlb.fill(1, true, RAM + 0x1000, host + 0x1000, watch_at, 0x1000, 12);
     ram[0x1004..0x1008].fill(0);
-    // SAFETY: as in `compiled_on`, with the tables of `tlb`, which outlives
-    // the run.
-    let code = unsafe {
-        jit.enter(
-            &entry,
-            &mut context,
-            slots.as_mut_ptr(),
-            code_frame.as_mut_ptr(),
-        )
+    let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
+    let run = |jit: &mut Jit, block: &Block, ram: &mut [u8], writes| {
+        run_on_tables(jit, block, &ops, ram, reads, writes)
     };
-    assert_eq!((code, env.thunk_calls), (DONE, 0));
-    assert_eq!(slots[0], u128::from(want ^ 0xff));
+    assert_eq!(run(&mut jit, &block, &mut ram, writes), (DONE, 0, 0, 0));
     assert_eq!(&ram[0x1004..0x1008], &0xeeff_1122u32.to_le_bytes());
-    // The same with the write table of nothing: the store misses alone.
-    context.writes = tlb::EMPTY_TABLE.as_ptr();
-    context.budget = 10;
-    // SAFETY: as above.
-    let code = unsafe {
-        jit.enter(
-            &entry,
-            &mut context,
-            slots.as_mut_ptr(),
-            code_frame.as_mut_ptr(),
-        )
-    };
-    assert_eq!((code, env.thunk_calls, env.misses), (DONE, 1, 1));
-    // An access that is not aligned misses also in a page that the TLB
-    // holds, and one outside the memory leaves the block.
-    for (address, calls, done) in [(RAM + 9, 2, DONE), (RAM - 8, 3, LEFT)] {
-        code_frame[1] = address;
-        context.writes = tlb.table(1, true);
-        context.budget = 10;
-        // SAFETY: as above.
-        let code = unsafe {
-            jit.enter(
-                &entry,
-                &mut context,
-                slots.as_mut_ptr(),
-                code_frame.as_mut_ptr(),
-            )
-        };
-        assert_eq!((code, env.thunk_calls), (done, calls));
+    // The write table of nothing: the store misses alone.
+    let empty = tlb::EMPTY_TABLE.as_ptr();
+    assert_eq!(run(&mut jit, &block, &mut ram, empty), (DONE, 1, 1, 0));
+    // A load that is not aligned misses also in a page that the TLB holds,
+    // and one outside the memory leaves the block.
+    for (load_at, calls, code) in [(RAM + 9, 1, DONE), (RAM + 0x1ff8, 1, DONE), (RAM - 8, 1, LEFT)]
+    {
+        let (ops, frame) = load_and_store(load_at, RAM + 0x1004);
+        let block = access_block(ops, frame, 2, Memory::Inline);
+        // RAM + 0x1ff8 is in the second page, which has no read entry.
+        assert_eq!(
+            run(&mut jit, &block, &mut ram, writes),
+            (code, calls, calls, 0),
+            "{load_at:#x}"
+        );
     }
 }
 
@@ -1013,6 +1000,10 @@ fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
         imm: 0,
     };
     let frame = vec![0, RAM + 16, 0];
+    let mut ram = vec![0u8; PAGES * 4096];
+    let mut tlb = FastTlb::new();
+    tlb.fill(1, false, RAM, ram.as_ptr() as usize, 0, 0, 12);
+    let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
     for (op, memory) in [
         (
             Op {
@@ -1024,59 +1015,42 @@ fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
         (load, Memory::Thunk),
     ] {
         let block = access_block(vec![op], frame.clone(), 2, memory);
-        let mut ram = vec![0u8; PAGES * 4096];
+        // One call of the operation itself, not a miss. The test thunk
+        // runs the plain load.
+        assert_eq!(
+            run_on_tables(&mut jit, &block, &[load], &mut ram, reads, writes),
+            (DONE, 1, 0, 0)
+        );
+    }
+    // The same load inline: a hit.
+    let block = access_block(vec![load], frame, 2, Memory::Inline);
+    assert_eq!(
+        run_on_tables(&mut jit, &block, &[load], &mut ram, reads, writes),
+        (DONE, 0, 0, 0)
+    );
+}
+
+#[test]
+fn a_store_into_a_watched_page_tells_the_thunk_after_its_write() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let page = RAM + 4096 * WATCHED_PAGE as u64;
+    let (ops, frame) = load_and_store(RAM + 8, page + 4);
+    let block = access_block(ops.clone(), frame, 2, Memory::Inline);
+    let mut ram = vec![0u8; PAGES * 4096];
+    let host = ram.as_ptr() as usize;
+    let offset = WATCHED_PAGE * 4096;
+    for odd in [false, true] {
+        let watch = AtomicU32::new(2 + u32::from(odd));
         let mut tlb = FastTlb::new();
-        tlb.fill(1, false, RAM, ram.as_ptr() as usize, 0, 0, 12);
-        // The test thunk does not know the bit: it reads `aux` only through
-        // the code, so give it the plain load.
-        let mut slots = [0u128; 1];
-        let plain = access_block(vec![load], frame.clone(), 2, memory);
-        let shape = Shape {
-            ops: &block.ops,
-            generics: &[],
-            frame: &block.frame,
-            accesses: &[],
-            calls: &[],
-            leaves: &block.leaves,
-            inputs: &[],
-            outputs: &block.outputs,
-            instructions: 1,
-            memory,
-        };
-        let entry = jit.compile(&shape).expect("a block");
-        let mut code_frame = block.frame.clone();
-        let mut env = Env {
-            ops: plain.ops.clone(),
-            frame: code_frame.as_mut_ptr(),
-            words: code_frame.len(),
-            calls: Vec::new(),
-            thunk_calls: 0,
-            left_at: None,
-            ram: ram.as_mut_ptr(),
-            tlb: FastTlb::new(),
-            watch: Vec::new(),
-            fill: false,
-            misses: 0,
-            watched: 0,
-            logged: Vec::new(),
-        };
-        let mut context = Context {
-            budget: 10,
-            thunk,
-            env: (&raw mut env).cast(),
-            reads: tlb.table(1, false),
-            writes: tlb.table(1, true),
-        };
-        // SAFETY: as in `compiled_on`.
-        let code = unsafe {
-            jit.enter(
-                &entry,
-                &mut context,
-                slots.as_mut_ptr(),
-                code_frame.as_mut_ptr(),
-            )
-        };
-        // One call of the operation itself, not a miss.
-        assert_eq!((code, env.thunk_calls, env.misses), (DONE, 1, 0));
+        tlb.fill(1, false, RAM, host, 0, 0, 12);
+        let watch_at = &watch as *const AtomicU32 as usize;
+        tlb.fill(1, true, page, host + offset, watch_at, offset as u64, 12);
+        let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
+        ram[offset + 4..offset + 8].fill(0);
+        let ran = run_on_tables(&mut jit, &block, &ops, &mut ram, reads, writes);
+        // The store hit and wrote, and an odd word asked the thunk once.
+        let calls = u64::from(odd);
+        assert_eq!(ran, (DONE, calls, 0, calls), "odd: {odd}");
+        assert_eq!(&ram[offset + 4..offset + 8], &0xeeff_1122u32.to_le_bytes());
     }
 }
