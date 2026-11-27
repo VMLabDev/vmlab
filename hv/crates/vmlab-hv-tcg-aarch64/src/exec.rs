@@ -2653,6 +2653,33 @@ mod tests {
     }
 
     #[test]
+    fn block_counts_measure_rollback_work_and_pairs_without_changing_execution() {
+        // add x4, x4, #1 ; ldp x0, x1, [x2] ; stp x0, x1, [x3] ;
+        // movz x4, #0 ; b .
+        let words = [0x9100_0484, 0xa940_0440, 0xa900_0460, 0xd280_0004, 0x1400_0000];
+        let mut plain = cpu(&words);
+        let mut counted = cpu(&words);
+        counted.block_counts = Some(BlockCounts::default());
+        for cpu in [&mut plain, &mut counted] {
+            cpu.state.set_x(2, BASE + 0x1000);
+            cpu.state.set_x(3, BASE + 0x1010);
+            cpu.memory.write(BASE + 0x1000, &[0x5a; 16]).unwrap();
+            assert_eq!(cpu.run(5), Stop::Budget);
+            let mut copied = [0; 16];
+            cpu.memory.read(BASE + 0x1010, &mut copied).unwrap();
+            assert_eq!(copied, [0x5a; 16]);
+        }
+        assert_eq!(counted.state.slots, plain.state.slots);
+        assert_eq!(counted.instructions, plain.instructions);
+        let counts = counted.block_counts.unwrap();
+        assert_eq!(counts.blocks, 1);
+        assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
+        assert_eq!(counts.alignment_operations, 6);
+        // The discarded add is still needed to restore X4 on an early exit.
+        assert!(counts.exit_writeback_operations > 0);
+    }
+
+    #[test]
     fn a_machine_cpu_leaves_its_loop_when_its_timer_is_due() {
         // The virtual timer is due 20 us from now on a 1 GHz clock, and the
         // budget takes some milliseconds. A machine CPU leaves its loop
