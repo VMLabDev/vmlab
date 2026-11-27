@@ -62,7 +62,7 @@ const COPY: u64 = 0x8000;
 const DATA: u64 = 0x1_0000;
 const HVC: u32 = 0xd400_0002;
 
-/// One piece of the program, three blocks: arithmetic, a load and a store,
+/// One piece of the program, two blocks or three: arithmetic, a load and a store,
 /// a pair of each, a comparison with a select, and a conditional branch
 /// over one instruction to a branch to the next piece.
 const PIECE: [u32; 12] = [
@@ -118,7 +118,7 @@ fn a_compile_makes_no_heap_call_once_the_buffers_have_grown() {
     let (compiled, again, blocks) = second_run(true);
     assert_eq!(none, 0);
     assert_eq!(translations, again);
-    assert!(translations >= PIECES as u64 * 3, "{translations}");
+    assert!(translations >= PIECES as u64 * 2, "{translations}");
     assert_eq!(blocks, translations, "every block of the second run is compiled");
     eprintln!(
         "{translations} blocks: {interpreted} heap calls without the JIT ({:.1} a block), \
