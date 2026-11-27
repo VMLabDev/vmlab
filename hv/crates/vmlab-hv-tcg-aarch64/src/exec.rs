@@ -2761,15 +2761,15 @@ impl Compiled {
         let agree = match &whole {
             Some(shadow) => *shadow == *state,
             None => {
-                let flags = slot::FLAGS_KIND..=slot::FLAGS_B;
+                let flags = crate::state::slot::FLAGS_KIND..=crate::state::slot::FLAGS_B;
                 let same = compiled_slots[..*flags.start()] == interpreted_slots[..*flags.start()]
                     && compiled_slots[*flags.end() + 1..] == interpreted_slots[*flags.end() + 1..];
                 // NZCV as each lazy record gives it.
-                let nzcv = |slots: &[u128; slot::COUNT]| {
+                let nzcv = |slots: &[u128; crate::state::slot::COUNT]| {
                     crate::flags::nzcv(
-                        slots[slot::FLAGS_KIND] as u8,
-                        slots[slot::FLAGS_A] as u64,
-                        slots[slot::FLAGS_B] as u64,
+                        slots[crate::state::slot::FLAGS_KIND] as u8,
+                        slots[crate::state::slot::FLAGS_A] as u64,
+                        slots[crate::state::slot::FLAGS_B] as u64,
                     )
                 };
                 same && nzcv(compiled_slots) == nzcv(interpreted_slots)
