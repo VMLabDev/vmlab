@@ -500,30 +500,45 @@ mod tests {
                 add(format!("cmove {name}, {}", NAMES[s]), &|a| {
                     a.cmov(Cond::E, dst, Rm::Reg(src))
                 });
-                add(format!("lzcnt {name}, {}", NAMES[s]), &|a| a.lzcnt(dst, src));
-                add(format!("tzcnt {name}, {}", NAMES[s]), &|a| a.tzcnt(dst, src));
-                add(format!("popcnt {name}, {}", NAMES[s]), &|a| a.popcnt(dst, src));
-                add(
-                    format!("mov {}, {}", NAMES32[d], NAMES32[s]),
-                    &|a| a.mov32(dst, src),
-                );
-                add(
-                    format!("xor {}, {}", NAMES32[d], NAMES32[s]),
-                    &|a| a.xor32(dst, src),
-                );
+                add(format!("lzcnt {name}, {}", NAMES[s]), &|a| {
+                    a.lzcnt(dst, src)
+                });
+                add(format!("tzcnt {name}, {}", NAMES[s]), &|a| {
+                    a.tzcnt(dst, src)
+                });
+                add(format!("popcnt {name}, {}", NAMES[s]), &|a| {
+                    a.popcnt(dst, src)
+                });
+                add(format!("mov {}, {}", NAMES32[d], NAMES32[s]), &|a| {
+                    a.mov32(dst, src)
+                });
+                add(format!("xor {}, {}", NAMES32[d], NAMES32[s]), &|a| {
+                    a.xor32(dst, src)
+                });
             }
             for mem in &mems {
                 let text = rm_text(*mem);
                 add(format!("mov {name}, {text}"), &|a| a.mov(dst, *mem));
                 add(format!("mov {text}, {name}"), &|a| a.store(*mem, dst));
-                add(format!("add {name}, {text}"), &|a| a.alu(Alu::Add, dst, *mem));
-                add(format!("cmp {name}, {text}"), &|a| a.alu(Alu::Cmp, dst, *mem));
+                add(format!("add {name}, {text}"), &|a| {
+                    a.alu(Alu::Add, dst, *mem)
+                });
+                add(format!("cmp {name}, {text}"), &|a| {
+                    a.alu(Alu::Cmp, dst, *mem)
+                });
                 add(format!("imul {name}, {text}"), &|a| a.imul(dst, *mem));
                 add(format!("cmovb {name}, {text}"), &|a| {
                     a.cmov(Cond::B, dst, *mem)
                 });
             }
-            for value in [1u64, 0x7f, 0xffff_ffff, u64::MAX, 0xffff_ffff_8000_0000, 1 << 40] {
+            for value in [
+                1u64,
+                0x7f,
+                0xffff_ffff,
+                u64::MAX,
+                0xffff_ffff_8000_0000,
+                1 << 40,
+            ] {
                 let text = if value <= u64::from(u32::MAX) {
                     format!("mov {}, {value}", NAMES32[d])
                 } else if fits_i32(value as i64) {
@@ -540,7 +555,11 @@ mod tests {
                     });
                 }
             }
-            for (shift, text) in [(Shift::Shl, "shl"), (Shift::Shr, "shr"), (Shift::Sar, "sar")] {
+            for (shift, text) in [
+                (Shift::Shl, "shl"),
+                (Shift::Shr, "shr"),
+                (Shift::Sar, "sar"),
+            ] {
                 add(format!("{text} {name}, cl"), &|a| a.shift_cl(shift, dst));
                 // A count of 1 prints as the form without a count (D1).
                 for count in [2u8, 7, 63] {
@@ -559,9 +578,15 @@ mod tests {
         for mem in &mems {
             let text = rm_text(*mem);
             add(format!("mov {text}, -5"), &|a| a.store_imm(*mem, -5));
-            add(format!("mov {text}, 100000"), &|a| a.store_imm(*mem, 100_000));
-            add(format!("sub {text}, 64"), &|a| a.alu_imm(Alu::Sub, *mem, 64));
-            add(format!("add {text}, 1000"), &|a| a.alu_imm(Alu::Add, *mem, 1000));
+            add(format!("mov {text}, 100000"), &|a| {
+                a.store_imm(*mem, 100_000)
+            });
+            add(format!("sub {text}, 64"), &|a| {
+                a.alu_imm(Alu::Sub, *mem, 64)
+            });
+            add(format!("add {text}, 1000"), &|a| {
+                a.alu_imm(Alu::Add, *mem, 1000)
+            });
             add(format!("cmp {text}, 0"), &|a| a.alu_imm(Alu::Cmp, *mem, 0));
             add(format!("call {text}"), &|a| a.call_indirect(*mem));
         }
@@ -623,7 +648,11 @@ mod tests {
     #[test]
     fn every_form_is_the_instruction_that_llvm_mc_reads() {
         let cases = cases();
-        let intel = ["-triple=x86_64", "-x86-asm-syntax=intel", "-output-asm-variant=1"];
+        let intel = [
+            "-triple=x86_64",
+            "-x86-asm-syntax=intel",
+            "-output-asm-variant=1",
+        ];
         // A jump is printed relative to its own address by the
         // disassembler, so each case is placed at 0x1000 and decoded alone.
         // A relative jump is not assembled: Intel syntax reads its number
@@ -664,13 +693,24 @@ mod tests {
             } else {
                 let want = assembled.next().expect("llvm-mc read every case");
                 if line != want {
-                    wrong.push(format!("{text}: {code:02x?} decodes as {line:?}, not {want:?}"));
+                    wrong.push(format!(
+                        "{text}: {code:02x?} decodes as {line:?}, not {want:?}"
+                    ));
                 }
             }
         }
         assert!(assembled.next().is_none(), "llvm-mc read one line per case");
-        assert_eq!(got.len(), cases.len(), "one instruction per case: {wrong:#?}");
-        assert!(wrong.is_empty(), "{} of {}: {wrong:#?}", wrong.len(), cases.len());
+        assert_eq!(
+            got.len(),
+            cases.len(),
+            "one instruction per case: {wrong:#?}"
+        );
+        assert!(
+            wrong.is_empty(),
+            "{} of {}: {wrong:#?}",
+            wrong.len(),
+            cases.len()
+        );
     }
 
     #[test]
@@ -688,7 +728,9 @@ mod tests {
         // je +1 (over the ret), ret, jmp -10 (back to the ret).
         assert_eq!(
             code,
-            [0x0f, 0x84, 0x01, 0, 0, 0, 0xc3, 0xe9, 0xfa, 0xff, 0xff, 0xff]
+            [
+                0x0f, 0x84, 0x01, 0, 0, 0, 0xc3, 0xe9, 0xfa, 0xff, 0xff, 0xff
+            ]
         );
     }
 }

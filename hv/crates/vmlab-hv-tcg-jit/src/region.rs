@@ -126,7 +126,11 @@ impl Region {
     /// # Panics
     /// When `address` is not what `next` gives for that length.
     pub fn put(&mut self, address: u64, code: &[u8]) {
-        assert_eq!(self.next(code.len()), Some(address), "the place of the code");
+        assert_eq!(
+            self.next(code.len()),
+            Some(address),
+            "the place of the code"
+        );
         let offset = (address - self.exec as u64) as usize;
         // SAFETY: `next` checked that the bytes are inside the writable
         // view, and no executable code of the current generation is there:

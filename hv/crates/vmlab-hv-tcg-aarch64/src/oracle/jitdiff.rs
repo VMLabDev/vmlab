@@ -17,6 +17,7 @@
 //! Sources read: none. This file holds no instruction semantics.
 
 use super::stream::Generator;
+use crate::FormatClass;
 use crate::exec::Cpu;
 use crate::lift::{
     BRANCH_FORMATS, FP_FORMATS, IMMEDIATE_FORMATS, LOAD_STORE_FORMATS, REGISTER_FORMATS,
@@ -24,7 +25,6 @@ use crate::lift::{
 };
 use crate::state::State;
 use crate::sysreg::reg;
-use crate::FormatClass;
 use vmlab_hv_tcg::FlatMemory;
 
 const RAM_BASE: u64 = 0x4000_0000;
@@ -62,7 +62,11 @@ pub struct Difference {
 
 impl std::fmt::Display for Difference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let words: Vec<String> = self.words.iter().map(|word| format!("{word:08x}")).collect();
+        let words: Vec<String> = self
+            .words
+            .iter()
+            .map(|word| format!("{word:08x}"))
+            .collect();
         write!(
             f,
             "seed {:#x}, round {}: {}\nimage: {}",
@@ -146,9 +150,14 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
             state.set_fpcr(vectors.fpcr);
             state.set_fpsr(vectors.fpsr);
         }
-        let mut reference = cpu(FlatMemory::new(RAM_BASE, bytes.clone()), state.clone(), false)
-            .map_err(difference)?;
-        let mut compiled = cpu(FlatMemory::new(RAM_BASE, bytes), state, true).map_err(difference)?;
+        let mut reference = cpu(
+            FlatMemory::new(RAM_BASE, bytes.clone()),
+            state.clone(),
+            false,
+        )
+        .map_err(difference)?;
+        let mut compiled =
+            cpu(FlatMemory::new(RAM_BASE, bytes), state, true).map_err(difference)?;
         let expected = reference.run(BUDGET);
         let got = compiled.run(BUDGET);
         if format!("{got:?}") != format!("{expected:?}") {

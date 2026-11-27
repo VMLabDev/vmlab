@@ -28,8 +28,8 @@
 //! `vmlab_hv_tcg_ir::block`.
 
 use crate::asm::{
-    Alu, Asm, Cond, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI,
-    RSP, Reg, Rm, Shift,
+    Alu, Asm, Cond, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
+    Reg, Rm, Shift,
 };
 use crate::{BUDGET, CONTEXT_BUDGET, CONTEXT_ENV, CONTEXT_THUNK, Features};
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
@@ -221,7 +221,10 @@ impl Emitter<'_> {
     /// A register of the pool for a value used after `at`: a free one, or
     /// the one whose word is used last, whose value goes home first.
     fn allocate(&mut self, at: u32) -> Reg {
-        if let Some(reg) = POOL.iter().find(|reg| self.owner[usize::from(reg.0)].is_none()) {
+        if let Some(reg) = POOL
+            .iter()
+            .find(|reg| self.owner[usize::from(reg.0)].is_none())
+        {
             return *reg;
         }
         let mut best: Option<(Reg, u32)> = None;
@@ -649,7 +652,8 @@ impl Emitter<'_> {
                     Code::LeadingZeros => {
                         self.asm.lzcnt(RAX, RAX);
                         if width < 64 {
-                            self.asm.alu_imm(Alu::Sub, Rm::Reg(RAX), i32::from(64 - width));
+                            self.asm
+                                .alu_imm(Alu::Sub, Rm::Reg(RAX), i32::from(64 - width));
                         }
                     }
                     Code::TrailingZeros => {
@@ -774,7 +778,9 @@ impl Emitter<'_> {
                 let w = self.words[usize::from(word)];
                 if let (None, Home::Slot(offset)) = (w.reg, w.home)
                     && offset != *register as i32 * 16 + half
-                    && targets.iter().any(|(start, end)| (*start..*end).contains(&offset))
+                    && targets
+                        .iter()
+                        .any(|(start, end)| (*start..*end).contains(&offset))
                 {
                     self.materialize(word);
                 }

@@ -262,7 +262,11 @@ fn every_inline_form_computes_what_the_interpreter_computes() {
                     n
                 }
             };
-            let (a, b, c) = (pick(&mut random, 1), pick(&mut random, 2), pick(&mut random, 3));
+            let (a, b, c) = (
+                pick(&mut random, 1),
+                pick(&mut random, 2),
+                pick(&mut random, 3),
+            );
             let op = operation(&mut random, code, 7, a, b, c);
             let block = Block {
                 ops: vec![op],
@@ -297,7 +301,12 @@ fn every_inline_form_computes_what_the_interpreter_computes() {
             interpret(&block, &mut expected);
             let mut got = slots;
             compiled(&mut jit, &block, &mut got, 100);
-            assert_eq!(got, expected, "{op:?} on {slots:x?} and {:x?}", &block.frame[4..7]);
+            assert_eq!(
+                got,
+                expected,
+                "{op:?} on {slots:x?} and {:x?}",
+                &block.frame[4..7]
+            );
         }
     }
 }
@@ -330,10 +339,10 @@ fn random_block(random: &mut Random, count: usize) -> Block {
         let dst = frame.len() as Slot;
         match random.below(12) {
             0 => {
-                let reads: Vec<Slot> = (0..random.below(4)).map(|_| any(random, &defined)).collect();
-                let writes: Vec<Slot> = (0..1 + random.below(2))
-                    .map(|n| dst + n as Slot)
+                let reads: Vec<Slot> = (0..random.below(4))
+                    .map(|_| any(random, &defined))
                     .collect();
+                let writes: Vec<Slot> = (0..1 + random.below(2)).map(|n| dst + n as Slot).collect();
                 frame.extend(writes.iter().map(|_| 0));
                 defined.extend(&writes);
                 ops.push(Op {
@@ -352,7 +361,9 @@ fn random_block(random: &mut Random, count: usize) -> Block {
             }
             1 => {
                 // A guard that holds most of the time.
-                let leave: Vec<Slot> = (0..random.below(5)).map(|_| any(random, &defined)).collect();
+                let leave: Vec<Slot> = (0..random.below(5))
+                    .map(|_| any(random, &defined))
+                    .collect();
                 let condition = any(random, &defined);
                 ops.push(Op {
                     code: Code::Guard,
@@ -380,13 +391,7 @@ fn random_block(random: &mut Random, count: usize) -> Block {
     let mut outputs = Vec::new();
     for register in 0..(1 + random.below(16) as u32) {
         let slot = defined[random.below(defined.len() as u64) as usize];
-        outputs.push((
-            register,
-            Place {
-                slot,
-                wide: false,
-            },
-        ));
+        outputs.push((register, Place { slot, wide: false }));
     }
     Block {
         ops,

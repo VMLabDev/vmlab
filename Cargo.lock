@@ -4311,6 +4311,7 @@ dependencies = [
  "cc",
  "vmlab-hv-tcg",
  "vmlab-hv-tcg-ir",
+ "vmlab-hv-tcg-jit",
 ]
 
 [[package]]
@@ -4332,6 +4333,14 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "vmlab-hv-sail-ir",
+]
+
+[[package]]
+name = "vmlab-hv-tcg-jit"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vmlab-hv-tcg-ir",
 ]
 
 [[package]]
@@ -4393,6 +4402,7 @@ dependencies = [
  "acpi_tables",
  "chrono",
  "env_filter",
+ "flate2",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",

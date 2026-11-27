@@ -48,7 +48,6 @@
 //! lockstep of the cards C6 and C8 and the probe of the system registers).
 //! This file holds no other instruction semantics.
 
-use vmlab_hv_tcg_ir::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
@@ -58,12 +57,13 @@ use crate::state::{Context, State, slot};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
+use vmlab_hv_tcg_ir::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
-use vmlab_hv_tcg_jit as jit;
 use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
+use vmlab_hv_tcg_jit as jit;
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
@@ -1592,9 +1592,7 @@ impl Compiled {
                     exit,
                     ..
                 } => jit::Effect {
-                    reads: std::iter::once(address)
-                        .chain(place_words(value))
-                        .collect(),
+                    reads: std::iter::once(address).chain(place_words(value)).collect(),
                     writes: exclusive.into_iter().collect(),
                     leave: Some(exit),
                 },
