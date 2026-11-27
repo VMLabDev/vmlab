@@ -11,7 +11,7 @@ use crate::flags;
 use crate::state::{Context, REGISTER_FILE, slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitId, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
-use vmlab_hv_tcg_ir::native::{Binary, Helper, HelperRef, ScalarId, ScalarType, Unary};
+use vmlab_hv_tcg_ir::native::{Binary, Helper, HelperRef, Operation, ScalarId, ScalarType, Unary};
 
 /// A PSTATE field that `MSR` writes with an immediate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1354,6 +1354,72 @@ impl Builder {
     pub fn branch_relative(&mut self, distance: ScalarId) {
         self.branch(distance);
         self.relative = true;
+    }
+
+    /// Go on lifting in the same block after the branch that the
+    /// instruction just lifted set (3e DESIGN.md J14, a superblock): its
+    /// target, a constant distance from the entry, becomes the next
+    /// instruction of the block, so the registers stay in the block across
+    /// the join. A conditional branch goes on at one of its two targets,
+    /// the taken one when it jumps back to the entry or past it and before
+    /// itself (a loop), else the next instruction, and a guard leaves the
+    /// block at the other one: the side exit writes the registers as they
+    /// are after the branch, and its next PC is the other target. `within`
+    /// says which distances the block may go on at and leave to, and
+    /// `sides` whether it may have one more side exit. The address to go on
+    /// at and whether the join made a side exit, or `None` when the block
+    /// ends here.
+    pub fn join(&mut self, within: impl Fn(u64) -> bool, sides: bool) -> Option<(u64, bool)> {
+        if self.trap.is_some() || !self.relative {
+            return None;
+        }
+        let branch = self.branch?;
+        let graph = &self.block.graph;
+        let here = self.pc.wrapping_sub(self.entry);
+        let distance = |id: ScalarId| graph.literal(id).map(|value| value as u64);
+        let (next, side) = match distance(branch) {
+            Some(target) => (target, None),
+            None => {
+                let Operation::Select {
+                    condition,
+                    when_true,
+                    when_false,
+                } = graph.scalars[branch].operation
+                else {
+                    return None;
+                };
+                let (taken, fallthrough) = (distance(when_true)?, distance(when_false)?);
+                // The fall through of a conditional branch is the next
+                // instruction. A target before the entry is outside what
+                // the code stamp of the block covers.
+                let backward = taken <= here;
+                if backward {
+                    (taken, Some((condition, true, fallthrough)))
+                } else {
+                    (fallthrough, Some((condition, false, taken)))
+                }
+            }
+        };
+        if !within(next) || side.is_some_and(|(_, _, other)| !sides || !within(other)) {
+            return None;
+        }
+        if let Some((condition, expected, other)) = side {
+            let writes = self.writes(self.current, self.written);
+            let other = self.imm(64, other);
+            let exit = self.block.exit(A64Exit {
+                writeback: Writeback { writes },
+                next: A64Next::Relative(other),
+                completed: self.completed + 1,
+            });
+            self.block.events.push(Event::Guard {
+                condition,
+                expected,
+                exit,
+            });
+        }
+        self.branch = None;
+        self.relative = false;
+        Some((self.entry.wrapping_add(next), side.is_some()))
     }
 
     /// The instruction that is being lifted is the last of the block, and
