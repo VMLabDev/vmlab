@@ -857,6 +857,7 @@ struct Parts {
     leaves: Vec<Leave>,
     calls: Vec<Call>,
     inputs: Vec<(Place, u32)>,
+    op_counts: Option<Vec<usize>>,
 }
 
 impl Parts {
@@ -879,6 +880,7 @@ impl Parts {
         roots: &[ScalarId],
     ) -> Result<(), Stop> {
         for id in schedule::scalars(graph, roots, seen) {
+            let before = lowering.ops.len();
             match &graph.scalars[id].operation {
                 Operation::Constant(value) => lowering.constant(id, *value),
                 Operation::Input(register) => {
@@ -900,6 +902,9 @@ impl Parts {
                 }
                 _ => lowering.scalar(graph, id),
             }
+            if let Some(counts) = &mut self.op_counts {
+                counts[id] = lowering.ops.len() - before;
+            }
         }
         Ok(())
     }
@@ -920,17 +925,102 @@ fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
     roots
 }
 
+/// Static operation counts summed over translations, including retranslations.
+#[derive(Debug, Default)]
+pub struct BlockCounts {
+    pub blocks: u64,
+    pub operations: u64,
+    pub alignment_operations: u64,
+    pub exit_writeback_operations: u64,
+    pub ldp_x: u64,
+    pub stp_x: u64,
+}
+
+impl BlockCounts {
+    fn translated(&mut self, block: &BlockOf<A64Exit>, counts: &[usize], operations: usize) {
+        let graph = &block.graph;
+        let mut normal = vec![false; counts.len()];
+        let mut alignment = Vec::new();
+        let mut writeback = Vec::new();
+        for event in &block.events {
+            let (exit, roots) = match event {
+                Event::Guard {
+                    condition, exit, ..
+                } if matches!(
+                    block.exits[*exit].next,
+                    A64Next::Exception {
+                        class: ExceptionClass::Alignment { .. },
+                        ..
+                    }
+                ) =>
+                {
+                    alignment.push(*condition);
+                    self.alignment_operations += 1;
+                    (Some(*exit), Vec::new())
+                }
+                Event::Guard {
+                    condition, exit, ..
+                } => (Some(*exit), vec![*condition]),
+                Event::ReadMemory { address, error, .. } => (Some(*error), vec![*address]),
+                Event::WriteMemory {
+                    address,
+                    value,
+                    error,
+                    ..
+                } => (Some(*error), vec![*address, *value]),
+                Event::Call { args, .. } => (None, args.clone()),
+                Event::Exit(exit) => (None, exit_roots(&block.exits[*exit])),
+                Event::Checkpoint(_) => continue,
+            };
+            schedule::scalars(graph, &roots, &mut normal);
+            if let Some(exit) = exit {
+                let payload = &block.exits[exit];
+                writeback.extend(payload.writeback.writes.iter().map(|&(_, id)| id));
+                if let A64Next::Exception { syndrome, .. } = &payload.next {
+                    schedule::scalars(graph, syndrome, &mut normal);
+                }
+            }
+        }
+        // Shared dependencies belong to neither exclusive category.
+        let alignment_only = schedule::scalars(graph, &alignment, &mut normal.clone());
+        let writeback_only = schedule::scalars(graph, &writeback, &mut normal);
+        let mut shared = vec![false; counts.len()];
+        for &id in &writeback_only {
+            shared[id] = true;
+        }
+        self.alignment_operations += alignment_only
+            .iter()
+            .filter(|&&id| !shared[id])
+            .map(|&id| counts[id] as u64)
+            .sum::<u64>();
+        for id in alignment_only {
+            shared[id] = false;
+        }
+        self.exit_writeback_operations += writeback_only
+            .into_iter()
+            .filter(|&id| shared[id])
+            .map(|id| counts[id] as u64)
+            .sum::<u64>();
+        self.blocks += 1;
+        self.operations += operations as u64;
+    }
+}
+
 fn compile(
     phys: u64,
     context: Context,
     instructions: u32,
     mut block: BlockOf<A64Exit>,
+    counts: Option<&mut BlockCounts>,
 ) -> Result<Compiled, Stop> {
     dce::prune_scalars(&mut block);
     let graph = &block.graph;
     let mut lowering = Lowering::new(graph).ok_or_else(|| host("a block with too many slots"))?;
     let mut seen = vec![false; graph.scalars.len()];
-    let mut parts = Parts::default();
+    let mut parts = Parts {
+        op_counts: counts.as_ref().map(|_| vec![0; graph.scalars.len()]),
+        ..Parts::default()
+    };
     let mut block_outputs = None;
     let mut terminal = None;
     // The exits that events leave through, by their number in the block.
@@ -1113,6 +1203,9 @@ fn compile(
     let Some(outputs) = block_outputs else {
         return Err(host("a block without an exit"));
     };
+    if let (Some(counts), Some(op_counts)) = (counts, &parts.op_counts) {
+        counts.translated(&block, op_counts, lowering.ops.len());
+    }
     // The loop reads the words of an operation without a check.
     let words = lowering.frame.len();
     let generics = lowering.generics.len();
@@ -1894,6 +1987,8 @@ pub struct Cpu<M> {
     pub translations: u64,
     /// The host time that the translations took, in nanoseconds.
     pub translation_ns: u64,
+    /// Enabled by the owner for an instrumented boot.
+    pub block_counts: Option<BlockCounts>,
     /// What the guest asked for that the CPU does not have, each once. The
     /// owner of the CPU writes it to its log.
     pub unknown: std::collections::BTreeSet<Unknown>,
@@ -1943,6 +2038,7 @@ impl<M: Memory> Cpu<M> {
             instructions: 0,
             translations: 0,
             translation_ns: 0,
+            block_counts: None,
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
             blocks: Cache::new(),
@@ -2470,6 +2566,8 @@ impl<M: Memory> Cpu<M> {
         let mut builder = Builder::new(context, pc);
         let mut at = pc;
         let mut count = 0;
+        let mut ldp_x = 0;
+        let mut stp_x = 0;
         loop {
             let mut bytes = [0u8; 4];
             // A block stays inside one page, so one translation serves it.
@@ -2492,7 +2590,17 @@ impl<M: Memory> Cpu<M> {
             let word = u32::from_le_bytes(bytes);
             builder.begin(at);
             let lifted = match decode(word) {
-                Some(decoded) => lift(&mut builder, &decoded),
+                Some(decoded) => {
+                    let lifted = lift(&mut builder, &decoded);
+                    if self.block_counts.is_some() && !matches!(lifted, Lifted::Unsupported) {
+                        match decoded.record {
+                            Record::LDPXi | Record::LDPXpost | Record::LDPXpre => ldp_x += 1,
+                            Record::STPXi | Record::STPXpost | Record::STPXpre => stp_x += 1,
+                            _ => {}
+                        }
+                    }
+                    lifted
+                }
                 // `SMC` needs EL3 in the LLVM tables, so no selected record
                 // matches it. The machine serves it as it serves `HVC`.
                 None if word & 0xffe0_001f == 0xd400_0003 => {
@@ -2535,8 +2643,18 @@ impl<M: Memory> Cpu<M> {
         }
         self.translations += 1;
         self.side.mark_code(phys);
-        let mut compiled =
-            compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
+        let mut compiled = compile(
+            phys,
+            context,
+            count,
+            builder.finish(at),
+            self.block_counts.as_mut(),
+        )
+        .map_err(Refused::Stop)?;
+        if let Some(counts) = &mut self.block_counts {
+            counts.ldp_x += ldp_x;
+            counts.stp_x += stp_x;
+        }
         compiled.stamp = self.memory.code_stamp(phys, count.max(1) as usize * 4);
         compiled.epoch = self.epoch;
         Ok(compiled)
@@ -2849,6 +2967,7 @@ impl<M: Memory> Cpu<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flags;
     use vmlab_hv_tcg::FlatMemory;
 
     const BASE: u64 = 0x4000_0000;
@@ -2878,6 +2997,40 @@ mod tests {
         assert_eq!(cpu.instructions, 3000);
         // One block of three instructions, translated once.
         assert_eq!(cpu.translations, 1);
+    }
+
+    #[test]
+    fn block_counts_measure_rollback_work_and_pairs_without_changing_execution() {
+        // add x4, x4, #1 ; ldp x0, x1, [x2] ; stp x0, x1, [x3] ;
+        // movz x4, #0 ; b .
+        let words = [
+            0x9100_0484,
+            0xa940_0440,
+            0xa900_0460,
+            0xd280_0004,
+            0x1400_0000,
+        ];
+        let mut plain = cpu(&words);
+        let mut counted = cpu(&words);
+        counted.block_counts = Some(BlockCounts::default());
+        for cpu in [&mut plain, &mut counted] {
+            cpu.state.set_x(2, BASE + 0x1000);
+            cpu.state.set_x(3, BASE + 0x1010);
+            cpu.memory.write(BASE + 0x1000, &[0x5a; 16]).unwrap();
+            let (completed, halt) = cpu.run_block(false).unwrap();
+            assert_eq!(completed, 5);
+            assert!(halt.is_none());
+            let mut copied = [0; 16];
+            cpu.memory.read(BASE + 0x1010, &mut copied).unwrap();
+            assert_eq!(copied, [0x5a; 16]);
+        }
+        assert_eq!(counted.state.slots, plain.state.slots);
+        let counts = counted.block_counts.unwrap();
+        assert_eq!(counts.blocks, 1);
+        assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
+        assert_eq!(counts.alignment_operations, 6);
+        // The discarded add restores X4. Each access also has its own fault PC.
+        assert_eq!(counts.exit_writeback_operations, 3);
     }
 
     #[test]
@@ -3505,7 +3658,7 @@ mod tests {
         });
         block.events.push(Event::Exit(exit));
         let context = State::reset(0).context;
-        let mut compiled = compile(0x4000_0000, context, 1, block).unwrap();
+        let mut compiled = compile(0x4000_0000, context, 1, block, None).unwrap();
         let mut state = State::reset(0x4000_0000);
         state.set_x(0, 5);
         state.set_x(1, 7);
@@ -3533,7 +3686,10 @@ mod tests {
             completed: 1,
         });
         block.events.push(Event::Exit(exit));
-        assert!(matches!(compile(0, context, 1, block), Err(Stop::Host(_))));
+        assert!(matches!(
+            compile(0, context, 1, block, None),
+            Err(Stop::Host(_))
+        ));
     }
 
     #[test]
@@ -3554,5 +3710,132 @@ mod tests {
                 BASE + 0x2000
             ))
         );
+    }
+
+    /// The flags of `a + b + carry` in `width` bits, from the definitions of
+    /// N, Z, C and V, as the bits 3 to 0.
+    fn sum_flags(width: u32, a: u64, b: u64, carry: bool) -> u8 {
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
+        let (a, b) = (a & mask, b & mask);
+        let result = a.wrapping_add(b).wrapping_add(u64::from(carry)) & mask;
+        let sign = |value: u64| -> i128 {
+            if width == 64 {
+                i128::from(value as i64)
+            } else {
+                i128::from(value as u32 as i32)
+            }
+        };
+        let n = result >> (width - 1) & 1 == 1;
+        let c = u128::from(a) + u128::from(b) + u128::from(carry) != u128::from(result);
+        let v = sign(a) + sign(b) + i128::from(carry) != sign(result);
+        u8::from(n) << 3 | u8::from(result == 0) << 2 | u8::from(c) << 1 | u8::from(v)
+    }
+
+    #[test]
+    fn every_condition_reads_the_lazy_flags_inside_and_after_their_block() {
+        // msr nzcv, x12 ; <setter> ; csinc x2, xzr, xzr, cond ; b +4 ;
+        // csinc x3, xzr, xzr, cond ; b . The first csinc reads the flags of the
+        // block, the second the flag slots.
+        const VALUES: [u64; 8] = [
+            0,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+        ];
+        let ccmp =
+            |sf: u32, cond: u32, nzcv: u32| sf << 31 | 0x7a40_0000 | 1 << 16 | cond << 12 | nzcv;
+        let mut case = 0u32;
+        for width in [32u32, 64] {
+            let sf = u32::from(width == 64);
+            // (encoding with rd 9, rn 0 and rm 1, its flags).
+            type Setter = (u32, fn(u32, u64, u64, u8) -> u8);
+            let setters: [Setter; 6] = [
+                (sf << 31 | 0x6b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, !b, true)
+                }),
+                (sf << 31 | 0x2b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, b, false)
+                }),
+                (sf << 31 | 0x6a00_0009 | 1 << 16, |w, a, b, _| {
+                    let mask = if w == 64 {
+                        u64::MAX
+                    } else {
+                        u64::from(u32::MAX)
+                    };
+                    let result = a & b & mask;
+                    u8::from(result >> (w - 1) & 1 == 1) << 3 | u8::from(result == 0) << 2
+                }),
+                (sf << 31 | 0x3a00_0009 | 1 << 16, |w, a, b, before| {
+                    sum_flags(w, a, b, before & 2 != 0)
+                }),
+                (sf << 31 | 0x7a00_0009 | 1 << 16, |w, a, b, before| {
+                    sum_flags(w, a, !b, before & 2 != 0)
+                }),
+                (0, |_, _, _, _| 0),
+            ];
+            for (index, (encoding, flags)) in setters.iter().enumerate() {
+                for &a in &VALUES {
+                    for &b in &VALUES {
+                        for cond in 0..16u32 {
+                            case += 1;
+                            let before = (case % 16) as u8;
+                            // The last setter is a ccmp on a condition of
+                            // the flags before it.
+                            let (encoding, expected) = if index == 5 {
+                                let on = case / 16 % 16;
+                                let given = case / 7 % 16;
+                                let expected = if flags::holds(on as u8, before) {
+                                    sum_flags(width, a, !b, true)
+                                } else {
+                                    given as u8
+                                };
+                                (ccmp(sf, on, given), expected)
+                            } else {
+                                (*encoding, flags(width, a, b, before))
+                            };
+                            let csinc = |rd: u32| 0x9a9f_07e0 | cond << 12 | rd;
+                            let mut cpu = cpu(&[
+                                0xd51b_420c,
+                                encoding,
+                                csinc(2),
+                                0x1400_0001,
+                                csinc(3),
+                                0x1400_0000,
+                            ]);
+                            cpu.state.set_x(0, a);
+                            cpu.state.set_x(1, b);
+                            cpu.state.set_x(12, u64::from(before) << 28);
+                            assert_eq!(cpu.run(6), Stop::Budget);
+                            let what = format!(
+                                "{encoding:#010x} {a:#x} {b:#x} cond {cond} flags {before:04b}"
+                            );
+                            assert_eq!(cpu.state.nzcv(), expected, "{what}");
+                            let holds = u64::from(!flags::holds(cond as u8, expected));
+                            assert_eq!(cpu.state.x(2), holds, "in the block: {what}");
+                            assert_eq!(cpu.state.x(3), holds, "after the block: {what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mrs_nzcv_reads_the_lazy_flags() {
+        // subs x9, x0, x1 ; mrs x2, nzcv ; b +4 ; mrs x3, nzcv
+        let mut cpu = cpu(&[0xeb01_0009, 0xd53b_4202, 0x1400_0001, 0xd53b_4203]);
+        cpu.state.set_x(0, 1);
+        cpu.state.set_x(1, 2);
+        assert_eq!(cpu.run(4), Stop::Budget);
+        assert_eq!(cpu.state.x(2), 0x8000_0000);
+        assert_eq!(cpu.state.x(3), 0x8000_0000);
     }
 }

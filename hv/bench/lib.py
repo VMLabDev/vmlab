@@ -173,6 +173,9 @@ G2G_SUITES = {
 
 UNIT = {
     "boot_to_agent_ready": "s",
+    # Instructions to agent ready divided by that time, in millions a
+    # second (card #1142): the speed of an emulated boot, idle time included.
+    "boot_mips": "MIPS",
     "sha256_256M": "s",
     "xz_9_32M": "s",
     "blk_seq_read_mbps": "MiB/s",
@@ -214,9 +217,8 @@ D28_BAR = {
     "idle_cpu_pct": None,
 }
 
-# Which way is a regression, for bench-check. Everything the TCG suite
-# records is seconds; idle CPU is a percentage — both grow when worse. The
-# phase-2 throughput workloads are rates that shrink when worse.
+# Which way is a regression, for bench-check. Time and idle CPU grow when
+# worse. Throughput and boot MIPS shrink when worse.
 DIRECTION = {
     name: ("lower" if unit in ("s", "%cpu") else "higher")
     for name, unit in UNIT.items()
@@ -604,6 +606,20 @@ class HvControlClient:
                     raise BenchError(f"control {command} failed: {m}")
                 return m
             # Events (e.g. run-state changes) are ignored here.
+
+    def debug(self, operation, **kwargs):
+        """One debug request; its response (vmlab-hv-proto debug.rs)."""
+        inner = {"command": "debug", "request": {"operation": operation, **kwargs}}
+        msg = {"type": "request", "id": self.next_id, "command": inner}
+        self.next_id += 1
+        self.f.write((json.dumps(msg) + "\n").encode())
+        self.f.flush()
+        while True:
+            m = self._read()
+            if m.get("type") == "reply" and m.get("id") == self.next_id - 1:
+                if m.get("outcome") != "debug":
+                    raise BenchError(f"debug {operation} failed: {m}")
+                return m["response"]
 
     def close(self):
         try:

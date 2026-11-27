@@ -109,6 +109,21 @@ pub struct EmulatedVcpu {
 pub type Counter = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl EmulatedVcpu {
+    /// The VM calls this after joining its vCPU workers.
+    pub(crate) fn report_boot_counts(&self, instructions: bool) {
+        if instructions {
+            eprintln!("boot instructions: {} {}", self.id, self.cpu.instructions);
+        }
+        if let Some(counts) = &self.cpu.block_counts {
+            eprintln!("boot block counts: {} {counts:?}", self.id);
+        }
+    }
+
+    /// The instructions that the CPU has run.
+    pub fn instructions(&self) -> u64 {
+        self.cpu.instructions
+    }
+
     /// The vCPU `id` in the reset state `state`, on `memory`, with the
     /// system counter of `clock`.
     pub fn new(id: u8, memory: GuestBus, state: State, clock: Clock) -> Self {
@@ -135,6 +150,9 @@ impl EmulatedVcpu {
         }
         cpu.clock = clock;
         cpu.lines = Some(shared);
+        if std::env::var_os("VMLAB_HV_BOOT_BLOCK_COUNTS").is_some() {
+            cpu.block_counts = Some(Default::default());
+        }
         Self {
             id,
             cpu,

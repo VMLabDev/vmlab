@@ -27,7 +27,7 @@ class VmSession:
     scope, so a group kill reaps the whole tree and nothing outlives a run.
     """
 
-    def __init__(self, vm_argv, run_dir, log):
+    def __init__(self, vm_argv, run_dir, log, env=None):
         lib.require_vm_slots()
         self.run_dir = run_dir
         self.log = log
@@ -40,6 +40,7 @@ class VmSession:
             argv,
             stdout=subprocess.DEVNULL,
             stderr=self.stderr_file,
+            env=env,
             start_new_session=True,
         )
 
@@ -300,8 +301,9 @@ class HvBackend:
             "--paused",
         ]
 
-    def launch(self):
-        self.session = VmSession(self.vm_argv, self.run_dir, self.log)
+    def launch(self, boot_mips=False):
+        env = dict(os.environ, VMLAB_HV_BOOT_INSTRUCTIONS="1") if boot_mips else None
+        self.session = VmSession(self.vm_argv, self.run_dir, self.log, env=env)
         return self.session
 
     def release_cpus(self):
@@ -321,6 +323,19 @@ class HvBackend:
 
     def agent_socket(self):
         return os.path.join(self.run_dir, "agent.sock")
+
+    def instructions(self, smp):
+        """The instructions that the emulated vCPUs have run (an aarch64
+        machine on the interpreter): pause, read each vCPU, resume."""
+        self.control.debug("pause")
+        try:
+            total = 0
+            for vcpu in range(smp):
+                response = self.control.debug("read_registers", vcpu=vcpu)
+                total += response["registers"]["instructions"]
+            return total
+        finally:
+            self.control.debug("detach", resume=True)
 
     def backend_version(self):
         return getattr(self, "hv_version_seen", "vmlab-hv (unlaunched)")
