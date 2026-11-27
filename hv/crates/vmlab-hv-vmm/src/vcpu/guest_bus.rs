@@ -66,6 +66,86 @@ struct Region {
     base: u64,
     len: u64,
     stamps: Arc<Stamps>,
+    /// The host address of the first byte of the region. The mapping lives
+    /// as long as `Shared::memory`, which holds the region.
+    host: usize,
+    /// The bitmap of the region, inside the same region: a write through
+    /// `host` reports itself there, as vm-memory's own writes do.
+    bitmap: *const vmlab_hv_devices::WriteDiscard,
+}
+
+// SAFETY: `bitmap` points into a region that `Shared::memory` keeps alive,
+// and `WriteDiscard` is `Sync`. `host` is a plain address.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
+/// Copy `bytes.len()` bytes of guest RAM at the host address `from`. An
+/// access of 2, 4 or 8 bytes at its own alignment is one host access, so
+/// that another CPU never sees half of it (single-copy atomicity).
+///
+/// # Safety
+/// `from` and the bytes after it are inside a live mapping of guest RAM.
+#[inline(always)]
+unsafe fn copy_in(from: usize, bytes: &mut [u8]) {
+    let aligned = from % bytes.len().max(1) == 0;
+    // SAFETY: the caller's promise. Other threads (devices, CPUs) can write
+    // the same RAM, so the access is volatile, as vm-memory's are.
+    unsafe {
+        match (bytes.len(), aligned) {
+            (1, _) => bytes[0] = std::ptr::read_volatile(from as *const u8),
+            (2, true) => {
+                let v = std::ptr::read_volatile(from as *const u16);
+                bytes.copy_from_slice(&v.to_le_bytes());
+            }
+            (4, true) => {
+                let v = std::ptr::read_volatile(from as *const u32);
+                bytes.copy_from_slice(&v.to_le_bytes());
+            }
+            (8, true) => {
+                let v = std::ptr::read_volatile(from as *const u64);
+                bytes.copy_from_slice(&v.to_le_bytes());
+            }
+            _ => {
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = std::ptr::read_volatile((from + index) as *const u8);
+                }
+            }
+        }
+    }
+}
+
+/// Copy `bytes` into guest RAM at the host address `to`, as `copy_in` reads.
+///
+/// # Safety
+/// `to` and the bytes after it are inside a live, writable mapping of guest
+/// RAM.
+#[inline(always)]
+unsafe fn copy_out_to(to: usize, bytes: &[u8]) {
+    let aligned = to % bytes.len().max(1) == 0;
+    // SAFETY: the caller's promise, as in `copy_in`.
+    unsafe {
+        match (bytes.len(), aligned) {
+            (1, _) => std::ptr::write_volatile(to as *mut u8, bytes[0]),
+            (2, true) => std::ptr::write_volatile(
+                to as *mut u16,
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+            ),
+            (4, true) => std::ptr::write_volatile(
+                to as *mut u32,
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            ),
+            (8, true) => {
+                let mut word = [0u8; 8];
+                word.copy_from_slice(bytes);
+                std::ptr::write_volatile(to as *mut u64, u64::from_le_bytes(word));
+            }
+            _ => {
+                for (index, byte) in bytes.iter().enumerate() {
+                    std::ptr::write_volatile((to + index) as *mut u8, *byte);
+                }
+            }
+        }
+    }
 }
 
 struct Shared {
@@ -126,6 +206,8 @@ impl GuestBus {
                 base: region.start_addr().0,
                 len: region.len(),
                 stamps,
+                host: region.as_ptr() as usize,
+                bitmap: region.bitmap() as *const _,
             });
         }
         Ok(Self(Arc::new(Shared {
@@ -141,6 +223,7 @@ impl GuestBus {
     }
 
     /// The region of RAM that holds the whole range, and the offset in it.
+    #[inline(always)]
     fn ram(&self, address: u64, len: usize) -> Option<(&Region, u64)> {
         self.0.regions.iter().find_map(|region| {
             let offset = address.checked_sub(region.base)?;
@@ -171,9 +254,16 @@ impl GuestBus {
 }
 
 impl Memory for GuestBus {
+    #[inline]
     fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<()> {
-        if self.ram(address, bytes.len()).is_some() {
-            return self.copy_out(address, bytes);
+        // RAM is read straight from its mapping: vm-memory's read takes a
+        // lookup and a slice per access, which was a third of the time of
+        // a boot (card C13).
+        if let Some((region, offset)) = self.ram(address, bytes.len()) {
+            // SAFETY: `ram` found the whole range inside the region, whose
+            // mapping `Shared::memory` keeps alive.
+            unsafe { copy_in(region.host + offset as usize, bytes) };
+            return Ok(());
         }
         if self.touches_ram(address, bytes.len()) {
             return Err(Error::Memory(address));
@@ -188,8 +278,9 @@ impl Memory for GuestBus {
         Ok(())
     }
 
+    #[inline]
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
-        if self.ram(address, bytes.len()).is_some() {
+        if let Some((region, offset)) = self.ram(address, bytes.len()) {
             if self
                 .0
                 .roms
@@ -199,12 +290,15 @@ impl Memory for GuestBus {
                 return Ok(());
             }
             let _atomic = self.lock();
-            // The bitmap of the region moves the generations.
-            return self
-                .0
-                .memory
-                .write_slice(bytes, GuestAddress(address))
-                .map_err(|_| Error::Memory(address));
+            // SAFETY: `ram` found the whole range inside the region, whose
+            // mapping `Shared::memory` keeps alive, and RAM is writable.
+            unsafe { copy_out_to(region.host + offset as usize, bytes) };
+            // The bitmap of the region moves the generations, after the
+            // write, as vm-memory reports its own writes.
+            // SAFETY: the bitmap is inside the region, as `host` is.
+            let bitmap = unsafe { &*region.bitmap };
+            vm_memory::bitmap::Bitmap::mark_dirty(bitmap, offset as usize, bytes.len());
+            return Ok(());
         }
         if self.touches_ram(address, bytes.len()) {
             return Err(Error::Memory(address));
