@@ -803,8 +803,8 @@ struct Compiled {
     inputs: Vec<(Place, u32)>,
     /// Register slot, words of the frame: copied out after it.
     outputs: Vec<(u32, Place)>,
-    /// The last instruction, when the loop runs it: its address and what
-    /// it does.
+    /// The last instruction, when the loop runs it: its distance in bytes
+    /// from the first, and what it does.
     terminal: Option<(u64, Trap)>,
 }
 
@@ -1398,6 +1398,7 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
+        let entry = state.pc();
         for (place, register) in &self.inputs {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
@@ -1436,8 +1437,8 @@ impl Compiled {
             state.slots[*register as usize] = place.read(&self.frame);
         }
         // The loop runs the last instruction with the PC at it.
-        if let Some((pc, _)) = self.terminal {
-            state.set_pc(pc);
+        if let Some((distance, _)) = self.terminal {
+            state.set_pc(entry.wrapping_add(distance));
         }
         (self.instructions, None)
     }
@@ -1465,9 +1466,12 @@ struct Cache {
     young_bytes: usize,
 }
 
-/// A block of the store: its PC, the physical address of its code, and the
-/// context it was lifted for.
-type BlockKey = (u64, u64, Context);
+/// A block of the store: the physical address of its code and the context
+/// it was lifted for. A block computes every address from the PC at its
+/// entry (`Builder::code_address`), so it serves its code at any virtual
+/// address: a library that two programs map at two places is translated
+/// once.
+type BlockKey = (u64, Context);
 
 impl Cache {
     fn new() -> Self {
@@ -1504,18 +1508,19 @@ impl Cache {
             self.young_bytes = 0;
         }
         self.young_bytes += bytes;
-        let key = (block.pc, block.phys, block.context);
+        let key = (block.phys, block.context);
         if let Some(replaced) = self.young.insert(key, block) {
             self.young_bytes = self.young_bytes.saturating_sub(replaced.heap_bytes());
         }
     }
 
-    /// Bring the block of `pc` at `phys` in `context` back from the store
-    /// into the entry at `index`, when the store has it. Whether it still
-    /// holds the code of the memory is for the caller to check.
+    /// Bring the block of the code at `phys` in `context` back from the
+    /// store into the entry at `index`, for the PC `pc`, when the store has
+    /// it. Whether it still holds the code of the memory is for the caller
+    /// to check.
     fn revive(&mut self, index: usize, pc: u64, phys: u64, context: Context) -> bool {
-        let key = (pc, phys, context);
-        let block = match self.young.remove(&key) {
+        let key = (phys, context);
+        let mut block = match self.young.remove(&key) {
             Some(block) => {
                 self.young_bytes = self.young_bytes.saturating_sub(block.heap_bytes());
                 block
@@ -1525,6 +1530,7 @@ impl Cache {
                 None => return false,
             },
         };
+        block.pc = pc;
         self.put(index, block);
         true
     }
@@ -2324,7 +2330,8 @@ impl<M: Memory> Cpu<M> {
             return Err(host("the block cache lost a block"));
         };
         let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
-        let terminal = block.terminal;
+        // The loop runs the last instruction at the PC that the block left.
+        let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
         Ok((count, self.finish(halt, terminal)))
     }
 
@@ -2396,7 +2403,7 @@ impl<M: Memory> Cpu<M> {
                 && u64::from(block.instructions) <= left
             {
                 let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
-                let terminal = block.terminal;
+                let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
                 (count, self.finish(halt, terminal))
             } else {
                 // A whole block where the budget allows one, else one
