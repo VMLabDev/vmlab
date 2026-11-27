@@ -84,13 +84,13 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use vmlab_hv_devices::gic;
 use vmlab_hv_proto::machine::MachineDescription;
+use vmlab_hv_tcg::Memory;
 use vmlab_hv_tcg_aarch64::exec::Access;
 use vmlab_hv_tcg_aarch64::oracle::boot::{self, Adopt, DeviceRead, Leader, Record};
 use vmlab_hv_tcg_aarch64::oracle::{
     Core, Trace, Vectors, apply_system, compared, normalise, system_difference, system_of,
 };
 use vmlab_hv_tcg_aarch64::timer::Clock;
-use vmlab_hv_tcg::Memory;
 use vmlab_hv_tcg_aarch64::{Cpu, Stop, decode, sysreg};
 use vmlab_hv_vmm::NoDevices;
 use vmlab_hv_vmm::vcpu::{Conduit, Hypercall, HypercallOutcome, Kick, VcpuHost};
@@ -724,8 +724,13 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     let mut agent_bytes: Vec<u8> = Vec::new();
     let mut hello_at = 0u64;
     let mut agent_answer: Option<String> = None;
-    let Some(mut current) =
-        next_instruction(&mut leader, &mut reads, &mut loads, &mut writes, &mut discontinuities)?
+    let Some(mut current) = next_instruction(
+        &mut leader,
+        &mut reads,
+        &mut loads,
+        &mut writes,
+        &mut discontinuities,
+    )?
     else {
         return Err("the leader wrote no instruction".into());
     };
@@ -734,8 +739,14 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     let mut instructions = 0u64;
     if arguments.leader_only {
         while instructions < arguments.max_instructions
-            && next_instruction(&mut leader, &mut reads, &mut loads, &mut writes, &mut discontinuities)?
-                .is_some()
+            && next_instruction(
+                &mut leader,
+                &mut reads,
+                &mut loads,
+                &mut writes,
+                &mut discontinuities,
+            )?
+            .is_some()
         {
             instructions += 1;
             reads.clear();
@@ -824,7 +835,13 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         loads.clear();
         writes.clear();
         discontinuities.clear();
-        let next = next_instruction(&mut leader, &mut reads, &mut loads, &mut writes, &mut discontinuities)?;
+        let next = next_instruction(
+            &mut leader,
+            &mut reads,
+            &mut loads,
+            &mut writes,
+            &mut discontinuities,
+        )?;
         if !reads.is_empty() {
             *host.reads.lock() = reads.iter().copied().collect();
         }
@@ -1084,7 +1101,9 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
                 }
             }
             let log = std::fs::read(&description.serial_log).unwrap_or_default();
-            if !arguments.until.is_empty() && String::from_utf8_lossy(&log).contains(&arguments.until) {
+            if !arguments.until.is_empty()
+                && String::from_utf8_lossy(&log).contains(&arguments.until)
+            {
                 reached = true;
                 ended = "our serial log holds the text";
                 break 'run;
