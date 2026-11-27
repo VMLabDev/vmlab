@@ -4,7 +4,9 @@
 //! translated, and compiled, with the buffers that the first run grew. The
 //! heap calls of the second run are counted on this thread, once with the
 //! JIT off and once with it on: their difference is what the compiles
-//! make, and it is none. The heap calls of a translation are reported.
+//! make, and it is none. What a translation makes is the lists that the
+//! block it makes keeps, and the box of the block: 13.5 a block of this
+//! program when card J11 measured it, 71.2 before.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -127,4 +129,8 @@ fn a_compile_makes_no_heap_call_once_the_buffers_have_grown() {
         compiled as f64 / translations as f64,
     );
     assert_eq!(compiled, interpreted, "the compiles of {blocks} blocks made heap calls");
+    assert!(
+        interpreted < translations * 16,
+        "a translation makes heap calls beside the lists of its block"
+    );
 }
