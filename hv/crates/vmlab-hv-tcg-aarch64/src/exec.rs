@@ -29,10 +29,19 @@
 //! ends the mark. A store of this CPU between the two keeps the mark, and
 //! an exception keeps it. An exception return and `CLREX` end it.
 //!
-//! With more CPUs the store also asks that no other writer reached the
-//! granules of the load (`Memory::store_conditional`), so it fails more
-//! often than QEMU's: a write of another CPU fails it also when it left the
-//! value as it was.
+//! The store also asks that no stamped write reached the granules of the
+//! load (`Memory::reservation_generation`): a device write, or a write into
+//! a page of translated code, fails it also when it left the value as it
+//! was. It writes with one compare and exchange against the value of the
+//! load (`Memory::compare_and_store`), because another CPU writes a page
+//! without code straight and moves no stamp (card S3): a write of another
+//! CPU that changed the value fails the store, and one that wrote the same
+//! value back does not, as on QEMU.
+//!
+//! A load or a store whose page the TLB holds with its host address
+//! (`Memory::host_page`) reads and writes the host mapping itself. A store
+//! does so only while no CPU holds code of the page, which its watch word
+//! says, and it moves no stamp then.
 //!
 //! A block is kept under its virtual PC, its context and the physical
 //! address of its code, so a new mapping of the same PC finds no old block.
