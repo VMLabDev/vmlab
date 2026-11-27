@@ -13,6 +13,8 @@
 //!   helpers (H12), and the thunk through which every other effect runs.
 //! - `tlb`: the layout of the fast TLB and its fill and flush (H7).
 //! - `perf`: the perf map (H13e), which names each block for `perf`.
+//! - `seat`: the context of a CPU at a fixed address, which another thread
+//!   kicks through its budget (H10c).
 //! - The trampoline here (H4): `enter` saves the registers that the System V
 //!   ABI keeps, loads the context, and jumps to a block. A block leaves by a
 //!   jump to the common exit, which restores them and returns the exit code.
@@ -43,6 +45,7 @@ pub mod asm;
 pub mod emit;
 pub mod perf;
 pub mod region;
+pub mod seat;
 pub mod tlb;
 
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
