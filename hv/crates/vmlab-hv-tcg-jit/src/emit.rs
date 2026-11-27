@@ -168,6 +168,153 @@ impl FlagTest {
     }
 }
 
+/// A block as the emitter sees it.
+pub struct Shape<'a> {
+    pub ops: &'a [Op],
+    pub generics: &'a [Generic],
+    /// The frame with the constants in place.
+    pub frame: &'a [u64],
+    /// What each access of `Code::Access` touches, by its index.
+    pub accesses: &'a [Effect],
+    /// What each helper call of `Code::Call` touches, by its index.
+    pub calls: &'a [Effect],
+    /// The words that each leave of the block reads.
+    pub leaves: &'a [Vec<Slot>],
+    /// Words of the frame, register slot: read from the state.
+    pub inputs: &'a [(Place, u32)],
+    /// Register slot, words of the frame: written to the state at the end.
+    pub outputs: &'a [(u32, Place)],
+    pub instructions: u32,
+}
+
+/// Why the emitter made no code for a block. The block runs in the
+/// interpreter (H2b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// An operation that the emitter has no form for on this host.
+    Form(Code),
+    /// A block that does not fit the region, or a frame or a register slot
+    /// past the reach of a displacement.
+    Size,
+    /// A word or an index that the block does not hold.
+    Malformed,
+}
+
+const POOL: [Reg; 9] = [RBX, RBP, R12, RSI, RDI, R8, R9, R10, R11];
+/// The registers of the pool that a call does not keep.
+const CALLER_SAVED: [Reg; 6] = [RSI, RDI, R8, R9, R10, R11];
+
+/// Where the value of a word is when it is in no register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Home {
+    /// Its word of the frame.
+    Frame,
+    /// A register slot of the state, at this offset in bytes: an input
+    /// that is not read yet.
+    Slot(i32),
+    /// A constant of the frame. Its word holds it, and nothing writes it.
+    Const(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Word {
+    home: Home,
+    reg: Option<Reg>,
+    /// The register holds a value that the frame does not.
+    dirty: bool,
+}
+
+/// An operand as an instruction reads it.
+#[derive(Clone, Copy, Debug)]
+enum Val {
+    Reg(Reg),
+    Mem(Rm),
+    Imm(u64),
+}
+
+/// The position of the exit of the block in the order of uses.
+fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, Vec<Slot>)> {
+    let place = |place: Place| -> Vec<Slot> {
+        if place.wide {
+            vec![place.slot, place.slot + 1]
+        } else {
+            vec![place.slot]
+        }
+    };
+    let leave = |index: u64| -> Option<Vec<Slot>> { shape.leaves.get(index as usize).cloned() };
+    Some(match op.code {
+        Code::Add
+        | Code::Sub
+        | Code::Mul
+        | Code::And
+        | Code::Or
+        | Code::Xor
+        | Code::ShiftLeft
+        | Code::ShiftRight
+        | Code::ArithmeticShiftRight
+        | Code::Equal
+        | Code::NotEqual
+        | Code::Less
+        | Code::LessEqual
+        | Code::Concat => (vec![op.a, op.b], vec![op.dst]),
+        Code::IsZero
+        | Code::BitNot
+        | Code::Negate
+        | Code::SignExtend
+        | Code::LeadingZeros
+        | Code::TrailingZeros
+        | Code::ReverseBits
+        | Code::ReverseBytes
+        | Code::PopCount
+        | Code::Slice => (vec![op.a], vec![op.dst]),
+        Code::Select => (vec![op.a, op.b, Slot::try_from(op.imm).ok()?], vec![op.dst]),
+        Code::Widen => (vec![op.a], vec![op.dst, op.dst.checked_add(1)?]),
+        Code::Generic => {
+            let generic = generics.get(op.imm as usize)?;
+            let reads = generic.args().into_iter().flat_map(place).collect();
+            (reads, place(generic.dst()))
+        }
+        Code::Guard => {
+            let mut reads = vec![op.a];
+            reads.extend(leave(op.imm)?);
+            (reads, Vec::new())
+        }
+        Code::Load1 | Code::Load2 | Code::Load4 | Code::Load8 => {
+            let mut reads = vec![op.a];
+            reads.extend(leave(op.imm)?);
+            (reads, vec![op.dst])
+        }
+        Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 => {
+            let mut reads = vec![op.a, op.b];
+            reads.extend(leave(op.imm)?);
+            (reads, Vec::new())
+        }
+        // Two words from `dst` on, and from `b` (low) and `dst` (high).
+        Code::LoadPair => {
+            let mut reads = vec![op.a];
+            reads.extend(leave(op.imm)?);
+            (reads, vec![op.dst, op.dst.checked_add(1)?])
+        }
+        Code::StorePair => {
+            let mut reads = vec![op.a, op.b, op.dst];
+            reads.extend(leave(op.imm)?);
+            (reads, Vec::new())
+        }
+        Code::Access | Code::Call => {
+            let effect = if op.code == Code::Access {
+                shape.accesses.get(op.imm as usize)?
+            } else {
+                shape.calls.get(op.imm as usize)?
+            };
+            let mut reads = effect.reads.clone();
+            if let Some(index) = effect.leave {
+                reads.extend(leave(index.into())?);
+            }
+            (reads, effect.writes.clone())
+        }
+    })
+}
+
 /// An operand of a comparison that becomes host flags: a word, or a
 /// constant that no word holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
