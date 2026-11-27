@@ -369,6 +369,21 @@ struct Side {
     shootdown: Option<(std::sync::Arc<crate::shootdown::Shootdown>, usize)>,
     /// `Memory::ended_code` when this CPU last told the others.
     ended_code: u64,
+    /// The counts of `JitCounts::machine`.
+    machine: MachineCounts,
+}
+
+/// What a CPU of a machine of more than one did that the others see (3e
+/// card J7): its exclusive loads and stores, the code mail and the pages of
+/// new code that it told the others of, and the time that it waited for
+/// them to take it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineCounts {
+    pub exclusive_loads: u64,
+    pub exclusive_stores: u64,
+    pub code_mails: u64,
+    pub code_pages: u64,
+    pub wait_ns: u64,
 }
 
 impl Side {
@@ -389,6 +404,7 @@ impl Side {
             user: false,
             shootdown: None,
             ended_code: 0,
+            machine: MachineCounts::default(),
         }
     }
 
@@ -434,9 +450,17 @@ impl Side {
             return;
         };
         match invalidation {
+            Some(Invalidation::CodePage(page)) => {
+                self.machine.code_pages += 1;
+                shootdown.post(id, Invalidation::CodePage(page));
+            }
             Some(invalidation) => shootdown.post(id, invalidation),
-            None => shootdown.post_code(id),
+            None => {
+                self.machine.code_mails += 1;
+                shootdown.post_code(id);
+            }
         }
+        let started = std::time::Instant::now();
         let mut spins = 0u32;
         while shootdown.outstanding(id) {
             // Mail of a CPU that waits on this one is taken here.
@@ -450,6 +474,7 @@ impl Side {
                 std::hint::spin_loop();
             }
         }
+        self.machine.wait_ns += started.elapsed().as_nanos() as u64;
     }
 
     /// A store of this CPU ended translated code of some CPU in a page
@@ -712,6 +737,7 @@ impl Side {
         let mut buffer = [0u8; 16];
         let part = &mut buffer[..usize::from(bytes)];
         if exclusive {
+            self.machine.exclusive_loads += 1;
             // A failed load leaves the monitor as it was. An exclusive load
             // is aligned, so it is in one page.
             let generation = memory
@@ -837,6 +863,7 @@ impl Side {
         user: bool,
         single: bool,
     ) -> Result<(bool, bool), Unstored> {
+        self.machine.exclusive_stores += 1;
         let done = self.store_exclusive_locked(memory, address, bytes, value, user, single);
         // After the lock of the store is let go: the others may wait for it.
         self.tell_code(memory);
@@ -3443,6 +3470,8 @@ pub struct JitCounts {
     pub tlb_misses: u64,
     pub tlb_fills: u64,
     pub tlb_flushes: u64,
+    /// What this CPU and the others of its machine told each other (J7).
+    pub machine: MachineCounts,
 }
 
 /// Make the link that the run before left for `block`, whose code is
@@ -4110,6 +4139,7 @@ impl<M: Memory> Cpu<M> {
             counts.tlb_fills = fast.fills;
             counts.tlb_flushes = fast.flushes;
         }
+        counts.machine = self.side.machine;
         counts
     }
 
