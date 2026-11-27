@@ -1225,8 +1225,9 @@ impl Emitter<'_> {
         // The stub, with the places of the words as they are here.
         self.asm.cold(true);
         self.asm.bind(stub);
-        if let Some(side) = self.native_side(op) {
-            self.side_exit(side);
+        if let Some(index) = self.native_side(op) {
+            let shape = self.shape;
+            self.side_exit(&shape.sides[index]);
             self.asm.cold(false);
             self.release(&all, at);
             self.all = all;
@@ -1255,13 +1256,16 @@ impl Emitter<'_> {
     /// stub can leave to the next block itself: the block chains, its PC
     /// has a slot, the target is in its page, and a jump that can be
     /// linked is left for it and for the two of the end.
-    fn native_side(&self, op: &Op) -> Option<&'a Side> {
+    fn native_side(&self, op: &Op) -> Option<usize> {
         let shape = self.shape;
         let chain = shape.chain.filter(|chain| chain.sites)?;
         shape.next?;
-        let side = shape.sides.iter().find(|side| u64::from(side.leave) == op.imm)?;
-        let target = i64::from(chain.page_offset) + side.distance as i64;
-        ((0..4096).contains(&target) && self.sites.len() + 2 < SITES).then_some(side)
+        let index = shape
+            .sides
+            .iter()
+            .position(|side| u64::from(side.leave) == op.imm)?;
+        let target = i64::from(chain.page_offset) + shape.sides[index].distance as i64;
+        ((0..4096).contains(&target) && self.sites.len() + 2 < SITES).then_some(index)
     }
 
     /// The stub of a side exit (J14): the outputs from where their words
