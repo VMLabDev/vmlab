@@ -412,41 +412,70 @@ fn ram_is_ram_and_every_other_address_is_the_bus() {
 }
 
 #[test]
-fn each_write_is_one_generation_also_the_write_of_a_device() {
+fn a_store_moves_the_stamps_only_where_a_cpu_holds_code() {
     let memory = ram();
     let mut bus = GuestBus::new(memory.clone(), host_with_latch(), 1).unwrap();
+    assert!(bus.writes_straight());
     let start = bus.generation();
     let code = bus.code_stamp(RAM, 8).unwrap();
     let crossing = bus.code_stamp(RAM + 0xffe, 4).unwrap();
     assert_eq!((crossing.first_page, crossing.last_page), (0, 1));
     assert_eq!(crossing.mapping, RAM);
 
-    // A CPU store elsewhere: one generation, and the code pages are as
-    // they were.
+    // A CPU store into a page that no CPU holds code of: no generation, no
+    // stamp, and the bytes are there.
     bus.write(RAM + 0x3000, &[7; 16]).unwrap();
-    assert_eq!(bus.generation(), start + 1);
-    assert_eq!(bus.code_stamp(RAM, 8), Some(code));
-    assert_eq!(bus.code_stamp(RAM + 0xffe, 4), Some(crossing));
-    // A bus write counts too, and stamps no page.
+    assert_eq!(bus.generation(), start);
+    assert_eq!(bus.own_generation(), Some(0));
+    let mut bytes = [0; 4];
+    bus.read(RAM + 0x3000, &mut bytes).unwrap();
+    assert_eq!(bytes, [7; 4]);
+    // A bus write counts, and stamps no page.
     bus.write(0x1000, &[1]).unwrap();
-    assert_eq!(bus.generation(), start + 2);
+    assert_eq!(bus.generation(), start + 1);
+    assert_eq!(bus.own_generation(), Some(1));
     assert_eq!(bus.code_stamp(RAM, 8), Some(code));
 
-    // A device writes into the second page, through vm-memory.
+    // A translator watches the first page: a store there moves its stamp,
+    // makes the word even, and the translator sees that.
+    let word = bus.watch_code(RAM).unwrap();
+    assert_eq!(word & 1, 1);
+    assert_eq!(bus.watch_code(RAM + 4), Some(word));
+    let page = bus.host_page(RAM).unwrap();
+    assert_eq!(page.watch().unwrap().load(Ordering::SeqCst), word);
+    bus.write(RAM + 0x10, &[3]).unwrap();
+    assert_eq!(bus.generation(), start + 2);
+    assert_eq!(bus.own_generation(), Some(2));
+    assert_ne!(bus.code_stamp(RAM, 8), Some(code));
+    assert!(!bus.watch_holds(RAM, word));
+    // Unwatched again: the next store moves nothing.
+    let code = bus.code_stamp(RAM, 8).unwrap();
+    bus.write(RAM + 0x10, &[4]).unwrap();
+    assert_eq!(bus.code_stamp(RAM, 8), Some(code));
+    // A CPU that wrote straight and found the word odd after its write.
+    let word = bus.watch_code(RAM).unwrap();
+    bus.wrote_straight(RAM + 0x20, 8);
+    assert_ne!(bus.code_stamp(RAM, 8), Some(code));
+    assert!(!bus.watch_holds(RAM, word));
+
+    // A device writes into the second page, through vm-memory: always a
+    // stamp, and it ends a watch there.
+    let word = bus.watch_code(RAM + 0x1000).unwrap();
+    let before = bus.generation();
     memory
         .write_slice(&[9; 4], GuestAddress(RAM + 0x1800))
         .unwrap();
-    assert_eq!(bus.generation(), start + 3);
-    assert_eq!(bus.code_stamp(RAM, 8), Some(code));
+    assert_eq!(bus.generation(), before + 1);
     assert_ne!(bus.code_stamp(RAM + 0xffe, 4), Some(crossing));
-    let mut bytes = [0; 4];
+    assert!(!bus.watch_holds(RAM + 0x1000, word));
     assert!(bus.code_bytes(RAM + 0x1800, &mut bytes));
     assert_eq!(bytes, [9; 4]);
-    assert_eq!(bus.generation(), start + 3);
+    // The device's write is not this CPU's.
+    assert_eq!(bus.own_generation(), Some(3));
 }
 
 #[test]
-fn an_exclusive_store_fails_after_any_write_to_its_page() {
+fn an_exclusive_store_is_a_compare_and_exchange_and_a_stamp_still_fails_it() {
     let memory = ram();
     let mut bus = GuestBus::new(memory.clone(), host_with_latch(), 2).unwrap();
     assert!(bus.transaction_lock().is_some());
@@ -454,28 +483,146 @@ fn an_exclusive_store_fails_after_any_write_to_its_page() {
     let at = RAM + 0x4000;
     let mut bytes = [0; 8];
 
+    // A store of another CPU to other bytes, straight: the value of the
+    // load is still there, and the exchange writes.
     let reservation = bus.load_reserved(at, &mut bytes).unwrap();
-    assert_eq!(reservation, bus.reservation_generation(at, 8));
-    // A store of another CPU to another page keeps it.
-    other.write(at + 0x1000, &[1]).unwrap();
-    assert!(bus.store_conditional(at, &[5; 8], reservation).unwrap());
-    // The store itself moved the generation of the page.
-    assert!(!bus.store_conditional(at, &[6; 8], reservation).unwrap());
-
-    let reservation = bus.load_reserved(at, &mut bytes).unwrap();
-    assert_eq!(bytes, [5; 8]);
     other.write(at + 0x20, &[1]).unwrap();
-    assert!(!bus.store_conditional(at, &[7; 8], reservation).unwrap());
+    assert_eq!(bus.reservation_generation(at, 8), reservation);
+    assert!(bus.compare_and_store(at, &bytes, &[5; 8]).unwrap());
+    // Another CPU changed the reserved bytes: the exchange fails, writes
+    // nothing, and the other CPU's value stays.
+    bus.load_reserved(at, &mut bytes).unwrap();
+    assert_eq!(bytes, [5; 8]);
+    other.write(at + 4, &[6]).unwrap();
+    assert!(!bus.compare_and_store(at, &bytes, &[7; 8]).unwrap());
+    bus.read(at, &mut bytes).unwrap();
+    assert_eq!(bytes, [5, 5, 5, 5, 6, 5, 5, 5]);
+    // Each size has its exchange, 16 bytes too.
+    let mut wide = [0u8; 16];
+    bus.read(at, &mut wide).unwrap();
+    assert!(bus.compare_and_store(at, &wide, &[8; 16]).unwrap());
+    assert!(!bus.compare_and_store(at, &wide, &[9; 16]).unwrap());
+    for len in [1, 2, 4, 8] {
+        let now = [8u8; 16];
+        assert!(bus.compare_and_store(at, &now[..len], &[len as u8; 16][..len]).unwrap());
+    }
 
+    // A device write moves the stamp of the page, which fails the
+    // reservation before the exchange.
     let reservation = bus.load_reserved(at, &mut bytes).unwrap();
     memory.write_slice(&[2], GuestAddress(at + 0x40)).unwrap();
-    assert!(!bus.store_conditional(at, &[8; 8], reservation).unwrap());
-    bus.read(at, &mut bytes).unwrap();
-    assert_eq!(bytes, [5; 8]);
+    assert_ne!(bus.reservation_generation(at, 8), reservation);
 
     // One CPU takes no lock.
     let single = GuestBus::new(ram(), host_with_latch(), 1).unwrap();
     assert!(single.transaction_lock().is_none());
+}
+
+/// `LDAXR Wt, [Xn]`.
+fn ldaxr32(rt: u32, rn: u32) -> u32 {
+    0x885f_fc00 | rn << 5 | rt
+}
+
+/// `LDXR Wt, [Xn]`.
+fn ldxr32(rt: u32, rn: u32) -> u32 {
+    0x885f_7c00 | rn << 5 | rt
+}
+
+/// `STXR Ws, Wt, [Xn]`.
+fn stxr32(rs: u32, rt: u32, rn: u32) -> u32 {
+    0x8800_7c00 | rs << 16 | rn << 5 | rt
+}
+
+/// `STLR Wt, [Xn]`.
+fn stlr32(rt: u32, rn: u32) -> u32 {
+    0x889f_fc00 | rn << 5 | rt
+}
+
+/// `CBNZ Wt, offset` in instructions.
+fn cbnz32(rt: u32, offset: i32) -> u32 {
+    0x3500_0000 | ((offset as u32) & 0x7ffff) << 5 | rt
+}
+
+/// `ADD Wd, Wn, #imm`.
+fn add32(rd: u32, rn: u32, imm: u32) -> u32 {
+    0x1100_0000 | imm << 10 | rn << 5 | rd
+}
+
+/// `SUB Xd, Xn, #imm`.
+fn sub64(rd: u32, rn: u32, imm: u32) -> u32 {
+    0xd100_0000 | imm << 10 | rn << 5 | rd
+}
+
+/// Two CPUs on two threads (card S3): each takes a spinlock with
+/// `LDAXR`/`STXR`, adds one to a counter with plain loads and stores, and
+/// gives the lock back with a plain `STLR`, which writes straight; then adds
+/// one to a second counter with `LDXR`/`STXR` alone, and makes a plain store
+/// of its own beside them in the same page. An exclusive store that
+/// succeeded over a store of the other CPU would lose an increment.
+#[test]
+fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
+    const ROUNDS: u64 = 200_000;
+    const CODE: u64 = RAM + 0x10_0000;
+    const DATA: u64 = RAM + 0x2000;
+    let memory = ram();
+    let bus = GuestBus::new(memory.clone(), host_with_latch(), 2).unwrap();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    assert!(bus.writes_straight(), "the host has membarrier and cmpxchg16b");
+    let program = [
+        ldaxr32(5, 1),     // 0 lock: w5 = [x1]
+        cbnz32(5, -1),     // 1 held: again
+        stxr32(6, 7, 1),   // 2 [x1] = 1
+        cbnz32(6, -3),     // 3 lost: again
+        ldr32(8, 3, 0),    // 4 w8 = [x3]
+        add32(8, 8, 1),    // 5
+        str32(8, 3, 0),    // 6 [x3] = w8
+        stlr32(31, 1),     // 7 [x1] = 0
+        ldxr32(11, 10),    // 8 w11 = [x10]
+        add32(11, 11, 1),  // 9
+        stxr32(12, 11, 10), // 10
+        cbnz32(12, -3),    // 11 lost: again from 8
+        str32(2, 9, 0),    // 12 [x9] = w2, beside the counters
+        sub64(2, 2, 1),    // 13
+        asm::cbnz(2, -14), // 14
+        asm::hvc(0),       // 15
+    ];
+    memory
+        .write_slice(&asm::bytes(&program), GuestAddress(CODE))
+        .unwrap();
+    let threads: Vec<_> = (0..2u64)
+        .map(|id| {
+            let bus = bus.clone();
+            std::thread::spawn(move || {
+                let mut state = State::reset(CODE);
+                state.set_x(1, DATA);
+                state.set_x(2, ROUNDS);
+                state.set_x(3, DATA + 0x40);
+                state.set_x(7, 1);
+                state.set_x(9, DATA + 0x100 + 8 * id);
+                state.set_x(10, DATA + 0x80);
+                let mut cpu = vmlab_hv_tcg_aarch64::Cpu::new(bus, state);
+                loop {
+                    match cpu.run(100_000) {
+                        vmlab_hv_tcg_aarch64::Stop::Budget => {}
+                        vmlab_hv_tcg_aarch64::Stop::Hypercall { .. } => break,
+                        other => panic!("cpu {id}: {other:?}"),
+                    }
+                }
+                cpu.state.x(2)
+            })
+        })
+        .collect();
+    for thread in threads {
+        assert_eq!(thread.join().unwrap(), 0);
+    }
+    let word = |at: u64| {
+        let mut bytes = [0u8; 4];
+        memory.read_slice(&mut bytes, GuestAddress(at)).unwrap();
+        u32::from_le_bytes(bytes)
+    };
+    assert_eq!(word(DATA), 0, "the lock is free");
+    assert_eq!(word(DATA + 0x40), 2 * ROUNDS as u32, "under the lock");
+    assert_eq!(word(DATA + 0x80), 2 * ROUNDS as u32, "exclusive increments");
 }
 
 // ---- the test VM ------------------------------------------------------------
