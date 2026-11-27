@@ -108,6 +108,9 @@ pub struct EmulatedVcpu {
     counter: Option<(Counter, u64)>,
     /// The instruction count at which `log_jit` writes next.
     jit_report: u64,
+    /// The windows of the boot lockstep that this vCPU still writes
+    /// (`VMLAB_HV_A64_WINDOWS`, card C13b).
+    windows: Option<super::windows::Windows>,
 }
 
 /// The count of the system counter of a machine now.
@@ -196,6 +199,7 @@ impl EmulatedVcpu {
             paused_at: 0,
             counter: None,
             jit_report: JIT_REPORT,
+            windows: super::windows::Windows::from_environment(id),
         }
     }
 
@@ -448,6 +452,14 @@ impl VcpuBackend for EmulatedVcpu {
         self.drive_timer();
         self.log_unknown();
         self.log_jit();
+        if matches!(stop, Stop::Budget)
+            && let Some(windows) = &mut self.windows
+            && windows.due(self.cpu.instructions)
+            && let Err(error) = windows.write(&self.cpu)
+        {
+            log::warn!("vcpu {}: a window was not written: {error}", self.id);
+            self.windows = None;
+        }
         match stop {
             Stop::Budget => Exit::Again,
             Stop::Halt => Exit::Halt,

@@ -10,6 +10,7 @@
 pub mod emulated;
 pub mod guest_bus;
 mod kvm;
+mod windows;
 
 #[cfg(test)]
 mod emulated_tests;
