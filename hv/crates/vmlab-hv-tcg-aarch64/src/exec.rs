@@ -937,20 +937,30 @@ impl BlockCounts {
         let mut writeback = Vec::new();
         for event in &block.events {
             let (exit, roots) = match event {
-                Event::Guard { condition, exit, .. }
-                    if matches!(block.exits[*exit].next, A64Next::Exception {
-                        class: ExceptionClass::Alignment { .. }, ..
-                    }) =>
+                Event::Guard {
+                    condition, exit, ..
+                } if matches!(
+                    block.exits[*exit].next,
+                    A64Next::Exception {
+                        class: ExceptionClass::Alignment { .. },
+                        ..
+                    }
+                ) =>
                 {
                     alignment.push(*condition);
                     self.alignment_operations += 1;
                     (Some(*exit), Vec::new())
                 }
-                Event::Guard { condition, exit, .. } => (Some(*exit), vec![*condition]),
+                Event::Guard {
+                    condition, exit, ..
+                } => (Some(*exit), vec![*condition]),
                 Event::ReadMemory { address, error, .. } => (Some(*error), vec![*address]),
-                Event::WriteMemory { address, value, error, .. } => {
-                    (Some(*error), vec![*address, *value])
-                }
+                Event::WriteMemory {
+                    address,
+                    value,
+                    error,
+                    ..
+                } => (Some(*error), vec![*address, *value]),
                 Event::Call { args, .. } => (None, args.clone()),
                 Event::Exit(exit) => (None, exit_roots(&block.exits[*exit])),
                 Event::Checkpoint(_) => continue,
@@ -2303,8 +2313,14 @@ impl<M: Memory> Cpu<M> {
         }
         self.translations += 1;
         self.side.mark_code(phys);
-        let mut compiled = compile(phys, context, count, builder.finish(at), self.block_counts.as_mut())
-            .map_err(Refused::Stop)?;
+        let mut compiled = compile(
+            phys,
+            context,
+            count,
+            builder.finish(at),
+            self.block_counts.as_mut(),
+        )
+        .map_err(Refused::Stop)?;
         if let Some(counts) = &mut self.block_counts {
             counts.ldp_x += ldp_x;
             counts.stp_x += stp_x;
@@ -3289,7 +3305,10 @@ mod tests {
             completed: 1,
         });
         block.events.push(Event::Exit(exit));
-        assert!(matches!(compile(0, context, 1, block, None), Err(Stop::Host(_))));
+        assert!(matches!(
+            compile(0, context, 1, block, None),
+            Err(Stop::Host(_))
+        ));
     }
 
     #[test]
