@@ -3598,32 +3598,6 @@ mod tests {
     const LOOP: [u32; 3] = [0x9100_0400, 0xf100_0421, 0x54ff_ffc1];
 
     #[test]
-    fn zz_dump_flag_blocks() {
-        let cases: [&[u32]; 7] = [
-            &[0xeb02003f, 0x54ffffeb],
-            &[0x7100143f, 0x54ffffec],
-            &[0xeb02003f, 0x9a848060, 0xd4200000],
-            &[0xf240003f, 0x54ffffe0],
-            &[0x54ffffe0],
-            &[0xb1000c3f, 0x1a9f57e0, 0xd4200000],
-            &[0xeb02003f, 0xfa421020, 0x54ffffea],
-        ];
-        for words in cases {
-            let mut cpu = cpu(words);
-            let mut block = cpu.translate(BASE, 64).ok().expect("a block");
-            let mut jit = jit::Jit::new().unwrap();
-            block.compile_code(&mut jit);
-            eprintln!("== {words:08x?} refused {} {:?}", block.refused, jit.stats);
-            for (n, op) in block.ops.iter().enumerate() {
-                eprintln!("  {n}: {op:?}");
-            }
-            for call in &block.calls {
-                eprintln!("  call condition {} args {:?}", call.condition, call.args);
-            }
-        }
-    }
-
-    #[test]
     fn a_counted_loop_runs_to_its_end_with_the_flags_of_the_last_compare() {
         let mut cpu = cpu(&LOOP);
         cpu.state.set_x(1, 1000);
