@@ -3937,6 +3937,10 @@ pub struct JitCounts {
     /// `Cpu::translations` and `Cpu::translation_ns`.
     pub translations: u64,
     pub translation_ns: u64,
+    /// The joins of superblocks and their side exits, as `Cpu::joins` and
+    /// `Cpu::side_exits` (3e DESIGN.md J14).
+    pub joins: u64,
+    pub side_exits: u64,
     /// Comparisons compiled as the host flags that the next operation
     /// reads, and lazy conditions compiled inline (3e DESIGN.md H8).
     pub fused: u64,
@@ -4766,6 +4770,8 @@ impl<M: Memory> Cpu<M> {
         counts.machine = self.side.machine;
         counts.translations = self.translations;
         counts.translation_ns = self.translation_ns;
+        counts.joins = self.joins;
+        counts.side_exits = self.side_exits;
         counts
     }
 
