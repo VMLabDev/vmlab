@@ -1144,6 +1144,9 @@ struct Call {
     /// The call is `flags::CONDITION`, which the JIT can make inline (3e
     /// DESIGN.md H8c).
     condition: bool,
+    /// The function that compiled code calls with the words of the
+    /// arguments in registers, for a helper that has one (3e DESIGN.md J13).
+    registers: Option<jit::RegisterFn>,
     /// The words of the arguments.
     args: Vec<Place>,
     /// The words of each result, with the mask of its type.
@@ -1266,6 +1269,7 @@ impl Parts {
                     let call = Call {
                         function: helper.0.function,
                         condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
+                        registers: crate::helpers::in_registers_of(helper.0),
                         args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                         results: vec![(lowering.place(id), result_mask(graph, id))],
                     };
@@ -1319,6 +1323,7 @@ impl Parts {
                         let call = Call {
                             function: helper.0.function,
                             condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
+                            registers: crate::helpers::in_registers_of(helper.0),
                             args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                             results: vec![(lowering.place(id), result_mask(graph, id))],
                         };
@@ -1591,6 +1596,7 @@ fn compile_with(
                 let call = Call {
                     function: helper.0.function,
                     condition: false,
+                    registers: None,
                     args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                     results: results
                         .iter()
@@ -3116,6 +3122,24 @@ fn place_words(place: Place) -> impl Iterator<Item = Slot> {
     std::iter::once(place.slot).chain(place.wide.then_some(place.slot + 1))
 }
 
+/// The call of `call` with its words in registers (3e DESIGN.md J13): for
+/// a helper with such a function, whose arguments and result are values of
+/// 128 bits, two words each, and whose result needs no mask.
+fn register_call(call: &Call) -> Option<jit::Registers> {
+    let function = call.registers?;
+    let [(result, u128::MAX)] = call.results[..] else {
+        return None;
+    };
+    if !result.wide || !call.args.iter().all(|place| place.wide) {
+        return None;
+    }
+    Some(jit::Registers {
+        function: function as usize as u64,
+        args: call.args.iter().copied().flat_map(place_words).collect(),
+        results: place_words(result).collect(),
+    })
+}
+
 /// What K3 writes into the written words of the frame before a replay: a
 /// word that the compiled code reads before it writes it shows.
 const POISON: u64 = 0x6b33_dead_6b33_dead;
@@ -3212,6 +3236,7 @@ impl Compiled {
                 index as u64,
             ));
             effect.condition = self.lazy_condition(call);
+            effect.registers = register_call(call);
         }
         let (leaves, accesses, calls) = (&*leaves, &*accesses, &*calls);
         // The compiled code sets the PC (3e DESIGN.md H5): the last
@@ -3311,6 +3336,7 @@ fn refill_effects(effects: &mut Vec<jit::Effect>, len: usize) -> &mut [jit::Effe
         effect.leave = None;
         effect.direct = None;
         effect.condition = None;
+        effect.registers = None;
     }
     effects
 }
@@ -5940,6 +5966,146 @@ mod tests {
         };
         let quiet = runs(false);
         assert_eq!(runs(true), quiet + 1, "the run after the TLBI");
+    }
+
+    /// 3e card J13: the inline forms of `ADD`, `SUB`, `CMEQ`, `CMTST` and
+    /// `REV` of vectors, and the crypto helpers with their words in
+    /// registers, give what the lane helper and the crypto function give,
+    /// in the interpreter and in compiled code, for every arrangement.
+    #[test]
+    fn inline_lanes_and_register_helpers_give_what_the_helpers_give() {
+        use crate::helpers::crypto::{Crypto, crypto};
+        use crate::helpers::simd::{Code as Lanes, Op as LaneOp, eval};
+        let mut seed = 0x3e_0013_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // A vector, and one that has some lanes of it, for the compares.
+        let mut vector = |bits: u32| -> (u128, u128) {
+            let a = u128::from(next()) | u128::from(next()) << 64;
+            let kind = next() % 4;
+            let a = match kind {
+                0 => a,
+                1 => !0,
+                2 => a & u128::from_le_bytes([0x80; 16]),
+                _ => 0,
+            };
+            let keep = u128::from(next()) | u128::from(next()) << 64;
+            let mut lanes = 0u128;
+            for lane in 0..128 / bits {
+                if keep >> lane & 1 != 0 {
+                    lanes |= ((1u128 << bits) - 1) << (lane * bits);
+                }
+            }
+            let b = u128::from(next()) | u128::from(next()) << 64;
+            (a, (a & lanes) | (b & !lanes))
+        };
+        // (word without size, Q and registers, operation, sizes, container
+        // of a REV, reads Rm, compares with zero).
+        let forms: [(u32, LaneOp, u32, u16, bool, bool); 8] = [
+            (0x0e20_8400, LaneOp::Add, 4, 0, true, false),
+            (0x2e20_8400, LaneOp::Sub, 4, 0, true, false),
+            (0x2e20_8c00, LaneOp::CmEq, 4, 0, true, false),
+            (0x0e20_8c00, LaneOp::CmTst, 4, 0, true, false),
+            (0x0e20_9800, LaneOp::CmEq, 4, 0, false, true),
+            (0x0e20_0800, LaneOp::Rev, 3, 64, false, false),
+            (0x2e20_0800, LaneOp::Rev, 2, 32, false, false),
+            (0x0e20_1800, LaneOp::Rev, 1, 16, false, false),
+        ];
+        let mut cases = Vec::new();
+        for (base, op, sizes, container, reads_m, zero) in forms {
+            for size in 0..sizes {
+                for q in [false, true] {
+                    if size == 3 && !q {
+                        continue;
+                    }
+                    let lanes = (if q { 128 } else { 64 }) / (8u32 << size);
+                    // The forms of two registers have no Rm.
+                    let rm = if reads_m { 2 << 16 } else { 0 };
+                    let word = base | u32::from(q) << 30 | size << 22 | rm | 1 << 5;
+                    let code = Lanes::new(op, size as u8, lanes as u8).imm(container);
+                    cases.push((word, code, reads_m, zero));
+                }
+            }
+        }
+        // ADD and SUB of the scalar D registers.
+        for (word, op) in [(0x5ee0_8400, LaneOp::Add), (0x7ee0_8400, LaneOp::Sub)] {
+            cases.push((word | 2 << 16 | 1 << 5, Lanes::new(op, 3, 1), true, false));
+        }
+        for (word, code, reads_m, zero) in cases {
+            for round in 0..64 {
+                let (n, m) = vector(8 << code.size);
+                let m = if reads_m { m } else { 0 };
+                let expected = eval(code, n, m, 0, 0).0;
+                for jit in [false, true] {
+                    // The instruction, then `b .`.
+                    let mut cpu = cpu(&[word, 0x1400_0000]);
+                    cpu.state.enable_fp();
+                    cpu.set_jit(jit).unwrap();
+                    cpu.state.set_v(0, u128::MAX);
+                    cpu.state.set_v(1, n);
+                    cpu.state.set_v(2, m);
+                    assert_eq!(cpu.run(2), Stop::Budget);
+                    assert_eq!(
+                        cpu.state.v(0),
+                        expected,
+                        "{word:#010x} {code:?} zero {zero} jit {jit} round {round}: {n:#x} {m:#x}"
+                    );
+                    if jit {
+                        assert_eq!(cpu.jit_counts().interpreted_instructions, 0);
+                    }
+                }
+            }
+        }
+        // The crypto operations: `SHA256H q0, q1, v2.4s` and the others of
+        // the 3d set, through their own helpers.
+        let crypto_words: [(u32, Crypto); 14] = [
+            (0x4e28_4820, Crypto::AesE),
+            (0x4e28_5820, Crypto::AesD),
+            (0x4e28_6820, Crypto::AesMc),
+            (0x4e28_7820, Crypto::AesImc),
+            (0x5e02_0020, Crypto::Sha1C),
+            (0x5e02_1020, Crypto::Sha1P),
+            (0x5e02_2020, Crypto::Sha1M),
+            (0x5e28_0820, Crypto::Sha1H),
+            (0x5e02_3020, Crypto::Sha1Su0),
+            (0x5e28_1820, Crypto::Sha1Su1),
+            (0x5e02_4020, Crypto::Sha256H),
+            (0x5e02_5020, Crypto::Sha256H2),
+            (0x5e28_2820, Crypto::Sha256Su0),
+            (0x5e02_6020, Crypto::Sha256Su1),
+        ];
+        for (word, operation) in crypto_words {
+            let record = crate::generated::decode::decode(word)
+                .expect("a crypto record")
+                .record;
+            let (planned, plan_d, plan_m) =
+                crate::lift::crypto::plan(record).expect("a crypto plan");
+            assert_eq!(planned, operation, "{word:#010x}");
+            for _ in 0..16 {
+                let (d, n) = vector(32);
+                let (m, _) = vector(32);
+                let expected = crypto(
+                    operation,
+                    if plan_d { d } else { 0 },
+                    n,
+                    if plan_m { m } else { 0 },
+                );
+                for jit in [false, true] {
+                    let mut cpu = cpu(&[word, 0x1400_0000]);
+                    cpu.state.enable_fp();
+                    cpu.set_jit(jit).unwrap();
+                    cpu.state.set_v(0, d);
+                    cpu.state.set_v(1, n);
+                    cpu.state.set_v(2, m);
+                    assert_eq!(cpu.run(2), Stop::Budget);
+                    assert_eq!(cpu.state.v(0), expected, "{operation:?} jit {jit}");
+                }
+            }
+        }
     }
 
     /// Card J10: two blocks 16 KiB apart take the same entry of the jump

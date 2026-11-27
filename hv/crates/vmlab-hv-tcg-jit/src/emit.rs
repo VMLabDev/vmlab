@@ -92,7 +92,41 @@ pub struct Effect {
     /// A helper call that is a condition of a lazy flag record, with the
     /// inline forms of its kinds (H8c).
     pub condition: Option<LazyCondition>,
+    /// A pure helper that compiled code calls with its arguments in
+    /// registers, in place of `direct` and of the thunk (3e DESIGN.md J13).
+    pub registers: Option<Registers>,
 }
+
+/// A pure helper call whose words go to the function in the argument
+/// registers of the System V convention and come back in RAX and RDX
+/// (3e DESIGN.md J13): no thunk, and no Rust code that finds the call and
+/// reads its arguments from the frame. It never leaves the block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registers {
+    /// The address of an `extern "sysv64"` function of the type
+    /// `crate::RegisterFn`.
+    pub function: u64,
+    /// The words of its arguments, in the order RDI, RSI, RDX, RCX, R8 and
+    /// R9: at most six, each one that the effect reads. The registers past
+    /// them hold no value that the function may read.
+    pub args: Vec<Slot>,
+    /// The words that RAX and then RDX fill: at most two, and the words that
+    /// the effect writes, in that order.
+    pub results: Vec<Slot>,
+}
+
+impl Registers {
+    /// Whether the call fits the effect that holds it.
+    fn fits(&self, reads: &[Slot], writes: &[Slot]) -> bool {
+        self.args.len() <= ARGUMENT_REGISTERS.len()
+            && self.results.len() <= 2
+            && self.args.iter().all(|word| reads.contains(word))
+            && self.results == writes
+    }
+}
+
+/// The argument registers of the System V convention, in order.
+const ARGUMENT_REGISTERS: [Reg; 6] = [RDI, RSI, RDX, RCX, R8, R9];
 
 /// A helper call whose result is whether a condition holds for a lazy flag
 /// record of the guest: a kind and two operands (DESIGN.md H8c). The caller
@@ -1021,18 +1055,51 @@ impl Emitter<'_> {
         }
     }
 
+    /// Call the pure helper of `registers` with the words of its arguments,
+    /// which are in the frame, in the argument registers, keeping `saved`,
+    /// and store what it gives in RAX and RDX into the words of its
+    /// results (3e DESIGN.md J13).
+    fn call_registers(asm: &mut Asm, registers: &Registers, saved: &[Reg]) {
+        for reg in saved {
+            asm.push(*reg);
+        }
+        let pad = saved.len() % 2 == 1;
+        if pad {
+            asm.alu_imm(Alu::Sub, Rm::Reg(RSP), 8);
+        }
+        // R14, the frame, is no argument register: every load reads the
+        // frame as it was before the first.
+        for (word, reg) in registers.args.iter().zip(ARGUMENT_REGISTERS) {
+            asm.mov(reg, Self::frame(*word));
+        }
+        asm.mov_imm(RAX, registers.function);
+        asm.call_indirect(Rm::Reg(RAX));
+        if pad {
+            asm.alu_imm(Alu::Add, Rm::Reg(RSP), 8);
+        }
+        for reg in saved.iter().rev() {
+            asm.pop(*reg);
+        }
+        // RAX and RDX are scratch: the pops above do not touch them.
+        for (word, reg) in registers.results.iter().zip([RAX, RDX]) {
+            asm.store(Self::frame(*word), reg);
+        }
+    }
+
     /// An operation that runs through the thunk, or through the function
     /// that its `Effect` names.
     fn effect(&mut self, index: usize, reads: &[Slot], writes: &[Slot]) {
         let op = self.shape.ops[index];
-        let direct = if op.code == Code::Call {
-            self.shape
-                .calls
-                .get(op.imm as usize)
-                .and_then(|call| call.direct)
+        let shape = self.shape;
+        let call = if op.code == Code::Call {
+            shape.calls.get(op.imm as usize)
         } else {
             None
         };
+        let direct = call.and_then(|call| call.direct);
+        let registers = call
+            .and_then(|call| call.registers.as_ref())
+            .filter(|registers| registers.fits(reads, writes));
         let at = index as u32;
         for word in reads {
             self.materialize(*word);
@@ -1043,6 +1110,10 @@ impl Emitter<'_> {
             self.words[usize::from(*word)].home = Home::Frame;
         }
         let saved = self.live_caller_saved();
+        if let Some(registers) = registers {
+            Self::call_registers(&mut self.asm, registers, saved.as_slice());
+            return;
+        }
         match direct {
             Some((function, argument)) => {
                 Self::call_function(&mut self.asm, Some(function), argument, saved.as_slice());

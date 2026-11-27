@@ -350,6 +350,27 @@ unsafe extern "sysv64" fn direct(env: *mut c_void, argument: u64, _block: *mut c
     0
 }
 
+/// The function of a helper call with `Effect::registers` that reads `N`
+/// words: what `call` computes, from the argument registers.
+extern "sysv64" fn fold<const N: usize>(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> Words {
+    let mut value = 0x9e37_79b9_7f4a_7c15u64;
+    for word in [a, b, c, d, e, f].into_iter().take(N) {
+        value = value.rotate_left(7) ^ word;
+    }
+    Words {
+        low: value.wrapping_mul(3),
+        high: value.wrapping_mul(4),
+    }
+}
+
+/// The address of `fold` for `count` words.
+fn fold_of(count: usize) -> u64 {
+    let functions: [RegisterFn; 7] = [
+        fold::<0>, fold::<1>, fold::<2>, fold::<3>, fold::<4>, fold::<5>, fold::<6>,
+    ];
+    functions[count] as usize as u64
+}
+
 /// A block of the test.
 struct Block {
     ops: Vec<Op>,
@@ -919,15 +940,23 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
                     b: 0,
                     imm: calls.len() as u64,
                 });
-                // Half of the calls go to their own function (H12).
-                let direct = (random.below(2) == 0)
-                    .then_some((direct as Thunk as usize as u64, calls.len() as u64));
+                // Half of the calls go to their own function (H12), and a
+                // third of those with their words in registers (J13).
+                let how = random.below(6);
+                let direct =
+                    (how < 3).then_some((direct as Thunk as usize as u64, calls.len() as u64));
+                let registers = (how == 0).then(|| Registers {
+                    function: fold_of(reads.len()),
+                    args: reads.clone(),
+                    results: writes.clone(),
+                });
                 calls.push(Effect {
                     reads,
                     writes,
                     leave: None,
                     direct,
                     condition: None,
+                    registers,
                 });
             }
             1 => {
@@ -1260,6 +1289,7 @@ fn lazy_conditions_run_their_forms_inline_and_call_for_other_kinds() {
                     leave: None,
                     direct: None,
                     condition: Some(lazy),
+                    registers: None,
                 }];
                 let block = Block {
                     generics: Vec::new(),
@@ -1324,6 +1354,7 @@ fn a_lazy_condition_for_another_code_is_a_call() {
             leave: None,
             direct: None,
             condition: Some(lazy),
+            registers: None,
         }],
         leaves: Vec::new(),
         inputs: vec![(word(1), 0), (word(2), 1), (word(3), 2)],
@@ -2310,6 +2341,7 @@ fn a_direct_call_runs_its_function_and_not_the_thunk() {
         leave: None,
         direct: Some((direct as Thunk as usize as u64, 0)),
         condition: None,
+        registers: None,
     };
     let block = Block {
         ops: vec![Op {
@@ -2336,4 +2368,69 @@ fn a_direct_call_runs_its_function_and_not_the_thunk() {
     let ran = compiled_on(&mut jit, &block, &mut got, 10, &mut ram, None);
     assert_eq!((ran.code, got), (DONE, expected));
     assert_eq!((ran.thunk_calls, ran.direct_calls), (0, 1));
+}
+
+/// A helper call with `Effect::registers` takes six words in the argument
+/// registers and gives two in RAX and RDX, with no thunk and no direct
+/// call (3e DESIGN.md J13), while other words stay live in the registers
+/// that a call does not keep. A call whose words do not fit the effect
+/// goes through `direct` as before.
+#[test]
+fn a_register_call_takes_its_words_in_registers() {
+    for fits in [true, false] {
+        let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+        let reads: Vec<Slot> = vec![1, 2, 3, 4, 5, 6];
+        let effect = Effect {
+            reads: reads.clone(),
+            writes: vec![7, 8],
+            leave: None,
+            direct: Some((direct as Thunk as usize as u64, 0)),
+            condition: None,
+            registers: Some(Registers {
+                function: fold_of(6),
+                args: reads,
+                // A word that the effect does not write: the call does not fit.
+                results: if fits { vec![7, 8] } else { vec![7, 9] },
+            }),
+        };
+        // Words 1 to 6 are read again after the call, from the registers
+        // that the allocator gave them.
+        let mut ops = vec![Op {
+            code: Code::Call,
+            aux: 0,
+            dst: 0,
+            a: 0,
+            b: 0,
+            imm: 0,
+        }];
+        for n in 0..6u16 {
+            ops.push(Op {
+                code: Code::Add,
+                aux: 0,
+                dst: 10 + n,
+                a: 1 + n,
+                b: 7 + n % 2,
+                imm: 0,
+            });
+        }
+        let block = Block {
+            ops,
+            generics: Vec::new(),
+            frame: vec![0; 16],
+            calls: vec![effect],
+            leaves: Vec::new(),
+            inputs: (1..=6).map(|n| (word(n), u32::from(n))).collect(),
+            outputs: (0..6).map(|n| (n, word(10 + n as Slot))).collect(),
+            memory: Memory::Thunk,
+        };
+        let slots: Vec<u128> = (0..8).map(|n| 0x1111_2222_3333_4444 * (n + 1)).collect();
+        let mut expected = slots.clone();
+        interpret(&block, &mut expected, &mut []);
+        let mut got = slots;
+        let mut ram = vec![0u8; PAGES * 4096];
+        let ran = compiled_on(&mut jit, &block, &mut got, 10, &mut ram, None);
+        assert_eq!((ran.code, &got), (DONE, &expected), "fits: {fits}");
+        let calls = if fits { (0, 0) } else { (0, 1) };
+        assert_eq!((ran.thunk_calls, ran.direct_calls), calls, "fits: {fits}");
+    }
 }
