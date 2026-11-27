@@ -1473,11 +1473,20 @@ mod tests {
         // Back to the first space.
         assert_eq!(switch(&mut mmu, ttbr0, 7), (changes + 2, jumps));
         // The same ASID with another base cannot be told apart.
-        assert_eq!(switch(&mut mmu, ttbr0 + 0x2000, 7), (changes + 3, jumps + 1));
+        assert_eq!(
+            switch(&mut mmu, ttbr0 + 0x2000, 7),
+            (changes + 3, jumps + 1)
+        );
         // The same ASID with the same base is no change.
-        assert_eq!(switch(&mut mmu, ttbr0 + 0x2000, 7), (changes + 3, jumps + 1));
+        assert_eq!(
+            switch(&mut mmu, ttbr0 + 0x2000, 7),
+            (changes + 3, jumps + 1)
+        );
         // A new ASID under the same base keeps it too.
-        assert_eq!(switch(&mut mmu, ttbr0 + 0x2000, 9), (changes + 4, jumps + 1));
+        assert_eq!(
+            switch(&mut mmu, ttbr0 + 0x2000, 9),
+            (changes + 4, jumps + 1)
+        );
         assert_eq!(mmu.spaces(), 3);
         // Every TLBI empties it, and so does a change of a control.
         mmu.flush_page(Regime::El10, va >> 12 | 9 << 48, Some(9));

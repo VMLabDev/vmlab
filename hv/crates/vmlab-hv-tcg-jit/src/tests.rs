@@ -1751,9 +1751,11 @@ fn a_miss_of_the_jump_cache_asks_the_thunk_and_goes_on_to_the_code_it_gives() {
     assert_eq!(slots[0], 1);
     // The thunk gives the code: the run goes on until its budget, with no
     // return to the owner, every turn through the thunk.
-    let (code, context, jumps) =
-        block.run_served(&jit, &entry, &mut slots, 20, entry.address);
-    assert_eq!((code, context.budget, context.hits, jumps), (BUDGET, 0, 0, 20));
+    let (code, context, jumps) = block.run_served(&jit, &entry, &mut slots, 20, entry.address);
+    assert_eq!(
+        (code, context.budget, context.hits, jumps),
+        (BUDGET, 0, 0, 20)
+    );
     assert_eq!(slots[0], 21);
     // A filled entry hits inline and asks nothing.
     jit.fill(pc, 9, &entry);

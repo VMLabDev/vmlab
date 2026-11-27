@@ -5586,7 +5586,10 @@ mod tests {
         let make = |jit: bool, serve: bool| {
             let mut data = vec![0u8; 0x8000];
             // add x0, x0, #1 ; br x2 / add x1, x1, #1 ; br x3
-            for (at, words) in [(0usize, [0x9100_0400u32, 0xd61f_0040]), (0x4000, [0x9100_0421, 0xd61f_0060])] {
+            for (at, words) in [
+                (0usize, [0x9100_0400u32, 0xd61f_0040]),
+                (0x4000, [0x9100_0421, 0xd61f_0060]),
+            ] {
                 for (n, word) in words.iter().enumerate() {
                     data[at + n * 4..at + n * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }
@@ -5609,7 +5612,12 @@ mod tests {
         }
         for cpu in [&served, &returned] {
             assert_eq!(
-                (cpu.state.x(0), cpu.state.x(1), cpu.state.pc(), cpu.instructions),
+                (
+                    cpu.state.x(0),
+                    cpu.state.x(1),
+                    cpu.state.pc(),
+                    cpu.instructions
+                ),
                 (
                     interpreted.state.x(0),
                     interpreted.state.x(1),
