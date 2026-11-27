@@ -602,6 +602,11 @@ fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Sl
             }
         }
     };
+    // A place of two words where `random.below(n) == 0` is `when`.
+    let place_by = |random: &mut Random, n: u64, when: bool| {
+        let wide = (random.below(n) == 0) == when;
+        place(random, wide)
+    };
     let width = 1 + random.below(128) as u16;
     let wide = width > 64;
     let ty = ScalarType::Bits(width);
@@ -624,8 +629,8 @@ fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Sl
         4 => {
             let operation = [Binary::Equal, Binary::NotEqual][random.below(2) as usize];
             let (a, b) = (
-                place(random, random.below(2) == 0),
-                place(random, random.below(2) == 0),
+                place_by(random, 2, true),
+                place_by(random, 2, true),
             );
             let out = Place {
                 slot: dst,
@@ -641,7 +646,7 @@ fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Sl
         }
         5 | 6 => {
             let offset = random.below(140) as u16;
-            let a = place(random, random.below(4) != 0);
+            let a = place_by(random, 4, false);
             Generic::new(
                 GenericKind::Slice { offset },
                 ty,
@@ -653,8 +658,8 @@ fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Sl
         7 | 8 => {
             let low_width = random.below(130) as u16;
             let (a, b) = (
-                place(random, random.below(2) == 0),
-                place(random, random.below(2) == 0),
+                place_by(random, 2, true),
+                place_by(random, 2, true),
             );
             Generic::new(
                 GenericKind::Concat { low_width },
@@ -670,7 +675,7 @@ fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Sl
                 Unary::Truncate(1 + random.below(128) as u16),
                 Unary::PopCount(1 + random.below(128) as u16),
             ][random.below(3) as usize];
-            let a = place(random, random.below(2) == 0);
+            let a = place_by(random, 2, true);
             Generic::new(
                 GenericKind::Unary(operation),
                 ty,
