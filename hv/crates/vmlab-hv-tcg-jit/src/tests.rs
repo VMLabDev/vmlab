@@ -628,10 +628,7 @@ fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Sl
         }
         4 => {
             let operation = [Binary::Equal, Binary::NotEqual][random.below(2) as usize];
-            let (a, b) = (
-                place_by(random, 2, true),
-                place_by(random, 2, true),
-            );
+            let (a, b) = (place_by(random, 2, true), place_by(random, 2, true));
             let out = Place {
                 slot: dst,
                 wide: false,
@@ -657,10 +654,7 @@ fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Sl
         }
         7 | 8 => {
             let low_width = random.below(130) as u16;
-            let (a, b) = (
-                place_by(random, 2, true),
-                place_by(random, 2, true),
-            );
+            let (a, b) = (place_by(random, 2, true), place_by(random, 2, true));
             Generic::new(
                 GenericKind::Concat { low_width },
                 ty,
@@ -1715,7 +1709,10 @@ fn every_generic_form_computes_what_the_interpreter_computes() {
             through += 1;
         }
     }
-    assert!(inline > 10_000 && through > 1000, "{inline} inline, {through} through the thunk");
+    assert!(
+        inline > 10_000 && through > 1000,
+        "{inline} inline, {through} through the thunk"
+    );
 }
 
 /// A helper call with `Effect::direct` is a call of its own function, not

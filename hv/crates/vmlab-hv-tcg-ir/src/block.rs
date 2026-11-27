@@ -156,9 +156,13 @@ pub enum Kind {
     Unary(Unary),
     Binary(Binary),
     /// `(a >> offset) & mask`.
-    Slice { offset: u16 },
+    Slice {
+        offset: u16,
+    },
     /// `((a << low_width) | b) & mask`.
-    Concat { low_width: u16 },
+    Concat {
+        low_width: u16,
+    },
     /// `b` where `a` is not zero, else the third operand.
     Select,
 }

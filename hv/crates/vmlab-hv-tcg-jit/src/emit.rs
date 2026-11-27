@@ -1136,7 +1136,8 @@ impl Emitter<'_> {
         let [a, b, c] = generic.args();
         let dst = generic.dst();
         let ty = generic.ty();
-        let is_big = |value: Val| matches!(value, Val::Imm(value) if i32::try_from(value as i64).is_err());
+        let is_big =
+            |value: Val| matches!(value, Val::Imm(value) if i32::try_from(value as i64).is_err());
         let form = match generic.kind() {
             GenericKind::Binary(
                 Binary::And | Binary::Or | Binary::Xor | Binary::Equal | Binary::NotEqual,
@@ -1159,7 +1160,10 @@ impl Emitter<'_> {
         {
             // Nothing reads the result.
             self.release(reads, at);
-            for word in [dst.slot, dst.slot + 1].into_iter().take(1 + usize::from(dst.wide)) {
+            for word in [dst.slot, dst.slot + 1]
+                .into_iter()
+                .take(1 + usize::from(dst.wide))
+            {
                 self.unbind(word);
                 self.words[usize::from(word)].home = Home::Frame;
             }
@@ -1316,7 +1320,9 @@ impl Emitter<'_> {
                         break;
                     }
                     match condition {
-                        Val::Imm(value) => self.load(target, if value != 0 { taken } else { other }),
+                        Val::Imm(value) => {
+                            self.load(target, if value != 0 { taken } else { other })
+                        }
                         Val::Reg(reg) => {
                             let rm = self.rm(taken, RDX);
                             self.load(target, other);
