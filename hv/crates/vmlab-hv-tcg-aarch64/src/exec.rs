@@ -69,9 +69,10 @@ pub const BLOCK_INSTRUCTIONS: u32 = 64;
 
 /// The block cache is direct-mapped by the PC.
 const CACHE_ENTRIES: usize = 1 << 14;
-/// The most blocks that a cache keeps beside its entries: those that a
-/// block of another PC took the entry of. More empty the store.
-const SPARE_BLOCKS: usize = 1 << 14;
+/// The heap bytes of the young generation of the store of a cache: the
+/// blocks that a block of another PC took the entry of (`Cache`). The old
+/// generation holds as much again at most.
+const SPARE_BYTES: usize = 64 << 20;
 
 /// The pages that hold translated code are a bit set over the low bits of
 /// the page number. Two pages with the same low bits share a bit, which
@@ -1191,6 +1192,33 @@ fn store<M: Memory, const N: usize>(
 }
 
 impl Compiled {
+    /// The bytes that the block holds, itself and on the heap, for the bound
+    /// of the store of its cache.
+    fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        size_of::<Self>()
+            + self.ops.capacity() * size_of::<Op>()
+            + self.generics.capacity() * size_of::<Generic>()
+            + self.accesses.capacity() * size_of::<Access16>()
+            + self
+                .leaves
+                .iter()
+                .map(|leave| size_of::<Leave>() + leave.outputs.capacity() * size_of::<(u32, Place)>())
+                .sum::<usize>()
+            + self.frame.capacity() * size_of::<u64>()
+            + self
+                .calls
+                .iter()
+                .map(|call| {
+                    size_of::<Call>()
+                        + call.args.capacity() * size_of::<Place>()
+                        + call.results.capacity() * size_of::<(Place, u128)>()
+                })
+                .sum::<usize>()
+            + self.inputs.capacity() * size_of::<(Place, u32)>()
+            + self.outputs.capacity() * size_of::<(u32, Place)>()
+    }
+
     /// Make one effect. The error: the exit to leave through, and why.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
@@ -1420,10 +1448,26 @@ impl Compiled {
 /// another PC. A kernel and its programs run more code than the entries
 /// cover, so without the store the same blocks were translated again and
 /// again (card C13).
+///
+/// The store has two generations. A block that loses its entry goes into
+/// the young one. When the young one holds `SPARE_BYTES` it becomes the old
+/// one, and the old one is dropped. A block that is taken back from either
+/// returns to its entry. So the blocks that were used since the last turn
+/// stay, and those that were not go: emptying the whole store when it was
+/// full threw away the code of the running programs with the rest, and a
+/// boot of Debian translated three times out of four what it had
+/// translated before.
 struct Cache {
     entries: Vec<Option<Box<Compiled>>>,
-    spare: FastMap<(u64, Context), Box<Compiled>>,
+    young: FastMap<BlockKey, Box<Compiled>>,
+    old: FastMap<BlockKey, Box<Compiled>>,
+    /// The heap bytes of the blocks in `young`.
+    young_bytes: usize,
 }
+
+/// A block of the store: its PC, the physical address of its code, and the
+/// context it was lifted for.
+type BlockKey = (u64, u64, Context);
 
 impl Cache {
     fn new() -> Self {
@@ -1431,7 +1475,9 @@ impl Cache {
         entries.resize_with(CACHE_ENTRIES, || None);
         Self {
             entries,
-            spare: FastMap::default(),
+            young: FastMap::default(),
+            old: FastMap::default(),
+            young_bytes: 0,
         }
     }
 
@@ -1452,23 +1498,35 @@ impl Cache {
     }
 
     fn keep(&mut self, block: Box<Compiled>) {
-        if self.spare.len() >= SPARE_BLOCKS {
-            self.spare.clear();
+        let bytes = block.heap_bytes();
+        if self.young_bytes + bytes > SPARE_BYTES {
+            self.old = std::mem::take(&mut self.young);
+            self.young_bytes = 0;
         }
-        self.spare.insert((block.pc, block.context), block);
+        self.young_bytes += bytes;
+        let key = (block.pc, block.phys, block.context);
+        if let Some(replaced) = self.young.insert(key, block) {
+            self.young_bytes = self.young_bytes.saturating_sub(replaced.heap_bytes());
+        }
     }
 
-    /// Bring the block of `pc` in `context` back from the store into the
-    /// entry at `index`, when the store has it. Whether it still holds the
-    /// code of the memory is for the caller to check.
-    fn revive(&mut self, index: usize, pc: u64, context: Context) -> bool {
-        match self.spare.remove(&(pc, context)) {
+    /// Bring the block of `pc` at `phys` in `context` back from the store
+    /// into the entry at `index`, when the store has it. Whether it still
+    /// holds the code of the memory is for the caller to check.
+    fn revive(&mut self, index: usize, pc: u64, phys: u64, context: Context) -> bool {
+        let key = (pc, phys, context);
+        let block = match self.young.remove(&key) {
             Some(block) => {
-                self.put(index, block);
-                true
+                self.young_bytes = self.young_bytes.saturating_sub(block.heap_bytes());
+                block
             }
-            None => false,
-        }
+            None => match self.old.remove(&key) {
+                Some(block) => block,
+                None => return false,
+            },
+        };
+        self.put(index, block);
+        true
     }
 }
 
@@ -2234,7 +2292,7 @@ impl<M: Memory> Cpu<M> {
             } else {
                 &mut self.blocks
             };
-            ready = cache.revive(index, pc, context)
+            ready = cache.revive(index, pc, phys, context)
                 && self.usable(single, index, pc, phys, context);
         }
         if !ready {
