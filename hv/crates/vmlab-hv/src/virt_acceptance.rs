@@ -35,6 +35,12 @@ impl Machine {
     /// Start `vmlab-hv --paused` on `description`, which names its serial
     /// log in `dir`, and connect to its control socket.
     fn start(dir: &Path, description: &serde_json::Value) -> Self {
+        Self::start_with(dir, description, None)
+    }
+
+    /// `start`, with `VMLAB_HV_JIT` set to `1` or `0` when `jit` names it
+    /// (3e DESIGN.md K7): the JIT is on by default.
+    fn start_with(dir: &Path, description: &serde_json::Value, jit: Option<bool>) -> Self {
         let machine = dir.join("machine.json");
         let control = dir.join("control.sock");
         let stderr = dir.join("stderr.log");
@@ -51,6 +57,7 @@ impl Machine {
                         .ok()
                         .map(|filter| ("VMLAB_HV_LOG", filter)),
                 )
+                .envs(jit.map(|on| ("VMLAB_HV_JIT", if on { "1" } else { "0" })))
                 .stdout(Stdio::null())
                 .stderr(std::fs::File::create(&stderr).unwrap()),
         )
@@ -331,9 +338,31 @@ impl Machine {
 /// D13 at S1 on an emulated aarch64 machine: an online snapshot over the
 /// control socket brings the guest back to its moment, in the same process
 /// and in a new one on the same disk; an offline snapshot of the disk is
-/// refused as a load, and the machine runs on.
+/// refused as a load, and the machine runs on. With the JIT, as a machine
+/// runs by default (3e DESIGN.md K7), and with the interpreter.
 #[test]
 fn snapshots_of_an_emulated_aarch64_machine_online_and_offline() {
+    snapshots_online_and_offline(true);
+}
+
+#[test]
+fn snapshots_of_an_emulated_aarch64_machine_online_and_offline_on_the_interpreter() {
+    snapshots_online_and_offline(false);
+}
+
+/// The stderr of a machine says how its vCPU runs: the JIT, or the
+/// interpreter that `VMLAB_HV_JIT=0` asks for.
+fn assert_runs_the_jit(machine: &Machine, jit: bool) {
+    let log = std::fs::read_to_string(&machine.stderr).unwrap_or_default();
+    let said = if jit {
+        "the JIT is on"
+    } else {
+        "turns the JIT off"
+    };
+    assert!(log.contains(said), "the log does not say {said:?}: {log}");
+}
+
+fn snapshots_online_and_offline(jit: bool) {
     use vmlab_hv_proto::control::{ErrorCode, RunState};
     use vmlab_hv_proto::debug::{DebugRequest, DebugResponse};
     let dir = tempfile::Builder::new()
@@ -355,8 +384,9 @@ fn snapshots_of_an_emulated_aarch64_machine_online_and_offline() {
         "id": "disk0", "path": disk, "format": "qcow2", "read_only": false, "vmstate": true,
     }]);
 
-    let mut machine = Machine::start(dir.path(), &desc);
+    let mut machine = Machine::start_with(dir.path(), &desc, Some(jit));
     let at_save = machine.run_a_while();
+    assert_runs_the_jit(&machine, jit);
     assert!(
         at_save > 0,
         "the guest did not count: {}",
@@ -421,7 +451,7 @@ fn snapshots_of_an_emulated_aarch64_machine_online_and_offline() {
 
     // A new process loads the online snapshot.
     std::fs::remove_file(dir.path().join("control.sock")).ok();
-    let mut machine = Machine::start(dir.path(), &desc);
+    let mut machine = Machine::start_with(dir.path(), &desc, Some(jit));
     ok(machine
         .client
         .call(Control::SnapshotLoad {

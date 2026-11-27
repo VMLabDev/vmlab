@@ -122,7 +122,55 @@ fn kernel(dir: &Path, words: &[u32]) -> Boot {
 
 /// Run the machine to its end: why it ended, and its serial log.
 fn run(desc: &MachineDescription) -> (ExitReason, String) {
-    let vm = crate::build(desc, &NoDevices, false).unwrap();
+    run_vm(crate::build(desc, &NoDevices, false).unwrap(), desc)
+}
+
+/// The machine of `desc` with its vCPUs on the JIT or on the interpreter
+/// (3e DESIGN.md K7), not started.
+fn machine(
+    desc: &MachineDescription,
+    jit: bool,
+) -> (
+    crate::vm::Vm,
+    Vec<std::sync::Arc<parking_lot::Mutex<crate::vcpu::emulated::EmulatedVcpu>>>,
+) {
+    let parts = super::assemble(desc, &NoDevices, super::Options::default()).unwrap();
+    for vcpu in &parts.vcpus {
+        let mut vcpu = vcpu.lock();
+        vcpu.cpu().set_jit(jit).unwrap();
+        assert_eq!(vcpu.cpu().jit_enabled(), jit);
+    }
+    let vcpus = parts.vcpus.clone();
+    let numbered = parts
+        .vcpus
+        .into_iter()
+        .enumerate()
+        .map(|(id, vcpu)| (id as u8, vcpu))
+        .collect();
+    let vm = crate::vm::Vm::from_emulated(parts.shared, numbered, parts.ram).unwrap();
+    (vm, vcpus)
+}
+
+/// The runs of compiled code of the vCPUs.
+fn compiled_runs(
+    vcpus: &[std::sync::Arc<parking_lot::Mutex<crate::vcpu::emulated::EmulatedVcpu>>],
+) -> u64 {
+    vcpus
+        .iter()
+        .map(|vcpu| vcpu.lock().cpu().jit_counts().compiled_runs)
+        .sum()
+}
+
+/// `run` with the vCPUs on the JIT or on the interpreter, and the runs of
+/// compiled code they made.
+fn run_with(desc: &MachineDescription, jit: bool) -> (ExitReason, String, u64) {
+    let (mut vm, vcpus) = machine(desc, jit);
+    vm.start();
+    let (reason, log) = run_vm(vm, desc);
+    (reason, log, compiled_runs(&vcpus))
+}
+
+fn run_vm(vm: crate::vm::Vm, desc: &MachineDescription) -> (ExitReason, String) {
     let handle = vm.handle();
     let watchdog = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -227,13 +275,19 @@ fn reset_once() -> Vec<u32> {
     program.finish()
 }
 
+/// A reset in place runs the boot again, with the JIT (3e DESIGN.md K7:
+/// the reset drops the compiled code of the first boot) and on the
+/// interpreter.
 #[test]
 fn a_guest_reset_runs_the_boot_again_in_place() {
-    let dir = tempfile::tempdir().unwrap();
-    let desc = description(dir.path(), 1, kernel(dir.path(), &reset_once()));
-    let (reason, log) = run(&desc);
-    assert_eq!(log, "12");
-    assert_eq!(reason, OFF);
+    for jit in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let desc = description(dir.path(), 1, kernel(dir.path(), &reset_once()));
+        let (reason, log, compiled) = run_with(&desc, jit);
+        assert_eq!(log, "12", "jit {jit}");
+        assert_eq!(reason, OFF, "jit {jit}");
+        assert_eq!(compiled > 0, jit, "{compiled} runs of compiled code");
+    }
 }
 
 #[test]
@@ -368,9 +422,11 @@ const COUNTER: u64 = map::RAM_BASE + 0x10_0000;
 
 /// A machine whose one CPU arms its virtual timer, so that its line is high
 /// at the GIC, and then counts in RAM for ever, with the count also in
-/// TPIDR_EL1. Its vmstate disk is a qcow2 file in `dir`.
+/// TPIDR_EL1. Its vmstate disk is a qcow2 file in `dir`. Its CPU runs the
+/// JIT or the interpreter.
 fn counting(
     dir: &Path,
+    jit: bool,
 ) -> (
     crate::vm::Vm,
     Vec<std::sync::Arc<parking_lot::Mutex<crate::vcpu::emulated::EmulatedVcpu>>>,
@@ -387,6 +443,9 @@ fn counting(
     ]);
     let desc = description(dir, 1, kernel(dir, &words));
     let parts = super::assemble(&desc, &NoDevices, super::Options::default()).unwrap();
+    for vcpu in &parts.vcpus {
+        vcpu.lock().cpu().set_jit(jit).unwrap();
+    }
     let path = dir.join("vmstate.qcow2");
     vmlab_disk::ops::create_qcow2(&path, 16 << 20, None, None).unwrap();
     let image: crate::factory::SharedImage = std::sync::Arc::new(parking_lot::Mutex::new(
@@ -466,12 +525,19 @@ fn gic_state(handle: &crate::vm::VmHandle) -> Vec<u8> {
 /// D13 on an emulated machine: a load puts RAM, the CPU with its system
 /// registers and timers, and the GIC back to the save, keeps the run state
 /// of the save, and the CPU runs on from there on caches that it built
-/// again.
+/// again. With the JIT (3e DESIGN.md K7: the load drops the compiled code,
+/// the fast TLB and the jump cache) and on the interpreter.
 #[test]
 fn a_snapshot_of_an_emulated_machine_brings_its_cpu_gic_timer_and_ram_back() {
+    for jit in [true, false] {
+        a_snapshot_brings_the_machine_back(jit);
+    }
+}
+
+fn a_snapshot_brings_the_machine_back(jit: bool) {
     use vmlab_hv_proto::control::RunState;
     let dir = tempfile::tempdir().unwrap();
-    let (mut vm, vcpus) = counting(dir.path());
+    let (mut vm, vcpus) = counting(dir.path(), jit);
     let handle = vm.handle();
     vm.start();
     counted_past(&handle, 1000);
@@ -502,10 +568,20 @@ fn a_snapshot_of_an_emulated_machine_brings_its_cpu_gic_timer_and_ram_back() {
     );
     assert_eq!(gic_state(&handle), gic_at_save);
     assert_eq!(vcpus[0].lock().cpu().tlb_entries(), 0);
+    let compiled_at_load = compiled_runs(&vcpus);
+    assert_eq!(
+        compiled_at_load > 0,
+        jit,
+        "{compiled_at_load} runs of compiled code"
+    );
 
-    // The CPU runs on from the save.
+    // The CPU runs on from the save, on compiled code again with the JIT.
     handle.resume().unwrap();
     counted_past(&handle, at_save + 1000);
+    handle.pause().unwrap();
+    assert_eq!(compiled_runs(&vcpus) > compiled_at_load, jit);
+    assert_eq!(vcpus[0].lock().cpu().jit_enabled(), jit);
+    handle.resume().unwrap();
     handle.quit();
     vm.wait();
 }
@@ -515,7 +591,7 @@ fn a_snapshot_of_an_emulated_machine_brings_its_cpu_gic_timer_and_ram_back() {
 #[test]
 fn a_snapshot_that_does_not_fit_the_emulated_machine_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut vm, _vcpus) = counting(dir.path());
+    let (mut vm, _vcpus) = counting(dir.path(), true);
     let handle = vm.handle();
     vm.start();
     counted_past(&handle, 10);
@@ -535,13 +611,21 @@ fn a_snapshot_that_does_not_fit_the_emulated_machine_is_refused() {
 
 /// The debug port of an emulated machine: pause, the registers, a step,
 /// a write of a register that the CPU runs on, memory by virtual address,
-/// and a detach that resumes.
+/// and a detach that resumes. With the JIT (3e DESIGN.md K7: a pause stops
+/// the CPU at a block head, and a step runs one instruction) and on the
+/// interpreter.
 #[test]
 fn the_debug_port_reads_steps_and_writes_an_emulated_cpu() {
+    for jit in [true, false] {
+        the_debug_port_on(jit);
+    }
+}
+
+fn the_debug_port_on(jit: bool) {
     use vmlab_hv_proto::control::{Outcome, RunState};
     use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
     let dir = tempfile::tempdir().unwrap();
-    let (mut vm, _vcpus) = counting(dir.path());
+    let (mut vm, vcpus) = counting(dir.path(), jit);
     let handle = vm.handle();
     vm.start();
     counted_past(&handle, 100);
@@ -607,6 +691,9 @@ fn the_debug_port_reads_steps_and_writes_an_emulated_cpu() {
     debug(DebugRequest::Detach { resume: true });
     assert_eq!(handle.status(), RunState::Running);
     counted_past(&handle, (1 << 40) + 100);
+    handle.pause().unwrap();
+    assert_eq!(compiled_runs(&vcpus) > 0, jit);
+    handle.resume().unwrap();
     handle.quit();
     vm.wait();
 }

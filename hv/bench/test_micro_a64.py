@@ -86,7 +86,8 @@ class JitReportTests(unittest.TestCase):
     def test_the_switch_and_the_last_report_of_a_run(self):
         self.assertTrue(lib.jit_enabled({"VMLAB_HV_JIT": "1"}))
         self.assertFalse(lib.jit_enabled({"VMLAB_HV_JIT": "0"}))
-        self.assertFalse(lib.jit_enabled({}))
+        self.assertTrue(lib.jit_enabled({}))
+        self.assertFalse(lib.jit_enabled({"VMLAB_HV_JIT": "off"}))
         line = ('{"level":"INFO","message":"vcpu 0: JIT: {n} instructions, 7 of them in the '
                 'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
                 '0 resets of the region, 3 ms of compiling"}\n')

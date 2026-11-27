@@ -360,7 +360,7 @@ class CheckTests(unittest.TestCase):
         self.addCleanup(self.patch.stop)
         self.args = argparse.Namespace(arch="aarch64", backend="all", guest=None)
 
-    def write(self, medians, backend="qemu", vcpus=1, workload="xz_9_32M"):
+    def write(self, medians, backend="qemu", vcpus=1, workload="xz_9_32M", env=None):
         for m, s in medians:
             lib.append_history(
                 "aarch64",
@@ -369,9 +369,55 @@ class CheckTests(unittest.TestCase):
                     "host": "h", "backend": backend, "arch": "aarch64",
                     "guest": "debian-13", "vcpus": vcpus, "workload": workload,
                     "unit": "s", "repeats": 3, "samples": [], "median": m,
-                    "spread": s, "qemu_baseline": None, "env": {},
+                    "spread": s, "qemu_baseline": None, "env": env or {},
                 },
             )
+
+    def test_jit_rows_compare_with_jit_rows_only(self):
+        import check
+
+        # An interpreter row, then a JIT row twice as fast, then one a bit
+        # slower than that: the JIT row is compared with the JIT row.
+        self.write([(200.0, 1.0)], backend="vmlab-hv", workload="boot_to_agent_ready")
+        self.write([(100.0, 1.0), (101.0, 1.0)], backend="vmlab-hv",
+                   workload="boot_to_agent_ready", env={"jit": True})
+        self.write([(210.0, 1.0)], backend="vmlab-hv", workload="boot_to_agent_ready",
+                   env={"jit": False})
+        regressions, notes = check.compare("aarch64", self.args)
+        self.assertEqual(regressions, [])
+        self.assertTrue(any("(jit)" in n and "100.0 -> 101.0" in n for n in notes))
+        self.assertTrue(any("(interpreter)" in n and "200.0 -> 210.0" in n for n in notes))
+
+    def test_a_slower_jit_row_fails(self):
+        import check
+
+        self.write([(100.0, 1.0), (150.0, 1.0)], backend="vmlab-hv",
+                   workload="boot_to_agent_ready", env={"jit": True})
+        regressions, _ = check.compare("aarch64", self.args)
+        self.assertEqual(len(regressions), 1)
+        self.assertIn("(jit)", regressions[0])
+
+    def test_a_row_of_the_check_is_not_gated(self):
+        import check
+
+        self.write([(100.0, 1.0)], backend="vmlab-hv", workload="boot_to_agent_ready",
+                   env={"jit": True})
+        self.write([(300.0, 1.0)], backend="vmlab-hv", workload="boot_to_agent_ready",
+                   env={"jit": True, "jit_check": True})
+        regressions, notes = check.compare("aarch64", self.args)
+        self.assertEqual(regressions, [])
+        self.assertTrue(any("only 1 entry" in n for n in notes))
+
+    def test_more_refused_blocks_fail_a_jit_row(self):
+        import check
+
+        before = {"jit": True, "jit_reports": [{"refused_blocks": 0}]}
+        after = {"jit": True, "jit_reports": [{"refused_blocks": 0}, {"refused_blocks": 3}]}
+        self.write([(100.0, 1.0)], backend="vmlab-hv", workload="boot_to_agent_ready", env=before)
+        self.write([(100.0, 1.0)], backend="vmlab-hv", workload="boot_to_agent_ready", env=after)
+        regressions, _ = check.compare("aarch64", self.args)
+        self.assertEqual(len(regressions), 1)
+        self.assertIn("0 -> 3 blocks in the interpreter", regressions[0])
 
     def test_single_entry_is_not_a_failure(self):
         import check
@@ -609,6 +655,7 @@ class JitReportTests(unittest.TestCase):
 
     def test_the_check_turns_the_jit_on(self):
         self.assertTrue(lib.jit_enabled({"VMLAB_HV_JIT_CHECK": "1"}))
+        self.assertTrue(lib.jit_enabled({"VMLAB_HV_JIT": "0", "VMLAB_HV_JIT_CHECK": "1"}))
         self.assertTrue(lib.jit_check_enabled({"VMLAB_HV_JIT_CHECK": "on"}))
         self.assertFalse(lib.jit_check_enabled({"VMLAB_HV_JIT": "1"}))
 
