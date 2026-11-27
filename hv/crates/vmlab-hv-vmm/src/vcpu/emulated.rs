@@ -65,6 +65,9 @@ impl CpuLine {
 impl IrqLine for CpuLine {
     fn set_level(&self, high: bool) {
         if self.atomic().swap(high, Ordering::SeqCst) != high && high {
+            // Compiled code that chains leaves at its next block head, and
+            // the loop takes the interrupt (3e DESIGN.md H10c).
+            self.lines.kick();
             self.waker.notify();
         }
     }
@@ -129,8 +132,13 @@ impl EmulatedVcpu {
     /// The vCPU `id` in the reset state `state`, on `memory`, with the
     /// system counter of `clock`.
     pub fn new(id: u8, memory: GuestBus, state: State, clock: Clock) -> Self {
-        let waker = Arc::new(Waker::default());
         let shared = Arc::new(Lines::default());
+        // A pause or a snapshot ends the slice at the next block, also in
+        // compiled code that chains.
+        let waker = Arc::new(Waker::with_kick({
+            let shared = shared.clone();
+            move || shared.leave()
+        }));
         let line = |fiq| {
             Arc::new(CpuLine {
                 lines: shared.clone(),

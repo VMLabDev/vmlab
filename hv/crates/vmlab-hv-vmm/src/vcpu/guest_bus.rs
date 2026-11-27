@@ -91,11 +91,13 @@ struct Stamps {
 impl Stamps {
     /// A write reached the bytes. Their pages hold no code that is known to
     /// hold any more: the watch words go even before the stamps move.
-    fn wrote(&self, offset: usize, len: usize) {
+    /// `true`: this write made one even (`Memory::ended_code`).
+    fn wrote(&self, offset: usize, len: usize) -> bool {
         if len == 0 {
             self.generation.fetch_add(1, Ordering::SeqCst);
-            return;
+            return false;
         }
+        let mut ended = false;
         let first = offset / PAGE as usize;
         let last = ((offset + len - 1) / PAGE as usize).min(self.pages.len() - 1);
         let pages = first.min(last)..=last;
@@ -104,18 +106,21 @@ impl Stamps {
             if now & 1 != 0 {
                 // Only a write makes an odd word even, so an exchange that
                 // fails found it even already.
-                let _ = word.compare_exchange(
-                    now,
-                    now.wrapping_add(1),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
+                ended |= word
+                    .compare_exchange(
+                        now,
+                        now.wrapping_add(1),
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok();
             }
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         for page in &self.pages[pages] {
             page.store(generation, Ordering::SeqCst);
         }
+        ended
     }
 
     /// Whether a page of the range holds code that a CPU translated.
@@ -384,6 +389,8 @@ pub struct GuestBus {
     shared: Arc<Shared>,
     /// The times that the writes through this clone moved the generation.
     own: u64,
+    /// The writes through this clone that ended translated code.
+    ended: u64,
 }
 
 impl GuestBus {
@@ -418,7 +425,9 @@ impl GuestBus {
             if !region
                 .get_mmap()
                 .bitmap()
-                .watch(Box::new(move |offset, len| watch.wrote(offset, len)))
+                .watch(Box::new(move |offset, len| {
+                    watch.wrote(offset, len);
+                }))
             {
                 return Err("the guest memory has an emulated CPU already".into());
             }
@@ -452,6 +461,7 @@ impl GuestBus {
                 roms: roms.iter().map(|(base, len)| (*base, base + len)).collect(),
             }),
             own: 0,
+            ended: 0,
         })
     }
 
@@ -533,11 +543,15 @@ impl Memory for GuestBus {
                 unsafe { copy_out_to(host, bytes) };
                 compiler_fence(Ordering::SeqCst);
                 if region.stamps.watched(offset, bytes.len()) {
-                    region.stamps.wrote(offset as usize, bytes.len());
+                    self.ended += u64::from(region.stamps.wrote(offset as usize, bytes.len()));
                     self.own += 1;
                 }
                 return Ok(());
             }
+            // The bitmap makes the watch words even: one that is odd now
+            // ends code. A translator that makes one odd after this look
+            // finds its word changed (`watch_holds`).
+            self.ended += u64::from(region.stamps.watched(offset, bytes.len()));
             let _atomic = shared.serialize.then(|| shared.transaction.lock());
             // SAFETY: as above.
             unsafe { copy_out_to(host, bytes) };
@@ -676,9 +690,13 @@ impl Memory for GuestBus {
 
     fn wrote_straight(&mut self, address: u64, len: usize) {
         if let Some((region, offset)) = self.ram(address, len) {
-            region.stamps.wrote(offset as usize, len);
+            self.ended += u64::from(region.stamps.wrote(offset as usize, len));
             self.own += 1;
         }
+    }
+
+    fn ended_code(&self) -> u64 {
+        self.ended
     }
 
     fn own_generation(&self) -> Option<u64> {
@@ -712,7 +730,7 @@ impl Memory for GuestBus {
             };
             if let Some(swapped) = swapped {
                 if swapped && region.stamps.watched(offset, len) {
-                    region.stamps.wrote(offset as usize, len);
+                    self.ended += u64::from(region.stamps.wrote(offset as usize, len));
                     self.own += 1;
                 }
                 return Ok(swapped);
