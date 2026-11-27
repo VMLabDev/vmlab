@@ -2,6 +2,7 @@
 mod address;
 mod effects;
 pub use address::address_arguments;
+pub mod block;
 pub mod indexed;
 pub mod native;
 pub use effects::{Effects, effects, pure_intrinsic};

@@ -1738,3 +1738,446 @@ same results. `timer` gives the same results after the deadline exit above.
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn.
+
+## S0: Debian boot profile (#1146)
+
+S1 lazy flags landed in `ab1dc54d` via PR #1031 and is included in this
+branch. The S0 function samples, block counts and ceilings below describe
+the **pre-S1 interpreter**. The S0 measurement binary was `2251fc8b`.
+
+The `boot_mips` row belongs to the aarch64 Debian 13 `vmlab-hv` boot
+suite. A run starts a fresh overlay, waits for the guest agent handshake,
+then issues `quit`. The VM emits the instruction count of every vCPU
+after joining its workers. The bench divides their sum by the monotonic
+wall time at the handshake. A small amount of guest execution can occur
+between the handshake and the quit request. A failed handshake or absent
+counter supplies no MIPS sample.
+
+```sh
+python3 hv/bench/run.py --backend vmlab-hv --arch aarch64 --guest debian-13 \
+  --suite boot --vcpus 2 --repeats 3 --cpus 24-27 --hv-bin /path/to/vmlab-hv
+```
+
+### Repeat measurements
+
+[Aarch64 history](../../bench/history/aarch64.jsonl) keeps the pre-S1 S0
+rows before the S1 comparison. Use the **87.92 MIPS** one-vCPU row
+(`ca5825bb`) as the post-S1 baseline. S1 measured **76.68 to 87.92 MIPS**
+(+14.7%) at one vCPU, using pin 16–19 and the debug-port count
+(`54317232` before S1). There is no post-S1 two-vCPU row. Measure that
+configuration on the relevant base commit before comparing future changes.
+
+S0's 62.87 MIPS and S1's 76.68 MIPS before row both predate lazy flags.
+They used different pins (16–17 and 16–19 respectively), and S0 measured
+under higher host load. S0's successful one-vCPU repeats started at
+one-minute load averages of 12.50–13.24, while the S1 before batch
+started at 10.19 and ended at 4.39. S0 counted at VM exit just after
+the handshake, while S1 read the paused vCPUs through the debug port.
+These differences confound the comparison, and the samples cannot
+isolate how much each contributed.
+
+At two vCPUs on the pre-S1 S0 build, the median was
+80.12 MIPS with block counting disabled and 74.89 MIPS with it enabled,
+with three boots per setting. One instrumented run took 350.74 s
+compared with 224.99 s for another, so the median difference does not
+isolate counter overhead.
+
+At one vCPU, three complete baseline boots pinned to CPUs 16–17 took
+285.53–296.45 s, with a median of 62.87 MIPS. One complete instrumented
+boot on that pin took 308.34 s (60.19 MIPS) and supplied the block counts.
+Other one-vCPU attempts hit the shared VM limit before launch or entered
+systemd emergency mode on the device timeout. Only complete boots enter
+the history. Guest time ran in real time with the standard timeouts.
+
+Flat CoreMark checked the same 245,425,680 instructions and guest
+checksums in each repeat. Three interleaved pairs pinned to CPUs 0–1
+gave median 111.12 MIPS on the initial boot-row build (`591d6274`) and
+120.07 MIPS on the build with the block counter code (`2251fc8b`).
+The initial build's 14.38 MIPS spread is larger than the median
+difference. Both builds used release optimization with line tables.
+Cargo updated the local lockfile to include the existing `flate2`
+dependency of `vmlab-hv-vmm` during the builds.
+
+### Function samples
+
+The one-vCPU column reuses the two windows of the
+[JIT design's W1 profile](../../docs/plans/phase-3e-aarch64-jit/DESIGN.md#w1-the-profile-measured)
+weighted by their sample counts. Those windows cover the busy part of a
+boot that did not reach agent ready. The two-vCPU run used Debian
+`13.20261001.0`, 2 GiB of RAM, two vCPUs pinned to logical CPUs 24–27 on
+helios, and the release binary of `2251fc8b` with line tables. It reached
+agent ready in 241.13 s at 77.17 MIPS (13.35 billion and 5.26 billion
+instructions on vCPU 0 and 1 respectively).
+
+The two-vCPU run used `bench/ipsample.c` with raw instruction pointer
+output and a `vcpu-*` thread filter. It requested user-space samples at
+1 kHz through `perf_event_open`, starting when the control socket
+appeared. `addr2line -f -i -C` resolved ELF offsets. The classifier used
+function names and inline callers where they identify a subsystem.
+Each sample is counted once. This measures on-CPU vCPU work. Idle time,
+kernel execution and time descheduled on the host are outside the profile.
+
+| Work | 1 vCPU, W1 (166,057 samples) | 2 vCPUs (342,753 samples) |
+|---|---:|---:|
+| Operation execution and dispatch, `step_unchecked`, `Compiled::run` | 38.33% | 32.25% |
+| Block loop, IRQ/FIQ, shootdown mail and PC translation, `run_inner`, `code_address` | 20.31% including cache | 15.58% |
+| Cache probe and code stamps, `usable`, `code_stamp` | included above | 7.35% |
+| State copies at block entry and exit, `Place::write` and `Place::read` | 3.57% | 9.73% |
+| RAM load path, `Side::load`, `GuestBus::read`, `copy_in` | 26.44% for RAM and other VMM frames combined | 5.37% |
+| RAM store path, `GuestBus::write`, ROM check, `copy_out_to` | included above | 3.67% |
+| Dirty callback and generation atomics, `WriteDiscard::mark_dirty`, `Stamps::wrote` | included above | 12.77% |
+| Global RAM transaction lock in store and exclusive accesses | one-vCPU branch bypasses lock | 3.44% |
+| TLB and page walks, `Tlb::lookup`, `Mmu::walk` | 6.04% including load/store dispatch | 1.92% |
+| Wide and exclusive access dispatch, `Compiled::access` | 0.28% for all effect dispatch | 0.65% |
+| Translation, decoder, lifter, IR and lowering | 1.03% | 0.41% |
+| Helpers, system registers and exceptions | 1.11% combined | 1.52% |
+| Other or unresolved | 2.85% | 5.36% |
+
+At two vCPUs the helpers account for 0.76% in vector/crypto functions,
+0.38% in common helper dispatch, 0.36% in system register/timer functions,
+and 0.02% in exception handling. The sampler attributed zero samples
+directly to a scalar FP helper. Other samples include 1.38% in outlined
+mutex routines whose callers were unavailable. The lock share attributable
+to guest RAM is therefore 3.44%, with a ceiling of 4.82% if all of those
+outlined mutex samples belong to it. The dirty callback with its SeqCst
+generation updates and the identified lock together account for 16.21%.
+The rest of the RAM store path accounts for 3.67%.
+
+### Counts per translated block
+
+Set `VMLAB_HV_BOOT_BLOCK_COUNTS=1` for the boot command to collect these
+counters. The VM prints totals per vCPU at exit. The first complete
+instrumented boot at each vCPU count supplied the totals below. The
+two-vCPU column sums the vCPUs before dividing by the number of blocks.
+
+| Counter | 1 vCPU, 492,167 blocks | 2 vCPUs, 711,911 blocks |
+|---|---:|---:|
+| Lowered operations per block | 13.961 | 14.224 |
+| Alignment guard operations per block | 3.326 | 3.398 |
+| Exit-only writeback operations per block | 0.938 | 0.966 |
+| LDP X instructions per block | 0.179 | 0.184 |
+| STP X instructions per block | 0.191 | 0.195 |
+
+The alignment count includes each alignment guard and its lowered scalar
+dependencies used exclusively by such guards. The exit writeback count
+includes lowered operations needed only to rebuild registers on a side
+exit. Values also used by a normal operation, the terminal writeback,
+the exception syndrome or an alignment guard are excluded. The LDP/STP
+counts include the offset, pre-indexed and post-indexed X register forms.
+These counts weight each translation once, including retranslations and
+single-instruction blocks. About 31% of the static operations are alignment
+or exit-writeback work. The profile gives no execution frequency for those
+operations.
+
+### Pre-S1 ceilings for remaining cards
+
+The ceilings below come from the pre-S1 profile. Lazy flags changed
+interpreter work, so current shares and relative gains require a new profile.
+The ceilings include all of the indicated measured functions, even
+where the planned change can remove only part of the work. They express
+shares of sampled boot CPU work under the measured guest workload. The
+two-vCPU wall-clock effect also depends on which vCPU delays agent readiness,
+how much work overlaps and whether faster execution changes the boot path.
+The ceilings overlap and should be recalculated after each change.
+
+For a generous wall-time budget at two vCPUs, the sampler's requested
+frequency gives about 343 vCPU-seconds over 241 s of elapsed time. The
+last column assumes that every saved vCPU-second shortens wall time by
+a full second at fixed guest work. It is a sizing estimate.
+
+| Card | Work included in the ceiling | 1 vCPU CPU share | 2 vCPU CPU share | 2 vCPU wall budget |
+|---|---|---:|---:|---:|
+| S3 TLB RAM access and unwatched stores | RAM load, RAM store, dirty stamps, TLB/page walks and the entire possible lock share. The W1 ceiling includes other VMM work. | 32.48% | 28.55% | 41% |
+| S4 alignment, exit writeback and pair accesses | All operations, wide access dispatch, RAM load/store paths and TLB work. The W1 ceiling uses its combined RAM/VMM class. Most of these paths survive S4. | 71.09% | 43.86% | 62% |
+| S5 cheaper block entry and chaining | The block loop, cache, register copies and all helper/system work. The W1 helper subtotal includes exceptions. | 24.99% | 34.16% | 49% |
+
+For S4, the static 31% operation share times the two-vCPU operation-loop
+share gives about 10% of sampled CPU work for guard and writeback
+operations if operation costs and execution frequency are uniform. The
+function profile does not distinguish those operations from other
+uses of the same opcodes. The effect of the pair fast path also depends
+on the proportion of X pairs that hit one page.
+
+The pre-S1 samples suggest investigating S3 first because the dirty callback
+and direct lock activity accounted for 16.21% of two-vCPU work. S4 can
+proceed alongside it, with the in-page pair path checked against the S3 TLB
+changes when they meet. Keep S5 on hold while the JIT's block chaining
+card (J4) is on schedule.
+
+### Behaviour checks
+
+On helios, `just tcg-a64-lockstep loadstore 1000 1` verified 52,390
+instructions, and `just tcg-a64-lockstep mmu 100000 1` verified 4,403,165.
+Both exited 0 with no differences. The counter unit test compares the
+same whole block with counting enabled and disabled, including an
+overwritten register and both X pair instructions.
+
+The kvm-unit-tests runner exited 0 at suite revision `32f8ad45`. Nine of
+eleven cases matched QEMU. As in C13, vmlab-hv passed the two ITARGETSR
+subtests that QEMU failed in both `gicv2-mmio` and `gicv2-mmio-3p`.
+
+No instruction semantics sources were consulted for S0. QEMU was used as
+a running oracle for lockstep and kvm-unit-tests.
+
+## Card S2, #1143 (2026-11-27)
+
+Translated blocks that do not depend on their virtual address (DESIGN.md
+M6). The PC-relative blocks and the cache indexed by physical address were
+made on card C13 (`73333030`, `b5117069`, after its F6); this card takes
+that branch, measures it, finds what it costs and takes part of the cost
+back.
+
+### What a block is keyed by
+
+A block is kept and found under the physical address of its first
+instruction and its `Context`: the exception level, `PSTATE.SP`, the FP
+enable of `CPACR_EL1.FPEN`, and `TCR.TBI0`/`TBI1` of the regime for an
+instruction address. The level, the stack pointer and the FP enable change
+what the lifter makes, and TBI changes the graph of a branch to a register.
+Nothing else is needed in the key:
+
+- A block never crosses a 4 KB page (`translate` ends it at a page
+  boundary), so its virtual and physical addresses have the same low 12
+  bits for every granule, and `ADRP` takes the page of the entry PC.
+- The execute permission, the level's view of it, the ASID and the
+  translation regime are checked by the TLB lookup of the PC before every
+  block (`code_address`), not by the key: a mapping without execute
+  permission takes its abort before any block is looked up.
+- Every value that depends on the PC is computed from the PC at the entry:
+  `ADR`, `ADRP`, `LDR` (literal), the link of `BL`/`BLR`, the PC of an
+  exception that leaves the block, the PC of the last instruction that the
+  loop runs (`Trap`), and the next PC.
+- The code bytes are checked as before, by the code stamp of the memory for
+  the physical pages of the block and the epoch. A store through any virtual
+  address reaches the same physical page, so invalidation stays exact: the
+  block is made again only when its own bytes may have changed.
+
+### What it cost, and what changed here
+
+On the flat images, whose translations do not matter, the PC-relative
+blocks ran slower: the next PC of every direct branch and the PC of every
+exception exit had become an `Add` of the entry PC in the operations of the
+block, and the exit PC of a load or a store is computed before the access.
+Now:
+
+- A direct branch and the fall through carry their next PC as a distance
+  from the entry (`A64Next::Relative`). A conditional branch is a `Select`
+  of two constants, as before the change. The loop adds the entry PC.
+- An exception exit carries the distance of its instruction (`at` of
+  `A64Next::Exception`) and no PC write: the loop sets the PC when the block
+  leaves there.
+- The next PC is not one of the register outputs any more: the block sets
+  it from its own words after them, and reads the entry PC after its
+  operations, not across them.
+
+What is still slower than the blocks at fixed addresses: `BL`, `ADR`,
+`ADRP` and `LDR` (literal) read the PC and add, and the index of the cache
+needs the physical address, which waits for the TLB lookup, where the
+virtual index did not.
+
+### Measurements
+
+helios, pinned to four cores (`--cpus 28-31`), 1 vCPU, Debian 13 template,
+2 GiB, `bench/run.py --backend vmlab-hv --arch aarch64 --suite boot`. The
+host ran other cards' boots and builds throughout (load average 4 to 28),
+so the wall times are noisy; the translation counts are not. Before is
+`f91d8899`, this branch at `567c0829` with `b5117069` and `73333030`
+reverted (C13's two-generation store and everything else kept); after is
+`567c0829`; final is `b94d2d67`, the code of this card (a commit of a
+scratch copy on helios with the tree of `40c0ffa4` of this branch;
+`f91d8899` exists only there too). The instruction and
+translation counts come from the line each emulated vCPU logs when the
+bench pauses the machine at agent ready (`boot_counters`).
+
+| Build | Translations to agent ready | Translation time | Instructions | Agent ready | Boot MIPS |
+|---|---|---|---|---|---|
+| before | 1,605,469; 1,591,822; 1,595,640; 1,586,935 | 12.8 s; 13.5 s; 12.6 s; 14.9 s | 18.02e9 to 18.31e9 | 228 s, 249 s, 250 s, 289 s; one run in emergency mode | 79.2, 72.6, 72.1, 63.4 |
+| after | 490,571; 488,811; 491,088; 482,317; 491,783; 492,190; 492,717 | 3.7 s to 4.4 s | 17.92e9 to 18.22e9 | 249 s, 264 s, 269 s, 254 s, 226 s, 222 s, 221 s | 72.2, 68.5, 67.0, 71.7, 79.4, 80.9, 81.1 |
+| final | 490,335; 491,570; 495,805; 495,209; 492,465 | 3.6 s to 4.0 s | 17.98e9 to 18.27e9 | 269 s, 243 s, 243 s, 220 s, 271 s; one run in emergency mode | 67.9, 74.6, 75.3, 81.9, 66.4 |
+
+The same physical code is translated once: 3.3 times fewer translations,
+and the translation time of a boot falls from about 13 s to about 4 s. The
+boot time does not show it beyond the noise of the host.
+
+The flat aarch64 images (`--backend interpreter`), 12 samples of each
+build, interleaved: before, final and before again, three repeats a run:
+
+| Build | CoreMark mix | Scalar loop |
+|---|---|---|
+| before | 133.1 MIPS (131.0 to 137.5) | 127.7 MIPS (111.0 to 130.1) |
+| after (an earlier interleaving) | 112.9 MIPS against 131.5 before | 112.9 MIPS against 125.5 before |
+| final | 123.3 MIPS (119.2 to 126.3) | 121.1 MIPS (119.6 to 123.6) |
+
+The flat mix runs 7 % slower than with blocks at fixed addresses, and the
+scalar loop 5 %, from 14 % and 10 % after the change of C13.
+
+`hv/bench/history/aarch64.jsonl` holds the rows of the three builds:
+`coremark_algorithms_1000` and `scalar_loop_300000000` of the interpreter,
+and `boot_to_agent_ready` and `boot_mips` of vmlab-hv, whose `env` keeps
+the counts of each repeat (`boot_counters`). These rows were taken with this
+card's pause counters; since the merge with card #1142 the bench takes
+`boot_mips` from #1142's instruction counts, and the pause line of a vCPU
+(`parking`) remains for the translation counts.
+
+### Equal behaviour
+
+- O3 lockstep (`just tcg-a64-lockstep <group>`, seed 1, 100,000 a class) at
+  `b94d2d67`, the tree of `40c0ffa4`: `c1` 1,439,552 instructions, `loadstore` 5,227,727, `system`
+  14,143,370 (with the exceptions), `mmu` 4,403,165; no difference in any.
+- kvm-unit-tests (`just tcg-a64-kvm-unit-tests`) at `b94d2d67`: 11 tests, 9
+  give the same results as QEMU, and `gicv2-mmio` and `gicv2-mmio-3p` pass
+  the two `ITARGETSR` subtests that fail on QEMU, as in cards C10 and C13.
+
+### Tests
+
+- `a_shared_block_computes_its_page_and_its_link_from_the_pc_it_runs_at`
+  (`tests/translate.rs`): one page of code with `ADRP`, `BL` and a return
+  at two addresses in two pages, run as blocks and stepped.
+- `a_write_to_shared_code_reaches_it_at_every_address`: the block of the
+  first address serves the second until a store through a third address
+  changes its code, and the second address runs the new code.
+- `one_translation_serves_code_at_two_addresses` (card C13).
+- bench: `BootCountersTests` reads the pause lines of the vCPUs.
+
+### Sources read for this card
+
+- The state of this crate, of vmlab-hv-vmm's emulated vCPU and of the bench.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.
+
+## Card S4 (2026-11-27)
+
+The alignment checks and the writeback of the exits off the path on which
+every access succeeds, and the pairs of X registers on the fast path of the
+loop (the five model views of card #1145, the parts that four of them name).
+
+### What changed
+
+- **Alignment.** The context of a block has a bit more, `strict`: the MMU is
+  off or SCTLR_EL1.A is set (`state::strict_alignment`). `State::refresh`
+  sets it, and so does the start of `run` and `step`, for an owner that
+  wrote SCTLR_EL1 itself. A block lifted with it checks every alignment
+  before the access, as before. A block lifted without it compiles no `And`,
+  `IsZero` and `Guard` for an alignment that only Device memory asks for:
+  the exit of the access carries that alignment
+  (`ExceptionClass::DataAbort::device`), each load and store holds it in its
+  `aux`, and the access checks it on its slow path, which a page of Device
+  memory takes (`exec::device_faults`). The check is the one the guard made
+  (`Side::unaligned_faults`): after the faults of the walk for the page and
+  before its permissions, the page of the first byte deciding. An exclusive
+  access and `LDAR`/`STLR` keep their guard in every context, since they ask
+  for the alignment on every memory.
+- **Exit writeback.** `compile` no longer computes the writeback of an exit
+  before the event that leaves through it. Each exit gets its own list of
+  operations (`Leave::ops`) with what its writeback needs and the block has
+  not computed at that point, and the inputs that only that list reads.
+  `Compiled::leave` runs the list, then copies the writeback out. The end of
+  the block computes its writeback on the way as before.
+- **Pairs.** A load or a store of 16 bytes that is not exclusive is
+  `Code::LoadPair` or `Code::StorePair`: one TLB hit and two accesses of 8
+  bytes where the bytes are in one page, the two words of the frame read and
+  written directly. A store whose value joins two words (`STP` of X
+  registers) stores the two words and computes no join. A slice of 64 bits
+  at the offset 0 or 64 of a value of 128 bits shares the words of the value
+  (`block::word_of`), so the two halves of an `LDP` cost no operation.
+  Anything else (a crossing into another page, a Device page without the
+  alignment, a page of code, an exclusive mark, the access log) takes the
+  slow path of before, which makes the one access of 16 bytes. Where the
+  memory refuses the second half after taking the first, the fault is the
+  one that access of 16 bytes reported, and the memory has seen the same
+  (it splits an access of 16 bytes to a device into two of 8 bytes too).
+- **SUB and CMP** of registers and of immediates are one `Sub`:
+  `Builder::sub_with_carry` computes `a - b` as one operation when the carry
+  is the literal 1, and `a + NOT b + carry` otherwise. Its flags stay the
+  lazy flags of card S1, from the same operands.
+- **W registers.** `Add`, `Sub`, `Mul`, `And`, `Or`, `Xor` and the shifted
+  value of `ShiftLeft` read a truncated operand of one word whole
+  (`exec::skip_truncations`): the block form masks the result to its type,
+  so the `Slice` of a W register read from its X slot is no operation of
+  its own unless another operation needs it.
+
+### Tests
+
+- `an_access_late_in_a_block_leaves_with_the_registers_before_it`
+  (`tests/translate.rs`): a block of four instructions whose load faults in
+  Device memory and with SCTLR_EL1.A and not in Normal memory, run as one
+  block, with the three instructions before it written back.
+- `a_pair_of_x_registers_is_one_access`: `STP` and `LDP` aligned and not, a
+  pair that crosses into a page without a translation (the fault names the
+  first byte of that page, no register written), and Device memory, which
+  asks a pair for the alignment of one register.
+
+### Measurements
+
+On helios, `c90a1e7b` (next, before) against `b3ecf70d` (the code of this
+card), each from its own clone, 1 vCPU, pinned to CPUs 28-31. Other cards
+ran boots, lockstep and builds on the host at the same time (load average 3
+to 17), and one of them was pinned to CPUs 16-17, inside the default window
+of the bench. Both clones count as dirty because the build rewrites
+`Cargo.lock` (the missing `flate2` entry of `vmlab-hv-vmm`). The lines are in
+`hv/bench/history/aarch64.jsonl`.
+
+| Workload | Before | After |
+|---|---|---|
+| `coremark_algorithms_1000`, MIPS, two alternating runs of 3 | 114.4, 103.4 | 119.7, 118.2 |
+| `scalar_loop_300000000`, MIPS, the same runs | 113.8, 109.8 | 115.8, 109.2 |
+| Debian 13 to agent ready, s, alternating, `--repeats 1` each | 237.5, 236.4, 230.6 (median 236.4) | 194.5, 247.0, 233.2 (median 233.2) |
+| the same boots, guest time at `Run /init`, s | 17.8, 17.9, 17.5 | 14.7, 17.4, 16.4 |
+| the same boots, guest time at the start of systemd, s | 47.2, 47.4, 47.2 | 38.7, 45.4, 42.9 |
+
+- The flat images run with the MMU off: their blocks are strict and keep
+  the alignment guards, so the CoreMark mix gains from the exits, the pairs,
+  `Sub` and the W registers only, 4 to 14 %. The loop of three instructions
+  has no access and no exit inside a block, and does not move.
+- The boot gains about 9 % to the start of systemd on the boots of the
+  quietest host (42.9 s against 47.2 s), and 1 % to agent ready by the
+  median, inside the spread of the runs (6.9 s before, 52.5 s after). From systemd on the boot waits on
+  devices and timers in real time as much as it computes.
+- The boot MIPS row (card S0) is not on `next` yet, so the boots are
+  recorded as time to agent ready. Each boot is its own line with one
+  sample: a run of three repeats writes no line when one repeat fails, and
+  two of the boots fell into emergency mode (one of each side, under load:
+  the device of `/boot/efi` did not appear inside its 90 s, as in card C13).
+  A first run of the baseline gave 312.4 s and 266.4 s before its third
+  repeat did that, and wrote no line.
+
+### Equal behaviour
+
+The instruction lockstep against QEMU 11.1.3 `-cpu cortex-a53` at
+`b3ecf70d`, no difference in any run:
+
+| Run | Instructions verified | Rounds |
+|---|---|---|
+| `just tcg-a64-lockstep mmu 100000 1` | 4,403,165 | 1,155 |
+| `just tcg-a64-lockstep mmu 100000 2` | 4,457,567 | 1,164 |
+| `just tcg-a64-lockstep mmu 100000 3` | 4,454,408 | 1,168 |
+| `just tcg-a64-lockstep walk 100000 1` | 4,454,798 | 1,099 |
+| `just tcg-a64-lockstep system 100000 1` | 14,143,984 | 15,388 |
+| `just tcg-a64-lockstep loadstore 100000 5` | 5,226,330 | 2,977,680 |
+| `just tcg-a64-lockstep all 100000 3` | 3,347,191 | 73,159 |
+
+The mmu runs give the same counts as in card C8, with their alignment, Device
+and permission faults in the same order on both sides. The lockstep runs one
+instruction a block, so the tests above hold the exits inside a longer
+block. `just tcg-a64-kvm-unit-tests`: 11 tests, 9 give the same result lines
+as QEMU, 2 (`gicv2-mmio`, `gicv2-mmio-3p`) pass the two `ITARGETSR`
+subtests that fail on QEMU, as in card C13.
+
+### What this card does not do
+
+- The boot MIPS row, which card S0 adds, and a profile of where the boot
+  time goes now.
+- The x86-64 back end, lazy flags, block chaining and the RAM store path
+  (the other cards of the five views).
+
+### Sources read for this card
+
+- The state of this crate, `vmlab-hv-tcg-ir` (the graph, the scheduler, the
+  pruning) and the RAM path of `vmlab-hv-vmm` (`guest_bus.rs`), and the five
+  model views of card #1145.
+- The two's complement identities for the flags of a subtraction.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the black box of the lockstep and of
+  kvm-unit-tests only.

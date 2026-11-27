@@ -1846,10 +1846,11 @@ impl Vm {
         {
             reason.cleanup_error("pflash flush at VM exit", &error);
         }
-        if let Some(virt) = self.shared.virt.get()
-            && let Err(error) = virt.flush()
-        {
-            reason.cleanup_error("flash flush at VM exit", &VmmError::Other(error));
+        if let Some(virt) = self.shared.virt.get() {
+            virt.report_boot_counts();
+            if let Err(error) = virt.flush() {
+                reason.cleanup_error("flash flush at VM exit", &VmmError::Other(error));
+            }
         }
         for device in self.shared.vfio.lock().iter() {
             if let Err(error) = device.lock().reset() {

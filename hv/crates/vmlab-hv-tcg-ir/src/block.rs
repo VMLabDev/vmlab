@@ -1,9 +1,12 @@
-//! The pre-decoded block form (DESIGN.md M6, the gate of card C5).
+//! The pre-decoded block form (3d DESIGN.md M6, the gate of card C5; moved
+//! here from `vmlab-hv-tcg-aarch64` by 3e DESIGN.md H15).
 //!
 //! A block of the typed IR is lowered once into a dense stream of 16-byte
-//! operations on a frame of 64-bit words, and the loop of `exec` runs that
-//! stream. The semantics stay where they are, in the lifters: this file
-//! knows the operations of the graph and nothing of aarch64.
+//! operations on a frame of 64-bit words. An interpreter loop runs that
+//! stream, and the emitter of `vmlab-hv-tcg-jit` compiles it. The semantics
+//! stay where they are, in the lifters of a guest architecture: this file
+//! knows the operations of the graph and nothing of aarch64 or of any other
+//! guest.
 //!
 //! - A scalar of at most 64 bits (`Bool`, `Bits(1..=64)`) is one word of the
 //!   frame. A wider one (`Bits(65..=128)`, `Integer`) is two words, the low
@@ -22,19 +25,19 @@
 //!
 //! Sources read: none. This file holds no instruction semantics.
 
-use vmlab_hv_tcg_ir::native::fasthash::FastMap as HashMap;
-use vmlab_hv_tcg_ir::native::{
+use crate::native::fasthash::FastMap as HashMap;
+use crate::native::{
     Binary, Graph, Operation, ScalarId, ScalarType, Unary, evaluate_binary, evaluate_unary, mask,
 };
 
 /// A word of the frame of a block.
-pub(crate) type Slot = u16;
+pub type Slot = u16;
 
 /// What an operation does. The codes from `Guard` on are the effects: the
-/// loop of `exec` runs them, `step` runs the others.
+/// interpreter loop runs them, `step` runs the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum Code {
+pub enum Code {
     /// `a + b`, and so on for the next five: the low words, then `imm` as a
     /// mask.
     Add,
@@ -77,29 +80,39 @@ pub(crate) enum Code {
     /// Leave through the exit `imm` unless the word `a` is not zero (`aux`
     /// 1) or is zero (`aux` 0).
     Guard,
-    /// Load `aux` bytes at the address `a` into `dst`. The exit is `imm`.
+    /// Load 1, 2, 4 or 8 bytes at the address `a` into `dst`. The exit is
+    /// `imm`. The `aux` of each load and store code up to `StorePair` holds
+    /// whether the access is made as EL0 and the alignment that Device
+    /// memory asks of it (`exec`).
     Load1,
     Load2,
     Load4,
     Load8,
-    /// Store the low `aux` bytes of `b` at the address `a`. The exit is
+    /// Store the low 1, 2, 4 or 8 bytes of `b` at the address `a`. The exit is
     /// `imm`.
     Store1,
     Store2,
     Store4,
     Store8,
-    /// The access of the index `imm`: 16 bytes, or exclusive.
+    /// Load 16 bytes at the address `a` into `dst` and the word after it.
+    /// The exit is `imm`.
+    LoadPair,
+    /// Store the 16 bytes of `b`, the low word, and `dst`, the high one, at
+    /// the address `a`. The exit is `imm`.
+    StorePair,
+    /// The access of the index `imm`: 16 bytes that are not two words, or
+    /// exclusive.
     Access,
     /// The helper call of the index `imm`.
     Call,
 }
 
 /// The first code that `step` does not run.
-pub(crate) const FIRST_EFFECT: u8 = Code::Guard as u8;
+pub const FIRST_EFFECT: u8 = Code::Guard as u8;
 
 /// One operation of a block.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Op {
+pub struct Op {
     pub code: Code,
     pub aux: u8,
     pub dst: Slot,
@@ -111,7 +124,7 @@ pub(crate) struct Op {
 /// An operand or a result of a generic operation: its first word, and
 /// whether it has a second one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Place {
+pub struct Place {
     pub slot: Slot,
     pub wide: bool,
 }
@@ -147,7 +160,7 @@ enum Kind {
 
 /// An operation on `u128` values: what has no code of its own.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Generic {
+pub struct Generic {
     kind: Kind,
     ty: ScalarType,
     /// The mask of the result. A binary operation masks by its type.
@@ -157,6 +170,17 @@ pub(crate) struct Generic {
 }
 
 impl Generic {
+    /// The words that the operation reads: its three operands, of which
+    /// those it does not use are the word 0.
+    pub fn args(&self) -> [Place; 3] {
+        self.args
+    }
+
+    /// The words of its result.
+    pub fn dst(&self) -> Place {
+        self.dst
+    }
+
     /// `false`: an arithmetic operation outside its domain.
     #[inline(never)]
     fn run(&self, frame: &mut [u64]) -> bool {
@@ -194,7 +218,7 @@ fn low(width: u8) -> u64 {
 /// When a word that the operation names is outside `frame`, or its generic
 /// operation outside `generics`.
 #[cfg(test)]
-pub(crate) fn step(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
+pub fn step(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
     assert!(op_in_frame(op, frame.len(), generics.len()));
     // SAFETY: checked just above.
     unsafe { step_unchecked(op, frame, generics) }
@@ -202,15 +226,15 @@ pub(crate) fn step(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
 
 /// Whether every word and every index that `op` names is inside a frame of
 /// `words` words and `generics` generic operations, for each code: what
-/// `step_unchecked` and the effects of `exec` read without a check.
-pub(crate) fn op_in_frame(op: &Op, words: usize, generics: usize) -> bool {
+/// `step_unchecked` and the effects of the interpreter loop read without a check.
+pub fn op_in_frame(op: &Op, words: usize, generics: usize) -> bool {
     let word = |slot: Slot| usize::from(slot) < words;
     word(op.a)
         && word(op.b)
         && word(op.dst)
         && match op.code {
             Code::Select => (op.imm as usize) < words,
-            Code::Widen => usize::from(op.dst) + 1 < words,
+            Code::Widen | Code::LoadPair => usize::from(op.dst) + 1 < words,
             Code::Generic => (op.imm as usize) < generics,
             _ => true,
         }
@@ -221,7 +245,7 @@ pub(crate) fn op_in_frame(op: &Op, words: usize, generics: usize) -> bool {
 /// # Safety
 /// `slot` is inside `frame`.
 #[inline(always)]
-pub(crate) unsafe fn word(frame: &[u64], slot: usize) -> u64 {
+pub unsafe fn word(frame: &[u64], slot: usize) -> u64 {
     debug_assert!(slot < frame.len());
     // SAFETY: the caller's promise.
     unsafe { *frame.get_unchecked(slot) }
@@ -232,20 +256,20 @@ pub(crate) unsafe fn word(frame: &[u64], slot: usize) -> u64 {
 /// # Safety
 /// `slot` is inside `frame`.
 #[inline(always)]
-pub(crate) unsafe fn set_word(frame: &mut [u64], slot: usize, value: u64) {
+pub unsafe fn set_word(frame: &mut [u64], slot: usize, value: u64) {
     debug_assert!(slot < frame.len());
     // SAFETY: the caller's promise.
     unsafe { *frame.get_unchecked_mut(slot) = value }
 }
 
-/// `step` without the bounds checks: the loop of `exec` runs the operations
+/// `step` without the bounds checks: the interpreter loop runs the operations
 /// of a block whose words it checked once, when the block was made
 /// (`op_in_frame`). The checks were a part of every operation.
 ///
 /// # Safety
 /// `op_in_frame(op, frame.len(), generics.len())` holds.
 #[inline(always)]
-pub(crate) unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
+pub unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
     // SAFETY: the caller's promise covers every word and index read here.
     unsafe {
         let a = word(frame, usize::from(op.a));
@@ -295,7 +319,7 @@ pub(crate) unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Gene
                 a
             }
             Code::Generic => return generics.get_unchecked(op.imm as usize).run(frame),
-            // The loop of `exec` runs the effects.
+            // The interpreter loop runs the effects.
             Code::Guard
             | Code::Load1
             | Code::Load2
@@ -305,6 +329,8 @@ pub(crate) unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Gene
             | Code::Store2
             | Code::Store4
             | Code::Store8
+            | Code::LoadPair
+            | Code::StorePair
             | Code::Access
             | Code::Call => return true,
         };
@@ -337,8 +363,23 @@ fn type_mask(ty: ScalarType) -> u128 {
     }
 }
 
+/// The bitvector of two words that `scalar` is one whole word of, and which
+/// word: a slice of 64 bits at the offset 0 or 64 of a bitvector of 128.
+fn word_of(graph: &Graph, scalar: &crate::native::Scalar) -> Option<(ScalarId, Slot)> {
+    let Operation::Slice {
+        value,
+        offset: offset @ (0 | 64),
+        width: 64,
+    } = scalar.operation
+    else {
+        return None;
+    };
+    (scalar.ty == ScalarType::Bits(64) && graph.scalars[value].ty == ScalarType::Bits(128))
+        .then_some((value, offset / 64))
+}
+
 /// The words of the scalars of one block, and the operations so far.
-pub(crate) struct Lowering {
+pub struct Lowering {
     first: Vec<Slot>,
     wide: Vec<bool>,
     /// The frame of the block. The constants are in place.
@@ -366,6 +407,12 @@ impl Lowering {
                 && (wide[value] || !is)
             {
                 first.push(first[value]);
+                continue;
+            }
+            // A word of a bitvector of two words is that word: the halves of
+            // a load or a register of 16 bytes need no operation (card S4).
+            if let Some((value, word)) = word_of(graph, scalar) {
+                first.push(first[value] + word);
                 continue;
             }
             first.push(Slot::try_from(words).ok()?);
@@ -433,7 +480,7 @@ impl Lowering {
         });
     }
 
-    /// An effect: an operation that the loop of `exec` runs.
+    /// An effect: an operation that the interpreter loop runs.
     pub fn effect(&mut self, code: Code, aux: u8, dst: Slot, a: Slot, b: Slot, imm: u64) {
         debug_assert!(code as u8 >= FIRST_EFFECT);
         self.push(code, aux, dst, a, b, imm);
@@ -608,6 +655,10 @@ impl Lowering {
         if self.wide[id] {
             return false;
         }
+        // It shares the words of `value` (`word_of`).
+        if word_of(graph, &graph.scalars[id]).is_some() {
+            return true;
+        }
         let imm = (mask(width) as u64) & word_mask(graph.scalars[id].ty);
         let dst = self.first[id];
         // The bits that the slice takes, counted from `offset`.
@@ -704,7 +755,7 @@ impl Lowering {
             | Operation::Input(_)
             | Operation::Effect(_)
             | Operation::Call { .. } => {
-                debug_assert!(false, "the loop of exec binds this scalar");
+                debug_assert!(false, "the interpreter loop binds this scalar");
             }
         }
     }
@@ -713,8 +764,8 @@ impl Lowering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmlab_hv_tcg_ir::native::linear;
-    use vmlab_hv_tcg_ir::native::packed::Packed;
+    use crate::native::linear;
+    use crate::native::packed::Packed;
 
     #[test]
     fn an_operation_is_sixteen_bytes() {
@@ -759,7 +810,7 @@ mod tests {
         let (slots, count) = linear::slots(graph);
         let mut values = vec![0u128; count];
         let mut seen = vec![false; graph.scalars.len()];
-        for scalar in vmlab_hv_tcg_ir::native::schedule::scalars(graph, &[id], &mut seen) {
+        for scalar in crate::native::schedule::scalars(graph, &[id], &mut seen) {
             match graph.scalars[scalar].operation {
                 Operation::Constant(value) => values[slots[scalar]] = value,
                 Operation::Input(_) => {
@@ -783,7 +834,7 @@ mod tests {
     fn lowered(graph: &Graph, inputs: &[(ScalarId, u128)], id: ScalarId) -> (Option<u128>, bool) {
         let mut lowering = Lowering::new(graph).expect("a small block");
         let mut seen = vec![false; graph.scalars.len()];
-        for scalar in vmlab_hv_tcg_ir::native::schedule::scalars(graph, &[id], &mut seen) {
+        for scalar in crate::native::schedule::scalars(graph, &[id], &mut seen) {
             match graph.scalars[scalar].operation {
                 Operation::Constant(value) => lowering.constant(scalar, value),
                 Operation::Input(_) => {
