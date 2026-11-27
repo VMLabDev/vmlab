@@ -866,6 +866,10 @@ fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
     }
 }
 
+/// The cold path of an exit: its operations and the inputs only they read
+/// (`Leave::ops`, `Leave::inputs`).
+type ColdPath = (Vec<Op>, Vec<(Place, u32)>);
+
 /// What `compile` gathers beside the operations of the block.
 #[derive(Default)]
 struct Parts {
@@ -930,7 +934,7 @@ impl Parts {
         graph: &Graph,
         seen: &mut [bool],
         roots: &[ScalarId],
-    ) -> Result<(Vec<Op>, Vec<(Place, u32)>), Stop> {
+    ) -> Result<ColdPath, Stop> {
         let scheduled = schedule::scalars(graph, roots, seen);
         let main = std::mem::take(&mut lowering.ops);
         let mut inputs = Vec::new();
