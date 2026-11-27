@@ -569,7 +569,11 @@ fn a_snapshot_brings_the_machine_back(jit: bool) {
     assert_eq!(gic_state(&handle), gic_at_save);
     assert_eq!(vcpus[0].lock().cpu().tlb_entries(), 0);
     let compiled_at_load = compiled_runs(&vcpus);
-    assert_eq!(compiled_at_load > 0, jit, "{compiled_at_load} runs of compiled code");
+    assert_eq!(
+        compiled_at_load > 0,
+        jit,
+        "{compiled_at_load} runs of compiled code"
+    );
 
     // The CPU runs on from the save, on compiled code again with the JIT.
     handle.resume().unwrap();
