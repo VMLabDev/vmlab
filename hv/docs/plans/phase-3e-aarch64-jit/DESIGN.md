@@ -1407,7 +1407,9 @@ of the host fell.
   block differential, the stores into translated code with the JIT on, the
   chained pair and the store from a second CPU, and
   `a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored` at 20,000
-  rounds. The stress test also ran alone at 2,000,000 rounds (below).
+  rounds. The stress test also ran alone at 2,000,000 rounds
+  (`VMLAB_HV_J7_ROUNDS=2000000`), beside the exclusives stress test of
+  card C3: both passed, no stale execution.
 - **J10m. What is left.** 67 % of the returns that are left are blocks
   that the loop ends itself (H5c), one every 204 instructions of a boot.
   The `MSR` of a table base and of the ASID at every entry to and exit
