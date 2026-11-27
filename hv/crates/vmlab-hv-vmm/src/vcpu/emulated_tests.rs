@@ -564,6 +564,14 @@ fn sub64(rd: u32, rn: u32, imm: u32) -> u32 {
 /// succeeded over a store of the other CPU would lose an increment.
 #[test]
 fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
+    // The interpreter, and the JIT with chaining (3e card J7), each on a
+    // machine of two CPUs that tell each other through their mailboxes.
+    for jit in [false, true] {
+        count_on_two_cpus(jit);
+    }
+}
+
+fn count_on_two_cpus(jit: bool) {
     const ROUNDS: u64 = 200_000;
     const CODE: u64 = RAM + 0x10_0000;
     const DATA: u64 = RAM + 0x2000;
@@ -574,6 +582,7 @@ fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
         bus.writes_straight(),
         "the host has membarrier and cmpxchg16b"
     );
+    let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(2));
     let program = [
         ldaxr32(5, 1),      // 0 lock: w5 = [x1]
         cbnz32(5, -1),      // 1 held: again
@@ -598,6 +607,7 @@ fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
     let threads: Vec<_> = (0..2u64)
         .map(|id| {
             let bus = bus.clone();
+            let shootdown = shootdown.clone();
             std::thread::spawn(move || {
                 let mut state = State::reset(CODE);
                 state.set_x(1, DATA);
@@ -607,6 +617,8 @@ fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
                 state.set_x(9, DATA + 0x100 + 8 * id);
                 state.set_x(10, DATA + 0x80);
                 let mut cpu = vmlab_hv_tcg_aarch64::Cpu::new(bus, state);
+                cpu.set_jit(jit).unwrap();
+                cpu.shootdown = Some((shootdown, id as usize));
                 loop {
                     match cpu.run(100_000) {
                         vmlab_hv_tcg_aarch64::Stop::Budget => {}
@@ -614,6 +626,7 @@ fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
                         other => panic!("cpu {id}: {other:?}"),
                     }
                 }
+                assert_eq!(cpu.jit_enabled(), jit);
                 cpu.state.x(2)
             })
         })
@@ -627,8 +640,141 @@ fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
         u32::from_le_bytes(bytes)
     };
     assert_eq!(word(DATA), 0, "the lock is free");
-    assert_eq!(word(DATA + 0x40), 2 * ROUNDS as u32, "under the lock");
-    assert_eq!(word(DATA + 0x80), 2 * ROUNDS as u32, "exclusive increments");
+    assert_eq!(word(DATA + 0x40), 2 * ROUNDS as u32, "under the lock, jit {jit}");
+    assert_eq!(word(DATA + 0x80), 2 * ROUNDS as u32, "exclusive increments, jit {jit}");
+}
+
+
+/// `LDR Xt, [Xn]`.
+fn ldr64(rt: u32, rn: u32) -> u32 {
+    0xf940_0000 | rn << 5 | rt
+}
+
+/// `STR Xt, [Xn]`.
+fn str64(rt: u32, rn: u32) -> u32 {
+    0xf900_0000 | rn << 5 | rt
+}
+
+/// `CMP Xn, Xm`.
+fn cmp64(rn: u32, rm: u32) -> u32 {
+    0xeb00_001f | rm << 16 | rn << 5
+}
+
+/// `B.EQ` (`ne` false) or `B.NE` to an offset in instructions.
+fn b_cond(ne: bool, offset: i32) -> u32 {
+    0x5400_0000 | ((offset as u32) & 0x7ffff) << 5 | u32::from(ne)
+}
+
+/// `AND Xd, Xn, #0xffff`.
+fn and_low16(rd: u32, rn: u32) -> u32 {
+    0x9240_3c00 | rn << 5 | rd
+}
+
+/// `ORR Xd, Xn, Xm, LSL #shift`; `MOV Xd, Xm` with `rn` 31.
+fn orr64(rd: u32, rn: u32, rm: u32, shift: u32) -> u32 {
+    0xaa00_0000 | rm << 16 | shift << 10 | rn << 5 | rd
+}
+
+/// 3e card J7: two CPUs on two threads, with the JIT and chaining. The
+/// writer stores a new `MOVZ X1, #round` into a function that the runner
+/// has translated and calls, and then publishes the round. The runner spins
+/// in a chained loop on the round, calls the function when it moves, and
+/// stops with `HVC #1` when the function gives an older value: a block of
+/// the old code ran after the store. Then it acknowledges the round, which
+/// the writer waits for. `VMLAB_HV_J7_ROUNDS` sets the rounds (10 million
+/// for the proof of the card).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored() {
+    const WRITER: u64 = RAM + 0x10_0000;
+    const RUNNER: u64 = RAM + 0x11_0000;
+    const FUNCTION: u64 = RAM + 0x12_0000;
+    const DATA: u64 = RAM + 0x2000;
+    let rounds: u64 = std::env::var("VMLAB_HV_J7_ROUNDS")
+        .ok()
+        .and_then(|rounds| rounds.parse().ok())
+        .unwrap_or(20_000);
+    let memory = ram();
+    let bus = GuestBus::new(memory.clone(), host_with_latch(), 2).unwrap();
+    assert!(bus.writes_straight());
+    let writer = [
+        asm::add(3, 3, 1),    // 0 the next round
+        and_low16(7, 3),      // 1
+        orr64(8, 6, 7, 5),    // 2 movz x1, #round
+        str32(8, 4, 0),       // 3 into the function
+        str64(3, 10),         // 4 publish the round
+        ldr64(9, 11),         // 5 wait for its acknowledgement
+        cmp64(9, 3),          // 6
+        b_cond(true, -2),     // 7
+        cmp64(3, 14),         // 8
+        b_cond(true, -9),     // 9
+        asm::hvc(0),          // 10
+    ];
+    let runner = [
+        ldr64(5, 10),         // 0 wait for a round
+        cmp64(5, 12),         // 1
+        b_cond(false, -2),    // 2
+        orr64(12, 31, 5, 0),  // 3
+        asm::blr(2),          // 4 the function
+        and_low16(13, 5),     // 5
+        cmp64(1, 13),         // 6
+        b_cond(true, 5),      // 7 old code ran
+        str64(5, 11),         // 8 acknowledge
+        cmp64(5, 14),         // 9
+        b_cond(true, -10),    // 10
+        asm::hvc(0),          // 11
+        asm::hvc(1),          // 12
+    ];
+    for (at, words) in [
+        (WRITER, &writer[..]),
+        (RUNNER, &runner[..]),
+        (FUNCTION, &[asm::movz(1, 0, 0), asm::RET][..]),
+    ] {
+        memory
+            .write_slice(&asm::bytes(words), GuestAddress(at))
+            .unwrap();
+    }
+    let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(2));
+    let threads: Vec<_> = [WRITER, RUNNER]
+        .into_iter()
+        .enumerate()
+        .map(|(id, start)| {
+            let bus = bus.clone();
+            let shootdown = shootdown.clone();
+            std::thread::spawn(move || {
+                let mut state = State::reset(start);
+                state.set_x(2, FUNCTION);
+                state.set_x(4, FUNCTION);
+                state.set_x(6, u64::from(asm::movz(1, 0, 0)));
+                state.set_x(10, DATA);
+                state.set_x(11, DATA + 0x40);
+                state.set_x(14, rounds);
+                let mut cpu = vmlab_hv_tcg_aarch64::Cpu::new(bus, state);
+                cpu.set_jit(true).unwrap();
+                cpu.set_chaining(true).unwrap();
+                cpu.shootdown = Some((shootdown, id));
+                loop {
+                    match cpu.run(1 << 20) {
+                        vmlab_hv_tcg_aarch64::Stop::Budget => {}
+                        vmlab_hv_tcg_aarch64::Stop::Hypercall { immediate, .. } => {
+                            return (immediate, cpu.state.x(5), cpu.state.x(1), cpu.jit_counts());
+                        }
+                        other => panic!("cpu {id}: {other:?}"),
+                    }
+                }
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let (immediate, round, value, counts) = &results[1];
+    assert_eq!(
+        *immediate, 0,
+        "the runner ran old code in round {round}: x1 {value:#x}"
+    );
+    assert_eq!(*round, rounds);
+    assert_eq!(results[0].0, 0);
+    // The loops ran as compiled code that chains.
+    assert!(counts.chained > rounds, "{counts:?}");
 }
 
 // ---- the test VM ------------------------------------------------------------

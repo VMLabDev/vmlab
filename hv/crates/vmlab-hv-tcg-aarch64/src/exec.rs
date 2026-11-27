@@ -5066,10 +5066,6 @@ impl<M: Memory> Cpu<M> {
                                 Some(lines) => &lines.seat,
                                 None => &self.seat,
                             },
-                    seat: match &self.lines {
-                        Some(lines) => &lines.seat,
-                        None => &self.seat,
-                    },
                         },
                         pending,
                         self.epoch,
