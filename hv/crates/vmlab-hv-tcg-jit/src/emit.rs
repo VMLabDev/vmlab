@@ -31,7 +31,11 @@ use crate::asm::{
     Alu, Asm, Cond, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
     Reg, Rm, Shift,
 };
-use crate::{BUDGET, CONTEXT_BUDGET, CONTEXT_ENV, CONTEXT_THUNK, Features};
+use crate::asm::Label;
+use crate::{
+    BUDGET, CHAIN, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV, CONTEXT_HITS,
+    CONTEXT_JUMP, CONTEXT_THUNK, Features, JUMP_ENTRIES, JUMP_SHIFT, LOOKUP, SITES,
+};
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
 
 /// What an effect that the caller describes reads and writes: an access of
@@ -42,6 +46,44 @@ pub struct Effect {
     pub writes: Vec<Slot>,
     /// The leave of the block that the effect can leave through.
     pub leave: Option<u32>,
+}
+
+/// How a block that can be chained to starts and ends (DESIGN.md H5, H6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chain {
+    /// The address of the frame of the block: its head loads it, because
+    /// a block reached by a jump finds the frame of another one in R14.
+    pub frame: u64,
+    /// What its head stores in `Context::block`.
+    pub tag: u64,
+    /// The key of the context of the block in the jump cache. Not 0.
+    pub key: u64,
+    /// The offset of its first instruction in its 4 KiB page.
+    pub page_offset: u32,
+    /// Whether its exits look for the code of the next block: linked jumps
+    /// to a target in the same page, and the jump cache for the rest.
+    /// Without, it leaves with `DONE`.
+    pub link: bool,
+}
+
+/// What the block makes of the PC of the state at its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextPc {
+    /// The PC moves by a constant: the block ends before an instruction
+    /// that its owner runs. It leaves with `DONE`.
+    Fixed(u64),
+    /// The PC moves by the value of a word.
+    Relative(Place),
+    /// The PC is the value of a word.
+    Absolute(Place),
+}
+
+/// The PC at the end of a block: the register slot that holds it, and how
+/// it changes. No operation of a block writes that slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Next {
+    pub pc: u32,
+    pub kind: NextPc,
 }
 
 /// A block as the emitter sees it.
@@ -61,6 +103,13 @@ pub struct Shape<'a> {
     /// Register slot, words of the frame: written to the state at the end.
     pub outputs: &'a [(u32, Place)],
     pub instructions: u32,
+    /// The head and the exits of a block that is chained (H5). `None`: the
+    /// frame is the one that `enter` names, and the block leaves with
+    /// `DONE`.
+    pub chain: Option<Chain>,
+    /// The PC at the end of the block. `None`: the block does not change
+    /// it.
+    pub next: Option<Next>,
 }
 
 /// Why the emitter made no code for a block. The block runs in the
@@ -193,6 +242,8 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
 
 struct Emitter<'a> {
     asm: Asm,
+    /// Where each word is at the head of the block.
+    initial: Vec<Home>,
     words: Vec<Word>,
     owner: [Option<Slot>; 16],
     /// The positions at which each word is read, in order.
@@ -441,6 +492,7 @@ impl Emitter<'_> {
         }
         asm.mov(RDI, Rm::Mem(R13, CONTEXT_ENV));
         asm.mov_imm(RSI, index as u64);
+        asm.mov(RDX, Rm::Mem(R13, CONTEXT_BLOCK));
         asm.call_indirect(Rm::Mem(R13, CONTEXT_THUNK));
         if pad {
             asm.alu_imm(Alu::Add, Rm::Reg(RSP), 8);
@@ -769,8 +821,140 @@ impl Emitter<'_> {
         }
     }
 
-    /// The end of the block: the outputs to the state, then the exit.
-    fn outputs(&mut self) {
+    /// The end of the block: the outputs to the state, the PC, then the
+    /// exit. The exits that chain are returned: the label of each jump and
+    /// of its stub.
+    fn outputs(&mut self) -> Vec<(Label, Label)> {
+        // The word of the next PC goes into RCX before an output can write
+        // over the slot that it is still in.
+        let next = self.shape.next;
+        if let Some(Next {
+            kind: NextPc::Relative(place) | NextPc::Absolute(place),
+            ..
+        }) = next
+        {
+            let value = self.current(place.slot);
+            self.load(RCX, value);
+        }
+        self.write_outputs();
+        let Some(next) = next else {
+            self.asm.xor32(RAX, RAX);
+            self.asm.jmp_absolute(self.exit);
+            return Vec::new();
+        };
+        let pc = i32::try_from(u64::from(next.pc) * 16).unwrap_or(i32::MAX);
+        let slot = Rm::Mem(R15, pc);
+        match next.kind {
+            NextPc::Fixed(distance) => {
+                self.asm.mov(RAX, slot);
+                if i32::try_from(distance as i64).is_ok() {
+                    self.asm.alu_imm(Alu::Add, Rm::Reg(RAX), distance as i32);
+                } else {
+                    self.asm.mov_imm(RDX, distance);
+                    self.asm.alu(Alu::Add, RAX, Rm::Reg(RDX));
+                }
+            }
+            NextPc::Relative(_) => {
+                self.asm.mov(RAX, slot);
+                self.asm.alu(Alu::Add, RAX, Rm::Reg(RCX));
+            }
+            NextPc::Absolute(_) => self.asm.mov(RAX, Rm::Reg(RCX)),
+        }
+        self.asm.store(slot, RAX);
+        self.asm.store_imm(Rm::Mem(R15, pc + 8), 0);
+        let chain = match self.shape.chain {
+            Some(chain) if chain.link && !matches!(next.kind, NextPc::Fixed(_)) => chain,
+            _ => {
+                self.asm.xor32(RAX, RAX);
+                self.asm.jmp_absolute(self.exit);
+                return Vec::new();
+            }
+        };
+        // H5: a constant distance to a target in the page of the block is a
+        // jump that its owner links. RCX holds the distance.
+        let mut sites = Vec::new();
+        if let NextPc::Relative(place) = next.kind {
+            for distance in self.candidates(place.slot) {
+                let target = i64::from(chain.page_offset) + distance as i64;
+                if !(0..4096).contains(&target) || sites.len() == SITES {
+                    continue;
+                }
+                let Ok(immediate) = i32::try_from(distance as i64) else {
+                    continue;
+                };
+                let other = self.asm.label();
+                let jump = self.asm.label();
+                let stub = self.asm.label();
+                self.asm.alu_imm(Alu::Cmp, Rm::Reg(RCX), immediate);
+                self.asm.jcc(Cond::Ne, other);
+                self.asm.alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_CHAINED), 1);
+                self.asm.bind(jump);
+                self.asm.jmp(stub);
+                self.asm.bind(other);
+                self.asm.cold(true);
+                self.asm.bind(stub);
+                self.asm.mov_imm(RAX, CHAIN + sites.len() as u64);
+                self.asm.jmp_absolute(self.exit);
+                self.asm.cold(false);
+                sites.push((jump, stub));
+            }
+        }
+        // H6: the jump cache, by the PC in RAX.
+        let miss = self.asm.label();
+        self.asm.mov(RDX, Rm::Reg(RAX));
+        self.asm.shift_imm(Shift::Shr, RDX, 2);
+        self.asm
+            .alu_imm(Alu::And, Rm::Reg(RDX), (JUMP_ENTRIES - 1) as i32);
+        self.asm.shift_imm(Shift::Shl, RDX, JUMP_SHIFT);
+        self.asm.alu(Alu::Add, RDX, Rm::Mem(R13, CONTEXT_JUMP));
+        self.asm.alu(Alu::Cmp, RAX, Rm::Mem(RDX, 0));
+        self.asm.jcc(Cond::Ne, miss);
+        self.asm.mov_imm(RCX, chain.key);
+        self.asm.alu(Alu::Cmp, RCX, Rm::Mem(RDX, 8));
+        self.asm.jcc(Cond::Ne, miss);
+        self.asm.alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_HITS), 1);
+        self.asm.jmp_indirect(Rm::Mem(RDX, 16));
+        self.asm.cold(true);
+        self.asm.bind(miss);
+        self.asm.mov_imm(RAX, LOOKUP);
+        self.asm.jmp_absolute(self.exit);
+        self.asm.cold(false);
+        sites
+    }
+
+    /// The constant values that the word `slot` can have at the end of
+    /// the block: a constant, or a `Select` of two constants (a
+    /// conditional branch).
+    fn candidates(&self, slot: Slot) -> Vec<u64> {
+        let constant = |word: Slot| match self.initial.get(usize::from(word)) {
+            Some(Home::Const(value)) => Some(*value),
+            _ => None,
+        };
+        if let Some(value) = constant(slot) {
+            return vec![value];
+        }
+        let Some(op) = self.shape.ops.iter().rev().find(|op| {
+            uses_of(op, self.shape.generics, self.shape)
+                .is_some_and(|(_, writes)| writes.contains(&slot))
+        }) else {
+            return Vec::new();
+        };
+        if op.code != Code::Select || op.dst != slot {
+            return Vec::new();
+        }
+        let mut values = Vec::new();
+        for word in [op.a, op.b] {
+            if let Some(value) = constant(word)
+                && !values.contains(&value)
+            {
+                values.push(value);
+            }
+        }
+        values
+    }
+
+    /// The outputs to the state.
+    fn write_outputs(&mut self) {
         let outputs = self.shape.outputs;
         let targets: Vec<(i32, i32)> = outputs
             .iter()
@@ -813,14 +997,17 @@ impl Emitter<'_> {
                 self.put(target, value);
             }
         }
-        self.asm.xor32(RAX, RAX);
-        self.asm.jmp_absolute(self.exit);
     }
 }
 
 /// Emit the code of `shape`. `exit` is the address of the common exit of
-/// the trampoline.
-pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused> {
+/// the trampoline. With the code, the labels of the jumps that chain and of
+/// their stubs, in the order of their exit indices.
+pub fn emit(
+    shape: &Shape,
+    exit: u64,
+    features: Features,
+) -> Result<(Asm, Vec<(Label, Label)>), Refused> {
     let words = shape.frame.len();
     if words > i32::MAX as usize / 8 {
         return Err(Refused::Size);
@@ -877,6 +1064,17 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
             uses[usize::from(slot)].push(end);
         }
     }
+    if let Some(next) = shape.next {
+        if next.pc as usize * 16 + 16 > i32::MAX as usize {
+            return Err(Refused::Size);
+        }
+        if let NextPc::Relative(place) | NextPc::Absolute(place) = next.kind {
+            if place.wide || !in_frame(place.slot) {
+                return Err(Refused::Malformed);
+            }
+            uses[usize::from(place.slot)].push(end);
+        }
+    }
     for (slot, home) in homes.iter_mut().enumerate() {
         if !written[slot] {
             *home = Home::Const(shape.frame[slot]);
@@ -884,6 +1082,7 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
     }
     let mut emitter = Emitter {
         asm: Asm::new(),
+        initial: homes.clone(),
         words: homes
             .into_iter()
             .map(|home| Word {
@@ -900,6 +1099,13 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
         features,
         shape,
     };
+    // H5: the head of a block that chains loads its own frame and names
+    // itself, because a jump from another block reaches it.
+    if let Some(chain) = shape.chain {
+        emitter.asm.mov_imm(R14, chain.frame);
+        emitter.asm.mov_imm(RAX, chain.tag);
+        emitter.asm.store(Rm::Mem(R13, CONTEXT_BLOCK), RAX);
+    }
     // H10: the head of the block takes its instructions from the budget,
     // and leaves when the budget is spent.
     let spent = emitter.asm.label();
@@ -926,6 +1132,6 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
             emitter.pure(index, op, reads)?;
         }
     }
-    emitter.outputs();
-    Ok(emitter.asm)
+    let sites = emitter.outputs();
+    Ok((emitter.asm, sites))
 }

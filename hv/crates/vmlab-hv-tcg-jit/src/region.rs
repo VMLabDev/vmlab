@@ -17,6 +17,16 @@ use std::io;
 /// the region asks again without it.
 const MFD_EXEC: libc::c_uint = 0x10;
 
+/// The generations of every region of the process. A region that a CPU
+/// makes after it dropped another can be mapped at the same address, so a
+/// generation is never used twice: an entry of the dropped region is then
+/// of no region.
+static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn new_generation() -> u64 {
+    GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Region {
     fd: libc::c_int,
     write: *mut u8,
@@ -92,7 +102,7 @@ impl Region {
             len,
             floor: 0,
             used: 0,
-            generation: 0,
+            generation: new_generation(),
         })
     }
 
@@ -117,7 +127,7 @@ impl Region {
     /// older generation from now on.
     pub fn reset(&mut self) {
         self.used = self.floor;
-        self.generation += 1;
+        self.generation = new_generation();
     }
 
     /// Copy `code` to `address`, which `next` gave for its length, and take
@@ -139,6 +149,27 @@ impl Region {
             std::ptr::copy_nonoverlapping(code.as_ptr(), self.write.add(offset), code.len());
         }
         self.used = offset + code.len();
+    }
+
+    /// Write `bytes` over code of the region at `address`: a jump that is
+    /// linked or unlinked (DESIGN.md H5). Only the thread that runs the
+    /// code of the region writes it, and never while that code runs.
+    ///
+    /// # Panics
+    /// When the bytes are not inside the code in use.
+    pub fn patch(&mut self, address: u64, bytes: &[u8]) {
+        let start = self.exec as u64;
+        assert!(
+            address >= start + self.floor as u64
+                && address + bytes.len() as u64 <= start + self.used as u64,
+            "a patch outside the code in use"
+        );
+        let offset = (address - start) as usize;
+        // SAFETY: the bytes are inside the writable view (checked above),
+        // and no code of the region runs while the owner patches it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.write.add(offset), bytes.len());
+        }
     }
 
     /// Keep the code so far for the whole life of the region: the
@@ -189,7 +220,7 @@ mod tests {
         let next = region.next(16).expect("room");
         region.put(next, &[0; 16]);
         region.reset();
-        assert_eq!(region.generation(), generation + 1);
+        assert_ne!(region.generation(), generation);
         assert_eq!(region.next(16), Some(next));
     }
 }

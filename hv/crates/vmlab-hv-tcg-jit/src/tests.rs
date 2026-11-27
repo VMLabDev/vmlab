@@ -130,7 +130,7 @@ const LEFT: u64 = 7;
 
 /// # Safety
 /// `env` is an `Env` whose frame is valid.
-unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64) -> u64 {
+unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64, _block: *mut c_void) -> u64 {
     // SAFETY: the test passes its `Env`.
     let env = unsafe { &mut *env.cast::<Env>() };
     env.thunk_calls += 1;
@@ -212,6 +212,8 @@ fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u
         inputs: &block.inputs,
         outputs: &block.outputs,
         instructions: 1,
+        chain: None,
+        next: None,
     };
     let entry = jit.compile(&shape).expect("a block that the emitter takes");
     let mut frame = block.frame.clone();
@@ -223,14 +225,10 @@ fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u
         thunk_calls: 0,
         left_at: None,
     };
-    let mut context = Context {
-        budget,
-        thunk,
-        env: (&raw mut env).cast(),
-    };
+    let mut context = jit.context(budget, thunk, (&raw mut env).cast());
     // SAFETY: the entry was just compiled from this block, and the slots
     // and the frame are as large as it names.
-    let code = unsafe { jit.enter(&entry, &mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
+    let code = unsafe { jit.enter(&entry, &raw mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
     let mut words = Vec::new();
     if code == LEFT {
         let op = block.ops[env.left_at.expect("the guard that failed")];
@@ -504,6 +502,8 @@ fn a_form_that_the_host_lacks_is_refused() {
         inputs: &inputs,
         outputs: &outputs,
         instructions: 1,
+        chain: None,
+        next: None,
     };
     assert_eq!(jit.compile(&shape), Err(Refused::Form(Code::PopCount)));
     let rbit = Op {
@@ -534,6 +534,8 @@ fn a_full_region_starts_a_new_generation() {
             inputs: &block.inputs,
             outputs: &block.outputs,
             instructions: 1,
+            chain: None,
+            next: None,
         };
         let entry = jit.compile(&shape).expect("a block");
         let first = *first.get_or_insert(entry);
@@ -543,4 +545,169 @@ fn a_full_region_starts_a_new_generation() {
         }
     }
     panic!("the region never filled");
+}
+
+/// A block of one instruction that adds 1 to the register 0 and moves the
+/// PC (the register 1) by the constant 0 or to the value of the register 2:
+/// it chains to itself through a linked jump or through the jump cache.
+struct Looping {
+    frame: Vec<u64>,
+    ops: Vec<Op>,
+    inputs: Vec<(Place, u32)>,
+    outputs: Vec<(u32, Place)>,
+}
+
+fn word(slot: Slot) -> Place {
+    Place { slot, wide: false }
+}
+
+impl Looping {
+    fn new() -> Self {
+        // Word 1 is the register 0, 2 the sum, 3 the constant 1, 4 the
+        // distance 0, 5 the register 2.
+        let mut frame = vec![0u64; 6];
+        frame[3] = 1;
+        Self {
+            frame,
+            ops: vec![Op {
+                code: Code::Add,
+                aux: 0,
+                dst: 2,
+                a: 1,
+                b: 3,
+                imm: u64::MAX,
+            }],
+            inputs: vec![(word(1), 0), (word(5), 2)],
+            outputs: vec![(0, word(2))],
+        }
+    }
+
+    fn compile(&mut self, jit: &mut Jit, kind: NextPc, key: u64) -> Entry {
+        let shape = Shape {
+            ops: &self.ops,
+            generics: &[],
+            frame: &self.frame,
+            accesses: &[],
+            calls: &[],
+            leaves: &[],
+            inputs: &self.inputs,
+            outputs: &self.outputs,
+            instructions: 1,
+            chain: Some(Chain {
+                frame: self.frame.as_mut_ptr() as u64,
+                tag: 0x7a6,
+                key,
+                page_offset: 0x100,
+                link: true,
+            }),
+            next: Some(Next { pc: 1, kind }),
+        };
+        jit.compile(&shape).expect("a block that the emitter takes")
+    }
+
+    /// Run from `entry` with `budget`: the code it left with, and the
+    /// context after.
+    fn run(&mut self, jit: &Jit, entry: &Entry, slots: &mut [u128; 3], budget: i64) -> (u64, Context) {
+        let mut env = Env {
+            ops: self.ops.clone(),
+            frame: self.frame.as_mut_ptr(),
+            words: self.frame.len(),
+            calls: Vec::new(),
+            thunk_calls: 0,
+            left_at: None,
+        };
+        let mut context = jit.context(budget, thunk, (&raw mut env).cast());
+        // SAFETY: the entry was compiled from this block, whose frame is
+        // alive, and the slots are as many as it names.
+        let code = unsafe {
+            jit.enter(
+                entry,
+                &raw mut context,
+                slots.as_mut_ptr(),
+                self.frame.as_mut_ptr(),
+            )
+        };
+        (code, context)
+    }
+}
+
+#[test]
+fn a_linked_jump_chains_until_the_budget_and_unlinks_to_its_stub() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Relative(word(4)), 9);
+    assert_eq!(entry.site_count, 1);
+    let mut slots = [0u128, 0x4000_0100, 0];
+    // Not linked: one run, and the exit of the jump.
+    let (code, context) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!((code, context.budget, context.chained), (CHAIN, 99, 1));
+    assert_eq!(context.block as u64, 0x7a6);
+    assert_eq!(slots[..2], [1, 0x4000_0100]);
+    // Linked: the block runs until its head finds the budget spent.
+    assert!(jit.link(&entry, 0, &entry));
+    assert_eq!(jit.linked(), 1);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.budget, context.chained), (BUDGET, 0, 10));
+    assert_eq!(slots[0], 11);
+    // Unlinked: back to the stub.
+    jit.unlink_to(entry.address);
+    assert_eq!(jit.linked(), 0);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!(code, CHAIN);
+    assert_eq!(slots[0], 12);
+    assert_eq!((jit.stats.links, jit.stats.unlinks), (1, 1));
+}
+
+#[test]
+fn the_jump_cache_serves_its_pc_and_its_key_and_is_dropped_with_the_region() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    assert_eq!(entry.site_count, 0);
+    let pc = 0x4000_0100u64;
+    let mut slots = [0u128, u128::from(pc), u128::from(pc)];
+    let (code, _) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!(code, LOOKUP);
+    jit.fill(pc, 9, &entry);
+    assert_eq!(jit.jump_entry(pc).code, entry.address);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!((code, context.hits), (BUDGET, 20));
+    assert_eq!(slots[0], 21);
+    // An entry of another context is a miss.
+    jit.fill(pc, 8, &entry);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!((code, context.hits), (LOOKUP, 0));
+    // Another PC is a miss.
+    jit.fill(pc, 9, &entry);
+    slots[2] = u128::from(pc + 4);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!(code, LOOKUP);
+    // A full region drops the jump cache with the code.
+    slots[2] = u128::from(pc);
+    let mut other = Looping::new();
+    let resets = jit.stats.resets;
+    while jit.stats.resets == resets {
+        other.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    assert_eq!(jit.jump_entry(pc).key, 0);
+    assert!(!jit.current(&entry));
+}
+
+#[test]
+fn a_fixed_next_pc_leaves_with_done_and_a_jump_outside_the_page_has_no_site() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Fixed(8), 9);
+    assert_eq!(entry.site_count, 0);
+    let mut slots = [0u128, 0x4000_0100, 0];
+    let (code, _) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!(code, DONE);
+    assert_eq!(slots[1], 0x4000_0108);
+    // A distance of a page from the offset 0x100 leaves it: the jump cache.
+    block.frame[4] = 0x1000;
+    let entry = block.compile(&mut jit, NextPc::Relative(word(4)), 9);
+    assert_eq!(entry.site_count, 0);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 100);
+    assert_eq!(code, LOOKUP);
+    assert_eq!(slots[1], 0x4000_1108);
 }

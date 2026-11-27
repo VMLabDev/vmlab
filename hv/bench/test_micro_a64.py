@@ -100,6 +100,21 @@ class JitReportTests(unittest.TestCase):
         self.assertEqual(report["instructions"], 2000)
         self.assertEqual(report["interpreted_instructions"], 7)
         self.assertEqual(report["compile_ms"], 3)
+        self.assertNotIn("chained", report)
+
+    def test_a_report_with_the_exits_of_chaining(self):
+        line = ('{"level":"INFO","message":"vcpu 0: JIT: 1000 instructions, 7 of them in the '
+                'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
+                '0 resets of the region, 3 ms of compiling; exits: 80 chained, 15 jump cache '
+                'hits, 4 unlinked, 6 jump cache misses, 12 runs entered; 9 links, 2 unlinks, '
+                '5 fills"}\n')
+        with tempfile.TemporaryDirectory() as run_dir:
+            with open(Path(run_dir) / "stderr.log", "w") as log:
+                log.write(line)
+            report = lib.last_jit_report(run_dir)
+        self.assertEqual((report["chained"], report["jump_hits"], report["unlinked"],
+                          report["lookups"], report["entered"]), (80, 15, 4, 6, 12))
+        self.assertEqual((report["links"], report["unlinks"], report["fills"]), (9, 2, 5))
 
 
 if __name__ == "__main__":
