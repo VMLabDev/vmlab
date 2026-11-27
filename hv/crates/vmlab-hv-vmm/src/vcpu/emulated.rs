@@ -109,6 +109,9 @@ impl EmulatedVcpu {
             irq: line(),
             fiq: line(),
         };
+        if let Some(limit) = std::env::var("VMLAB_HV_A64_BLOCK").ok().and_then(|v| v.parse().ok()) {
+            vmlab_hv_tcg_aarch64::exec::BLOCK_LIMIT.store(limit, Ordering::Relaxed);
+        }
         let mut cpu = Cpu::new(memory, state);
         cpu.clock = clock;
         Self {

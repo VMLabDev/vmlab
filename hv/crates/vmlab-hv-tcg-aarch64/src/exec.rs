@@ -65,6 +65,8 @@ use vmlab_hv_tcg_ir::native::{
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
+/// WIP: the longest block, for a bisection.
+pub static BLOCK_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(BLOCK_INSTRUCTIONS);
 
 /// The block cache is direct-mapped by the PC.
 const CACHE_ENTRIES: usize = 1 << 12;
@@ -2106,7 +2108,7 @@ impl<M: Memory> Cpu<M> {
             }
         };
         if !self.usable(single, index, pc, phys, context) {
-            let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
+            let limit = if single { 1 } else { BLOCK_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
             let compiled = match self.translate(phys, limit) {
                 Ok(compiled) => Box::new(compiled),
                 Err(Refused::Stop(stop)) => return Err(stop),
