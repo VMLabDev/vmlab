@@ -132,6 +132,15 @@ tcg-a64-boot-lockstep firmware='../guest/dist/firmware/aarch64' until='Shell>' r
 	if [ "{{max}}" != 0 ]; then args+=(--max-instructions "{{max}}"); fi
 	cargo run --release -p vmlab-hv-vmm --example a64_boot_lockstep -- "${args[@]}"
 
+# Run the windows of a boot against QEMU (card C13b, the O4 form that ends in under two hours): windows is the directory that VMLAB_HV_A64_WINDOWS=<dir>,<first>,<every>,<count> made a boot of our machine write, ram_mib the RAM of that machine, budget the most instructions of one window
+[group('tcg')]
+tcg-a64-window-lockstep windows ram_mib budget='20000000': tcg-a64-plugin-build
+	#!/usr/bin/env bash
+	set -euo pipefail
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64window.XXXXXX")
+	trap '[ -n "$dir" ] && [ -d "$dir" ] && rm -rf -- "$dir"' EXIT
+	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_window_lockstep -- --plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --windows "{{windows}}" --ram-mib "{{ram_mib}}" --budget "{{budget}}" --keep 1
+
 # Run kvm-unit-tests for arm64 on QEMU and on vmlab-hv and compare the result lines (DESIGN.md O5; card C10: selftest, gic, timer, psci); it fetches and builds kvm-unit-tests under target/kvm-unit-tests, and tests names the ones to run, separated by spaces
 [group('tcg')]
 tcg-a64-kvm-unit-tests tests='' timeout='120':

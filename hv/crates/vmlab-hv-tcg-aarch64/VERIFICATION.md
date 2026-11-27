@@ -2413,6 +2413,103 @@ measured rows are in J8 of the design.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn. QEMU ran as the oracle of K4.
 
+## Card C13b, #1144 (2026-11-28)
+
+The rest of the acceptance of C13 (#1048): a new stack profile of the Debian
+boot, the S1 boot matrix, O4 for Debian in a form that ends in under two
+hours, and kvm-unit-tests at 4 vCPUs. The numbers are in 3e DESIGN.md,
+"C13b, measured by card C13b", and the form of O4 in 3d DESIGN.md, O4w.
+
+### How it is built
+
+- `oracle::window`: the state of a window as a text file (`Start`), our CPU
+  from it, and the flash image of the leader: a prelude that runs at EL2,
+  copies the first MiB of RAM (where QEMU puts its device tree), sets
+  HCR_EL2, CPTR_EL2, CNTHCTL_EL2, VPIDR_EL2, VMPIDR_EL2 and CNTVOFF_EL2,
+  writes every register of `oracle::compared`, the stack pointer in use, V0
+  to V31, FPCR and FPSR, loads X0 to X30 and leaves with `ERET`.
+- `oracle::boot::Options::window`: the leader as
+  `virt,virtualization=on` with `-bios` of that image and the RAM above its
+  first MiB as `-device loader`.
+- `vmlab-hv-vmm`, `vcpu/windows.rs`: `VMLAB_HV_A64_WINDOWS` makes vCPU 0 of
+  an emulated machine write its windows at the end of a slice.
+- `examples/a64_window_lockstep.rs` and `just tcg-a64-window-lockstep`:
+  the follower of every window, with the comparisons and the adoptions of
+  the boot lockstep. A window ends at its budget, at an external abort of
+  our CPU (an access outside RAM), at `WFI`, at a host call, at an
+  interrupt or at a device read of the leader, or at a CPU difference. On a
+  difference it prints the walk of both PCs in our RAM.
+- `plugin/a64lock.c`: the PC of an instruction is the PC register at the
+  start of its block, read in the block callback, plus its offset.
+
+### O4 for Debian, as windows
+
+- The boot of the windows: Debian 13 at one vCPU to agent ready in 124.9 s,
+  68 windows from 1e9 instructions every 250 million (the 68 copies of 2 GiB
+  of RAM held the guest for about 0.7 s each).
+- `just tcg-a64-window-lockstep /tmp/c13b-windows2 2048 40000000`, cores 16
+  to 19, the JIT on: 68 windows, 1,821,246,744 instructions compared in
+  3,410 s, no CPU difference. 24 windows in the firmware and the boot
+  loader (769 million instructions), 33 in the kernel (866 million, 47,999
+  exceptions, 338 of them at a fetch) and 11 in user space (186 million,
+  14,682 exceptions, 164 at a fetch). 39 windows ended at their budget, 28
+  at an access outside RAM and 1 at `WFI`. 86,047 counter and timer reads
+  were taken from the leader. The boot and the run took 59 minutes.
+- The first two runs found two defects of the harness, no defect of the CPU:
+  the instruction abort at a fetch, which has no record of its own, and the
+  PC of the plugin in a block that QEMU translated at another virtual
+  address of the same code (3e DESIGN.md, C13b-O1). The second showed as a
+  `BL` whose target was the address of another process, with the link
+  register right.
+
+### The plugin change, on the other locksteps
+
+- O3 `just tcg-a64-lockstep c1 2000`: 29,023 instructions verified in
+  1,400 rounds, no difference.
+- K4 `just tcg-a64-boot-lockstep` (AAVMF from the reset): no CPU difference
+  in 469.8 million instructions, past the 351,352,700 where the stream of
+  the leader stopped in card J8, and past the four keys of the boot menu.
+  This card stopped the run after 902 s, before the shell.
+
+### Tests
+
+- `oracle::window`: `a_window_file_gives_back_the_state_that_wrote_it`,
+  `the_prelude_is_instructions_that_end_in_eret_and_data_that_holds_the_state`,
+  `the_registers_without_an_msr_of_their_own_are_written_through_the_ones_that_set_them`.
+- `oracle::boot`: `the_leader_of_a_window_starts_at_el2_from_the_prelude_with_our_ram`.
+- `vmlab-hv-vmm`: `the_switch_names_a_directory_the_first_window_the_gap_and_the_count`.
+
+### What this card does not do
+
+- O4 from the reset to agent ready with the devices, the DMA and the
+  interrupts led by the leader. W1 to W5 of 3d O4w say what the windows do
+  not prove.
+- Any change of speed. The three largest costs of the profile are named in
+  C13b-P1 of the 3e design.
+- S1 for Fedora 44 at one vCPU. Of seven boots on a host at a load of 7 to
+  12, four reached agent ready in 149.6 to 172.5 s and three went to
+  emergency mode on systemd's 90 s device timeout, the vCPU at 37 to 130
+  MIPS in the late phase (3e DESIGN.md, C13b-S1). Every other cell of the
+  matrix passed its three repeats. The leader landed the card with this
+  cell open (C13b-S1a): a follow-up card measures it again after J10, J11
+  and J12.
+
+### Sources read for this card
+
+- The state of this crate (the oracle, the plugin, the boot lockstep), of
+  `vmlab-hv-vmm` (the emulated vCPU, `GuestBus`, the snapshot of `virt`) and
+  of the bench (`run.py`, `lib.py`, `bench/ipsample.c`, the measure tools of
+  3e).
+- The encodings of the registers of EL2 that the prelude writes and of the
+  loads, stores and branches that it uses were written by hand from their
+  op0, op1, CRn, CRm and op2 and their fixed bits, with no document opened
+  for them. The tests check the words against our decoder, which is
+  generated from the LLVM tables (S1), and the leader ran the prelude to the
+  first instruction of every window.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the oracle of O3, K4 and the windows, through its
+  command line and the plugin API that `a64lock.c` already used.
+
 ## Card J13, #1185 (2026-11-28)
 
 AdvSIMD and crypto without the generic evaluator (3e DESIGN.md J13, N4).

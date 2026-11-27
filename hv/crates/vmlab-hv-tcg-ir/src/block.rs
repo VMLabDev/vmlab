@@ -415,6 +415,7 @@ fn word_of(graph: &Graph, scalar: &crate::native::Scalar) -> Option<(ScalarId, S
 }
 
 /// The words of the scalars of one block, and the operations so far.
+#[derive(Default)]
 pub struct Lowering {
     first: Vec<Slot>,
     wide: Vec<bool>,
@@ -429,8 +430,20 @@ pub struct Lowering {
 impl Lowering {
     /// `None`: the block has more words than a `Slot` counts.
     pub fn new(graph: &Graph) -> Option<Self> {
-        let mut first: Vec<Slot> = Vec::with_capacity(graph.scalars.len());
-        let mut wide = Vec::with_capacity(graph.scalars.len());
+        let mut lowering = Self::default();
+        lowering.reset(graph)?;
+        Some(lowering)
+    }
+
+    /// Start the block of `graph`, with the memory of the buffers of the
+    /// block before it: a lowering that a CPU keeps makes no heap call for
+    /// them once they have grown (3e DESIGN.md J11). `None`: the block has
+    /// more words than a `Slot` counts.
+    pub fn reset(&mut self, graph: &Graph) -> Option<()> {
+        let first = &mut self.first;
+        let wide = &mut self.wide;
+        first.clear();
+        wide.clear();
         // The word 0 is the operand of an operation that has none.
         let mut words = 1usize;
         for scalar in &graph.scalars {
@@ -455,14 +468,12 @@ impl Lowering {
             words += if is { 2 } else { 1 };
         }
         Slot::try_from(words).ok()?;
-        Some(Self {
-            first,
-            wide,
-            frame: vec![0; words],
-            ops: Vec::new(),
-            generics: Vec::new(),
-            literals: HashMap::default(),
-        })
+        self.frame.clear();
+        self.frame.resize(words, 0);
+        self.ops.clear();
+        self.generics.clear();
+        self.literals.clear();
+        Some(())
     }
 
     /// The words of the scalar `id`.

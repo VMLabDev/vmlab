@@ -419,6 +419,56 @@ a pipe and never stored (it would be 5 to 8 TB). On a difference the follower
 keeps the last records. This is a run by hand and for the nightly, not for
 the merge bar.
 
+### O4w. Windows of a boot (card C13b)
+
+O4 from the reset to agent ready needs the disk, the virtio devices and the
+agent on both sides, with the leader leading their completions, and about
+9.4 hours of the leader for the 18e9 instructions of a Debian boot (3e
+J8g). The form that card C13b built and ran instead compares windows of a
+real boot, and ends in under two hours:
+
+1. Our machine boots the template to agent ready at one vCPU, with
+   `VMLAB_HV_A64_WINDOWS=<dir>,<first>,<every>,<count>`. vCPU 0 writes the
+   state of its CPU (`oracle::window::Start`: X0 to X30, SP, PC, PSTATE, V0
+   to V31, FPSR, FPCR, every register of `oracle::compared` and the virtual
+   count) and the RAM of the machine at the end of a slice after `<first>`
+   instructions and then every `<every>`. The guest stands still while it
+   does (0.7 s for 2 GiB).
+2. For each window (`just tcg-a64-window-lockstep <dir> <ram_mib>`), QEMU
+   starts as `virt,virtualization=on` at EL2 from a flash image that our
+   side writes: a prelude that copies the first MiB of RAM into place (QEMU
+   puts its device tree there), turns off the traps of EL2, sets VPIDR and
+   VMPIDR, sets CNTVOFF_EL2 so that the virtual count is ours, writes every
+   register of EL1 and EL0, and leaves with `ERET`. The rest of the RAM is
+   loaded as a file. Our CPU (the CPU of the lockstep, `QEMU_CORTEX_A53`,
+   with the JIT on) starts from the same state over a flat copy of the RAM.
+3. The follower compares before every instruction as O4 does, with the same
+   adoptions: the counter, the timer status and the ID registers of the
+   allow-list. An instruction abort at a fetch has no record of its own in
+   the stream: our CPU steps into it.
+4. A window ends at its budget, at the first access outside RAM, at `WFI`,
+   at `HVC` or `SMC`, at an interrupt of the leader, or at a CPU difference.
+
+What it proves: the CPU on the instructions of the kernel and of user space
+in every phase of a boot to agent ready, from states that a real boot
+reached, with the MMU, exceptions to EL1 and back, page faults, context
+switches and the KPTI trampoline.
+
+What it does not prove:
+
+- **W1.** Interrupts: none comes in a window. When and how one is taken
+  stays with O4 from the reset (the firmware), kvm-unit-tests and the boots
+  of the templates.
+- **W2.** Devices and DMA: a window ends at the first device access. A
+  driver's code after a device access is reached only where a later window
+  starts in it.
+- **W3.** The instructions between two windows. The run of card C13b
+  compared 1.82e9 of the 17.9e9 instructions of the boot, one in ten.
+- **W4.** That our boot reached the state of the window as QEMU would have:
+  the state comes from our machine, so an earlier defect of ours that left a
+  consistent wrong state is not seen.
+- **W5.** Everything of U1 to U7.
+
 ### M4. Determinism (measured)
 
 Two QEMU runs of the same Debian boot were compared by a hash of (X0 to X30,

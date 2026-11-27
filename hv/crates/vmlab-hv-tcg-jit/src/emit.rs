@@ -67,7 +67,7 @@ use crate::tlb::{ADDEND, ENTRIES, ENTRY_BITS, TAG, WATCH};
 use crate::{
     BUDGET, CHAIN, CONTEXT_ACCESSES, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV,
     CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_THUNK,
-    CONTEXT_WRITES, Features, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
+    CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
     WATCHED,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Kind as GenericKind, Op, Place, Slot};
@@ -143,8 +143,9 @@ pub struct LazyCondition {
     pub code_value: u64,
     /// The word of the result: 0 or 1.
     pub result: Slot,
-    /// Each kind of record with its form, tried in order.
-    pub cases: Vec<(u64, FlagTest)>,
+    /// Each kind of record with its form, tried in order. The owner can
+    /// lend a table of its own, so that a block makes no heap call for it.
+    pub cases: std::borrow::Cow<'static, [(u64, FlagTest)]>,
 }
 
 /// The host operation whose flags a `FlagTest::Host` reads.
@@ -287,6 +288,10 @@ pub struct Chain {
     /// that the owner can compare the entry with its own lookup (a check
     /// for a bisect).
     pub verify: bool,
+    /// A miss of the jump cache calls the thunk with `JUMP` before it
+    /// leaves (card J10): the owner can give the code of the target, and
+    /// the run goes on. Not with `verify`.
+    pub serve: bool,
 }
 
 /// What the block makes of the PC of the state at its end.
@@ -365,6 +370,18 @@ const POOL: [Reg; 9] = [RBX, RBP, R12, RSI, RDI, R8, R9, R10, R11];
 /// The registers of the pool that a call does not keep.
 const CALLER_SAVED: [Reg; 6] = [RSI, RDI, R8, R9, R10, R11];
 
+/// The registers of the pool that a call keeps by pushing them.
+struct Saved {
+    regs: [Reg; CALLER_SAVED.len()],
+    len: usize,
+}
+
+impl Saved {
+    fn as_slice(&self) -> &[Reg] {
+        &self.regs[..self.len]
+    }
+}
+
 /// Where the value of a word is when it is in no register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Home {
@@ -393,17 +410,21 @@ enum Val {
     Imm(u64),
 }
 
-/// The position of the exit of the block in the order of uses.
-fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, Vec<Slot>)> {
-    let place = |place: Place| -> Vec<Slot> {
+/// The words that `op` reads, then those that it writes, pushed onto `out`:
+/// the index in `out` at which the writes start.
+fn uses_of(op: &Op, generics: &[Generic], shape: &Shape, out: &mut Vec<Slot>) -> Option<usize> {
+    fn place(out: &mut Vec<Slot>, place: Place) {
+        out.push(place.slot);
         if place.wide {
-            vec![place.slot, place.slot + 1]
-        } else {
-            vec![place.slot]
+            out.push(place.slot + 1);
         }
+    }
+    let leave = |out: &mut Vec<Slot>, index: u64| -> Option<()> {
+        out.extend_from_slice(shape.leaves.get(index as usize)?);
+        Some(())
     };
-    let leave = |index: u64| -> Option<Vec<Slot>> { shape.leaves.get(index as usize).cloned() };
-    Some(match op.code {
+    let writes;
+    match op.code {
         Code::Add
         | Code::Sub
         | Code::Mul
@@ -417,7 +438,11 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
         | Code::NotEqual
         | Code::Less
         | Code::LessEqual
-        | Code::Concat => (vec![op.a, op.b], vec![op.dst]),
+        | Code::Concat => {
+            out.extend_from_slice(&[op.a, op.b]);
+            writes = out.len();
+            out.push(op.dst);
+        }
         Code::IsZero
         | Code::BitNot
         | Code::Negate
@@ -427,39 +452,58 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
         | Code::ReverseBits
         | Code::ReverseBytes
         | Code::PopCount
-        | Code::Slice => (vec![op.a], vec![op.dst]),
-        Code::Select => (vec![op.a, op.b, Slot::try_from(op.imm).ok()?], vec![op.dst]),
-        Code::Widen => (vec![op.a], vec![op.dst, op.dst.checked_add(1)?]),
+        | Code::Slice => {
+            out.push(op.a);
+            writes = out.len();
+            out.push(op.dst);
+        }
+        Code::Select => {
+            out.extend_from_slice(&[op.a, op.b, Slot::try_from(op.imm).ok()?]);
+            writes = out.len();
+            out.push(op.dst);
+        }
+        Code::Widen => {
+            let high = op.dst.checked_add(1)?;
+            out.push(op.a);
+            writes = out.len();
+            out.extend_from_slice(&[op.dst, high]);
+        }
         Code::Generic => {
             let generic = generics.get(op.imm as usize)?;
-            let reads = generic.args().into_iter().flat_map(place).collect();
-            (reads, place(generic.dst()))
+            for arg in generic.args() {
+                place(out, arg);
+            }
+            writes = out.len();
+            place(out, generic.dst());
         }
         Code::Guard => {
-            let mut reads = vec![op.a];
-            reads.extend(leave(op.imm)?);
-            (reads, Vec::new())
+            out.push(op.a);
+            leave(out, op.imm)?;
+            writes = out.len();
         }
         Code::Load1 | Code::Load2 | Code::Load4 | Code::Load8 => {
-            let mut reads = vec![op.a];
-            reads.extend(leave(op.imm)?);
-            (reads, vec![op.dst])
+            out.push(op.a);
+            leave(out, op.imm)?;
+            writes = out.len();
+            out.push(op.dst);
         }
         Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 => {
-            let mut reads = vec![op.a, op.b];
-            reads.extend(leave(op.imm)?);
-            (reads, Vec::new())
+            out.extend_from_slice(&[op.a, op.b]);
+            leave(out, op.imm)?;
+            writes = out.len();
         }
         // Two words from `dst` on, and from `b` (low) and `dst` (high).
         Code::LoadPair => {
-            let mut reads = vec![op.a];
-            reads.extend(leave(op.imm)?);
-            (reads, vec![op.dst, op.dst.checked_add(1)?])
+            let high = op.dst.checked_add(1)?;
+            out.push(op.a);
+            leave(out, op.imm)?;
+            writes = out.len();
+            out.extend_from_slice(&[op.dst, high]);
         }
         Code::StorePair => {
-            let mut reads = vec![op.a, op.b, op.dst];
-            reads.extend(leave(op.imm)?);
-            (reads, Vec::new())
+            out.extend_from_slice(&[op.a, op.b, op.dst]);
+            leave(out, op.imm)?;
+            writes = out.len();
         }
         Code::Access | Code::Call => {
             let effect = if op.code == Code::Access {
@@ -467,13 +511,15 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
             } else {
                 shape.calls.get(op.imm as usize)?
             };
-            let mut reads = effect.reads.clone();
+            out.extend_from_slice(&effect.reads);
             if let Some(index) = effect.leave {
-                reads.extend(leave(index.into())?);
+                leave(out, index.into())?;
             }
-            (reads, effect.writes.clone())
+            writes = out.len();
+            out.extend_from_slice(&effect.writes);
         }
-    })
+    }
+    Some(writes)
 }
 
 /// An operand of a comparison that becomes host flags: a word, or a
@@ -517,9 +563,9 @@ fn fusions(
     leaves: &[Vec<Slot>],
     homes: &[Home],
     uses: &mut [Vec<u32>],
-) -> (Vec<Option<Fusion>>, Vec<bool>) {
-    let mut fused = vec![None; ops.len()];
-    let mut skip = vec![false; ops.len()];
+    fused: &mut [Option<Fusion>],
+    skip: &mut [bool],
+) {
     for i in 0..ops.len().saturating_sub(1) {
         let op = ops[i];
         let cond = match op.code {
@@ -562,7 +608,10 @@ fn fusions(
             wide: true,
             test: false,
         };
-        let mut group = vec![i];
+        // The comparison and the operations before it that it takes in:
+        // at most two more.
+        let mut group = [i; 3];
+        let mut grouped = 1;
         let with_zero = match op.code {
             Code::IsZero => true,
             Code::Equal | Code::NotEqual => homes[usize::from(op.b)] == Home::Const(0),
@@ -576,7 +625,8 @@ fn fusions(
                 wide,
                 test: true,
             };
-            group.push(at);
+            group[1] = at;
+            grouped = 2;
         } else if matches!(op.code, Code::Less | Code::LessEqual)
             && let Some((x, y, wide, flips)) = signed(ops, i, homes, uses)
         {
@@ -591,8 +641,12 @@ fn fusions(
                 wide,
                 test: false,
             };
-            group.extend(flips);
+            for at in flips.into_iter().flatten() {
+                group[grouped] = at;
+                grouped += 1;
+            }
         }
+        let group = &group[..grouped];
         for word in fusion.words() {
             let list = &mut uses[usize::from(word)];
             list.retain(|at| !group.contains(&(*at as usize)));
@@ -601,13 +655,12 @@ fn fusions(
                 list.insert(at, j as u32);
             }
         }
-        for at in group {
+        for &at in group {
             skip[at] = true;
             uses[usize::from(ops[at].dst)].clear();
         }
         fused[j] = Some(fusion);
     }
-    (fused, skip)
 }
 
 /// A comparison with zero at `i` of the result of an `And` just before it
@@ -639,7 +692,7 @@ fn signed(
     i: usize,
     homes: &[Home],
     uses: &[Vec<u32>],
-) -> Option<(Operand, Operand, bool, Vec<usize>)> {
+) -> Option<(Operand, Operand, bool, [Option<usize>; 2])> {
     let op = ops[i];
     let constant = |word: Slot| match homes[usize::from(word)] {
         Home::Const(value) => Some(value),
@@ -683,14 +736,12 @@ fn signed(
     };
     let left = operand(op.a, x)?;
     let right = operand(op.b, y)?;
-    let flips: Vec<usize> = [x, y].into_iter().flatten().map(|(_, _, at)| at).collect();
+    let flips = [x.map(|(_, _, at)| at), y.map(|(_, _, at)| at)];
     // A value read later than its place must not be written in between.
-    let written: Vec<Slot> = (flips.iter().copied().min()?..=i)
-        .map(|at| ops[at].dst)
-        .collect();
+    let first = flips.into_iter().flatten().min()?;
     for operand in [left, right] {
         if let Operand::Word(word) = operand
-            && written.contains(&word)
+            && (first..=i).any(|at| ops[at].dst == word)
         {
             return None;
         }
@@ -714,6 +765,10 @@ struct Emitter<'a> {
     shape: &'a Shape<'a>,
     /// The lazy conditions emitted inline.
     lazy: u64,
+    /// The words that an operation reads with those of the comparison that
+    /// it takes in (H8a), and the exits that chain: buffers of `Scratch`.
+    all: Vec<Slot>,
+    sites: Vec<(Label, Label)>,
 }
 
 impl Emitter<'_> {
@@ -932,12 +987,18 @@ impl Emitter<'_> {
 
     /// The registers of the pool that hold a word and that a call does not
     /// keep.
-    fn live_caller_saved(&self) -> Vec<Reg> {
-        CALLER_SAVED
-            .iter()
-            .copied()
-            .filter(|reg| self.owner[usize::from(reg.0)].is_some())
-            .collect()
+    fn live_caller_saved(&self) -> Saved {
+        let mut saved = Saved {
+            regs: [RAX; CALLER_SAVED.len()],
+            len: 0,
+        };
+        for reg in CALLER_SAVED {
+            if self.owner[usize::from(reg.0)].is_some() {
+                saved.regs[saved.len] = reg;
+                saved.len += 1;
+            }
+        }
+        saved
     }
 
     /// Call the thunk for the operation `index`, keeping `saved`. RAX holds
@@ -1036,9 +1097,9 @@ impl Emitter<'_> {
         }
         match direct {
             Some((function, argument)) => {
-                Self::call_function(&mut self.asm, Some(function), argument, &saved);
+                Self::call_function(&mut self.asm, Some(function), argument, saved.as_slice());
             }
-            None => Self::call_thunk(&mut self.asm, index as u64, &saved),
+            None => Self::call_thunk(&mut self.asm, index as u64, saved.as_slice()),
         }
         self.asm.test(RAX, RAX);
         self.asm.jcc_absolute(Cond::Ne, self.exit);
@@ -1141,7 +1202,7 @@ impl Emitter<'_> {
             },
             kind => {
                 let kind = self.rm(kind, RCX);
-                for (value, test) in &lazy.cases {
+                for (value, test) in lazy.cases.iter() {
                     let next = self.asm.label();
                     match i32::try_from(*value as i64) {
                         Ok(value) => self.asm.alu_imm(Alu::Cmp, kind, value),
@@ -1169,7 +1230,7 @@ impl Emitter<'_> {
             Self::home_code(&mut self.asm, *word, w);
         }
         let saved = self.live_caller_saved();
-        Self::call_thunk(&mut self.asm, index as u64, &saved);
+        Self::call_thunk(&mut self.asm, index as u64, saved.as_slice());
         self.asm.test(RAX, RAX);
         self.asm.jcc_absolute(Cond::Ne, self.exit);
         self.asm.mov(RAX, Self::frame(lazy.result));
@@ -1185,7 +1246,9 @@ impl Emitter<'_> {
         let at = index as u32;
         let stub = self.asm.label();
         let back = self.asm.label();
-        let mut all = reads.to_vec();
+        let mut all = std::mem::take(&mut self.all);
+        all.clear();
+        all.extend_from_slice(reads);
         if let Some(fusion) = fusion {
             // The guard reads the flags of the comparison before it (H8a).
             all.extend(fusion.words());
@@ -1223,12 +1286,13 @@ impl Emitter<'_> {
                 .store_imm(Self::frame(op.a), i32::from(op.aux == 0));
         }
         let saved = self.live_caller_saved();
-        Self::call_thunk(&mut self.asm, index as u64, &saved);
+        Self::call_thunk(&mut self.asm, index as u64, saved.as_slice());
         self.asm.test(RAX, RAX);
         self.asm.jcc_absolute(Cond::Ne, self.exit);
         self.asm.jmp(back);
         self.asm.cold(false);
         self.release(&all, at);
+        self.all = all;
     }
 
     /// The test of a guard on the word of its condition.
@@ -1358,10 +1422,13 @@ impl Emitter<'_> {
     /// moves, then `cmp` and `cmov` (H8a).
     fn fused_select(&mut self, index: usize, op: &Op, reads: &[Slot], fusion: Fusion) {
         let at = index as u32;
-        let mut all = reads.to_vec();
+        let mut all = std::mem::take(&mut self.all);
+        all.clear();
+        all.extend_from_slice(reads);
         all.extend(fusion.words());
         if self.next_use(op.dst, at).is_none() {
             self.release(&all, at);
+            self.all = all;
             self.unbind(op.dst);
             self.words[usize::from(op.dst)].home = Home::Frame;
             return;
@@ -1384,6 +1451,7 @@ impl Emitter<'_> {
             }
         }
         self.define(op.dst, &all, at);
+        self.all = all;
     }
 
     /// The words that a stub puts into the frame: those of `reads`, from
@@ -1400,7 +1468,7 @@ impl Emitter<'_> {
     /// the block.
     fn thunk(&mut self, index: usize, request: u64, leaves: bool) {
         let saved = self.live_caller_saved();
-        Self::call_thunk(&mut self.asm, index as u64 | request, &saved);
+        Self::call_thunk(&mut self.asm, index as u64 | request, saved.as_slice());
         if leaves {
             self.asm.test(RAX, RAX);
             self.asm.jcc_absolute(Cond::Ne, self.exit);
@@ -1446,11 +1514,8 @@ impl Emitter<'_> {
         }
         self.asm.alu(Alu::Add, RAX, Rm::Mem(RCX, ADDEND));
         if let Some(value) = value {
-            let parts = match high {
-                Some(high) => vec![(0, value), (8, high)],
-                None => vec![(0, value)],
-            };
-            for (offset, part) in parts {
+            let parts = [Some((0, value)), high.map(|high| (8, high))];
+            for (offset, part) in parts.into_iter().flatten() {
                 let source = match part {
                     Val::Reg(reg) => reg,
                     Val::Mem(memory) => {
@@ -1837,11 +1902,8 @@ impl Emitter<'_> {
     /// one in RCX, into the words of `dst`.
     fn define_two(&mut self, dst: Place, reads: &[Slot], at: u32) {
         self.release(reads, at);
-        let mut halves = vec![(dst.slot, RAX)];
-        if dst.wide {
-            halves.push((dst.slot + 1, RCX));
-        }
-        for (word, source) in halves {
+        let halves = [Some((dst.slot, RAX)), dst.wide.then(|| (dst.slot + 1, RCX))];
+        for (word, source) in halves.into_iter().flatten() {
             self.unbind(word);
             self.words[usize::from(word)].home = Home::Frame;
             if self.next_use(word, at).is_none() {
@@ -2101,9 +2163,10 @@ impl Emitter<'_> {
     }
 
     /// The end of the block: the outputs to the state, the PC, then the
-    /// exit. The exits that chain are returned: the label of each jump and
-    /// of its stub.
-    fn outputs(&mut self) -> Vec<(Label, Label)> {
+    /// exit. The exits that chain go into `sites`: the label of each jump
+    /// and of its stub. `slots` and `spans` are the words of each operation.
+    fn outputs(&mut self, slots: &[Slot], spans: &[Span]) {
+        self.sites.clear();
         // The word of the next PC goes into RCX before an output can write
         // over the slot that it is still in.
         let next = self.shape.next;
@@ -2119,7 +2182,7 @@ impl Emitter<'_> {
         let Some(next) = next else {
             self.asm.xor32(RAX, RAX);
             self.asm.jmp_absolute(self.exit);
-            return Vec::new();
+            return;
         };
         let pc = i32::try_from(u64::from(next.pc) * 16).unwrap_or(i32::MAX);
         let slot = Rm::Mem(R15, pc);
@@ -2150,18 +2213,21 @@ impl Emitter<'_> {
             _ => {
                 self.asm.xor32(RAX, RAX);
                 self.asm.jmp_absolute(self.exit);
-                return Vec::new();
+                return;
             }
         };
         // H5: a constant distance to a target in the page of the block is a
         // jump that its owner links. RCX holds the distance.
-        let mut sites = Vec::new();
         if let NextPc::Relative(place) = next.kind
             && chain.sites
         {
-            for distance in self.candidates(place.slot) {
+            for distance in self
+                .candidates(place.slot, slots, spans)
+                .into_iter()
+                .flatten()
+            {
                 let target = i64::from(chain.page_offset) + distance as i64;
-                if !(0..4096).contains(&target) || sites.len() == SITES {
+                if !(0..4096).contains(&target) || self.sites.len() == SITES {
                     continue;
                 }
                 let Ok(immediate) = i32::try_from(distance as i64) else {
@@ -2178,16 +2244,16 @@ impl Emitter<'_> {
                 self.asm.bind(other);
                 self.asm.cold(true);
                 self.asm.bind(stub);
-                self.asm.mov_imm(RAX, CHAIN + sites.len() as u64);
+                self.asm.mov_imm(RAX, CHAIN + self.sites.len() as u64);
                 self.asm.jmp_absolute(self.exit);
                 self.asm.cold(false);
-                sites.push((jump, stub));
+                self.sites.push((jump, stub));
             }
         }
         if !chain.jumps {
             self.asm.xor32(RAX, RAX);
             self.asm.jmp_absolute(self.exit);
-            return sites;
+            return;
         }
         // H6: the jump cache, by the PC in RAX.
         let miss = self.asm.label();
@@ -2213,53 +2279,61 @@ impl Emitter<'_> {
         }
         self.asm.cold(true);
         self.asm.bind(miss);
+        if chain.serve && !chain.verify {
+            // Card J10: the owner looks the target up without leaving. Every
+            // output is written, and no host register but those of the
+            // context holds anything, so the call keeps none.
+            let leave = self.asm.label();
+            Self::call_thunk(&mut self.asm, JUMP, &[]);
+            self.asm.test(RAX, RAX);
+            self.asm.jcc(Cond::E, leave);
+            self.asm.jmp_reg(RAX);
+            self.asm.bind(leave);
+        }
         self.asm.mov_imm(RAX, LOOKUP);
         self.asm.jmp_absolute(self.exit);
         self.asm.cold(false);
-        sites
     }
 
     /// The constant values that the word `slot` can have at the end of
     /// the block: a constant, or a `Select` of two constants (a
-    /// conditional branch).
-    fn candidates(&self, slot: Slot) -> Vec<u64> {
+    /// conditional branch). `slots` and `spans` are the words that each
+    /// operation reads and writes.
+    fn candidates(&self, slot: Slot, slots: &[Slot], spans: &[Span]) -> [Option<u64>; 2] {
         let constant = |word: Slot| match self.initial.get(usize::from(word)) {
             Some(Home::Const(value)) => Some(*value),
             _ => None,
         };
         if let Some(value) = constant(slot) {
-            return vec![value];
+            return [Some(value), None];
         }
-        let Some(op) = self.shape.ops.iter().rev().find(|op| {
-            uses_of(op, self.shape.generics, self.shape)
-                .is_some_and(|(_, writes)| writes.contains(&slot))
-        }) else {
-            return Vec::new();
+        let Some((op, _)) = self
+            .shape
+            .ops
+            .iter()
+            .zip(spans)
+            .rev()
+            .find(|(_, span)| span.writes(slots).contains(&slot))
+        else {
+            return [None, None];
         };
         if op.code != Code::Select || op.dst != slot {
-            return Vec::new();
+            return [None, None];
         }
-        let mut values = Vec::new();
-        for word in [op.a, op.b] {
-            if let Some(value) = constant(word)
-                && !values.contains(&value)
-            {
-                values.push(value);
-            }
-        }
-        values
+        let a = constant(op.a);
+        let b = constant(op.b).filter(|value| a != Some(*value));
+        [a, b]
     }
 
     /// The outputs to the state.
     fn write_outputs(&mut self) {
         let outputs = self.shape.outputs;
-        let targets: Vec<(i32, i32)> = outputs
-            .iter()
-            .map(|(register, _)| {
+        let targets = || {
+            outputs.iter().map(|(register, _)| {
                 let start = *register as i32 * 16;
                 (start, start + 16)
             })
-            .collect();
+        };
         // An input that is still in its slot is read before an output
         // writes that slot, unless the output writes it to itself.
         for (register, place) in outputs {
@@ -2270,9 +2344,7 @@ impl Emitter<'_> {
                 let w = self.words[usize::from(word)];
                 if let (None, Home::Slot(offset)) = (w.reg, w.home)
                     && offset != *register as i32 * 16 + half
-                    && targets
-                        .iter()
-                        .any(|(start, end)| (*start..*end).contains(&offset))
+                    && targets().any(|(start, end)| (start..end).contains(&offset))
                 {
                     self.materialize(word);
                 }
@@ -2324,18 +2396,64 @@ fn inline_access(op: &Op, memory: Memory) -> Option<(u8, bool)> {
 /// run changes. K3 fills the written words with a pattern before a replay,
 /// so that a word that the code reads before it writes it shows.
 pub fn written(shape: &Shape) -> Result<Vec<bool>, Refused> {
-    Ok(analyse(shape)?.written)
+    let mut scratch = Scratch::default();
+    analyse(shape, &mut scratch)?;
+    Ok(scratch.written)
 }
 
-/// What `emit` knows of a block before its pass.
-struct Analysis {
+/// The words that one operation reads and then those that it writes, as a
+/// range of `Scratch::slots`.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start: u32,
+    writes: u32,
+    end: u32,
+}
+
+impl Span {
+    fn reads<'s>(&self, slots: &'s [Slot]) -> &'s [Slot] {
+        &slots[self.start as usize..self.writes as usize]
+    }
+
+    fn writes<'s>(&self, slots: &'s [Slot]) -> &'s [Slot] {
+        &slots[self.writes as usize..self.end as usize]
+    }
+}
+
+/// The buffers of the emitter, which the JIT keeps from one block to the
+/// next (3e DESIGN.md J11): once they have grown to the size of the blocks
+/// that it compiles, a block makes no heap call in the emitter.
+#[derive(Default)]
+pub struct Scratch {
+    /// The code of the last block, and the labels of its jumps that chain
+    /// and of their stubs, in the order of their exit indices.
+    pub(crate) asm: Asm,
+    pub(crate) sites: Vec<(Label, Label)>,
+    /// The finished code of the last block.
+    pub(crate) code: Vec<u8>,
+    /// The positions at which each word is read, in order. Only the first
+    /// entries, one for each word of the block, are of the block.
     uses: Vec<Vec<u32>>,
+    /// The words that each operation reads and writes.
+    slots: Vec<Slot>,
+    spans: Vec<Span>,
+    /// The words that something writes, and where each word is at the head
+    /// of the block.
     written: Vec<bool>,
-    effects: Vec<(Vec<Slot>, Vec<Slot>)>,
     homes: Vec<Home>,
+    words: Vec<Word>,
+    cursor: Vec<usize>,
+    /// For each operation, the comparison that it reads as flags, and
+    /// whether the emitter skips it (H8a).
+    fused: Vec<Option<Fusion>>,
+    skip: Vec<bool>,
+    all: Vec<Slot>,
 }
 
-fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
+/// What `emit` knows of a block before its pass, into the buffers of
+/// `scratch`: the uses of every word, the words of every operation, the
+/// words that something writes, and the home of every word.
+fn analyse(shape: &Shape, scratch: &mut Scratch) -> Result<(), Refused> {
     let words = shape.frame.len();
     if words > i32::MAX as usize / 8 {
         return Err(Refused::Size);
@@ -2343,33 +2461,51 @@ fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
     let in_frame = |slot: Slot| usize::from(slot) < words;
     let end = u32::try_from(shape.ops.len()).map_err(|_| Refused::Size)?;
     // The uses of every word, and the words that something writes.
-    let mut uses: Vec<Vec<u32>> = vec![Vec::new(); words];
-    let mut written = vec![false; words];
-    let mut effects = Vec::with_capacity(shape.ops.len());
+    if scratch.uses.len() < words {
+        scratch.uses.resize_with(words, Vec::new);
+    }
+    let uses = &mut scratch.uses[..words];
+    for list in uses.iter_mut() {
+        list.clear();
+    }
+    let written = &mut scratch.written;
+    written.clear();
+    written.resize(words, false);
+    let slots = &mut scratch.slots;
+    slots.clear();
+    scratch.spans.clear();
     for (index, op) in shape.ops.iter().enumerate() {
-        let (reads, writes) = uses_of(op, shape.generics, shape).ok_or(Refused::Malformed)?;
-        if !reads.iter().chain(&writes).all(|slot| in_frame(*slot)) {
+        let start = slots.len();
+        let writes = uses_of(op, shape.generics, shape, slots).ok_or(Refused::Malformed)?;
+        let span = Span {
+            start: start as u32,
+            writes: writes as u32,
+            end: slots.len() as u32,
+        };
+        if !slots[start..].iter().all(|slot| in_frame(*slot)) {
             return Err(Refused::Malformed);
         }
-        for slot in &reads {
+        for slot in span.reads(slots) {
             let list = &mut uses[usize::from(*slot)];
             if list.last() != Some(&(index as u32)) {
                 list.push(index as u32);
             }
         }
-        for slot in &writes {
+        for slot in span.writes(slots) {
             written[usize::from(*slot)] = true;
         }
-        effects.push((reads, writes));
+        scratch.spans.push(span);
     }
-    let mut homes = vec![Home::Frame; words];
+    let homes = &mut scratch.homes;
+    homes.clear();
+    homes.resize(words, Home::Frame);
     for (place, register) in shape.inputs {
         let offset = i32::try_from(*register as usize * 16).map_err(|_| Refused::Size)?;
-        let mut parts = vec![(place.slot, offset)];
-        if place.wide {
-            parts.push((place.slot + 1, offset + 8));
-        }
-        for (slot, offset) in parts {
+        let parts = [
+            Some((place.slot, offset)),
+            place.wide.then(|| (place.slot + 1, offset + 8)),
+        ];
+        for (slot, offset) in parts.into_iter().flatten() {
             if !in_frame(slot) {
                 return Err(Refused::Malformed);
             }
@@ -2381,11 +2517,8 @@ fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
         if *register as usize * 16 + 16 > i32::MAX as usize {
             return Err(Refused::Size);
         }
-        let mut slots = vec![place.slot];
-        if place.wide {
-            slots.push(place.slot + 1);
-        }
-        for slot in slots {
+        let slots = [Some(place.slot), place.wide.then(|| place.slot + 1)];
+        for slot in slots.into_iter().flatten() {
             if !in_frame(slot) {
                 return Err(Refused::Malformed);
             }
@@ -2408,131 +2541,170 @@ fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
             *home = Home::Const(shape.frame[slot]);
         }
     }
-    Ok(Analysis {
-        uses,
-        written,
-        effects,
-        homes,
-    })
+    Ok(())
 }
 
-/// The code of a block, the labels of the jumps that chain and of their
-/// stubs, the count of comparisons that became host flags, and the count of
-/// lazy conditions that are inline.
-pub type Emitted = (Asm, Vec<(Label, Label)>, u64, u64);
-
-/// Emit the code of `shape`. `exit` is the address of the common exit of
-/// the trampoline. `host_flags` turns on the forms of H8. With the code, the
-/// labels of the jumps that chain and of their stubs, in the order of their
-/// exit indices, the count of comparisons that became host flags, and the
-/// count of lazy conditions that are inline.
+/// Emit the code of `shape` into `scratch.asm`, with the labels of the
+/// jumps that chain and of their stubs in `scratch.sites`, in the order of
+/// their exit indices. `exit` is the address of the common exit of the
+/// trampoline. `host_flags` turns on the forms of H8. The count of
+/// comparisons that became host flags, and the count of lazy conditions
+/// that are inline.
 pub fn emit(
     shape: &Shape,
     exit: u64,
     features: Features,
     defect: Defect,
     host_flags: bool,
-) -> Result<Emitted, Refused> {
-    let Analysis {
-        mut uses,
-        effects,
-        homes,
-        ..
-    } = analyse(shape)?;
+    scratch: &mut Scratch,
+) -> Result<(u64, u64), Refused> {
+    analyse(shape, scratch)?;
     let words = shape.frame.len();
-    let (fused, skip) = if host_flags {
-        fusions(shape.ops, shape.leaves, &homes, &mut uses)
-    } else {
-        (vec![None; shape.ops.len()], vec![false; shape.ops.len()])
-    };
+    let count = shape.ops.len();
+    scratch.fused.clear();
+    scratch.fused.resize(count, None);
+    scratch.skip.clear();
+    scratch.skip.resize(count, false);
+    if host_flags {
+        fusions(
+            shape.ops,
+            shape.leaves,
+            &scratch.homes,
+            &mut scratch.uses[..words],
+            &mut scratch.fused,
+            &mut scratch.skip,
+        );
+    }
+    let mut asm = std::mem::take(&mut scratch.asm);
+    asm.clear();
+    let initial = std::mem::take(&mut scratch.homes);
+    let mut states = std::mem::take(&mut scratch.words);
+    states.clear();
+    states.extend(initial.iter().map(|&home| Word {
+        home,
+        reg: None,
+        dirty: false,
+    }));
+    let mut cursor = std::mem::take(&mut scratch.cursor);
+    cursor.clear();
+    cursor.resize(words, 0);
     let mut emitter = Emitter {
-        asm: Asm::new(),
-        initial: homes.clone(),
-        words: homes
-            .into_iter()
-            .map(|home| Word {
-                home,
-                reg: None,
-                dirty: false,
-            })
-            .collect(),
+        asm,
+        initial,
+        words: states,
         owner: [None; 16],
-        uses,
-        cursor: vec![0; words],
+        uses: std::mem::take(&mut scratch.uses),
+        cursor,
         pinned: 0,
         exit,
         features,
         defect,
         shape,
         lazy: 0,
+        all: std::mem::take(&mut scratch.all),
+        sites: std::mem::take(&mut scratch.sites),
     };
-    // H5: the head of a block that chains loads its own frame and names
-    // itself, because a jump from another block reaches it.
-    if let Some(chain) = shape.chain {
-        emitter.asm.mov_imm(R14, chain.frame);
-        emitter.asm.mov_imm(RAX, chain.tag);
-        emitter.asm.store(Rm::Mem(R13, CONTEXT_BLOCK), RAX);
-    }
-    // H10: the head of the block takes its instructions from the budget,
-    // and leaves when the budget is spent.
-    let spent = emitter.asm.label();
-    let count = i32::try_from(shape.instructions).map_err(|_| Refused::Size)?;
-    emitter
-        .asm
-        .alu_imm(Alu::Sub, Rm::Mem(R13, CONTEXT_BUDGET), count);
-    emitter.asm.jcc(Cond::S, spent);
-    emitter.asm.cold(true);
-    emitter.asm.bind(spent);
-    emitter
-        .asm
-        .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_BUDGET), count);
-    emitter.asm.mov_imm(RAX, BUDGET);
-    emitter.asm.jmp_absolute(exit);
-    emitter.asm.cold(false);
-    // H7: the block counts its inlined loads and stores, for the hit rate.
-    let inlined = shape
-        .ops
+    let result = emitter.body(
+        host_flags,
+        &scratch.slots,
+        &scratch.spans,
+        &scratch.fused,
+        &scratch.skip,
+    );
+    let fused = scratch
+        .fused
         .iter()
-        .filter(|op| inline_access(op, shape.memory).is_some())
-        .count();
-    if inlined != 0 {
-        let inlined = i32::try_from(inlined).map_err(|_| Refused::Size)?;
-        emitter
-            .asm
-            .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_ACCESSES), inlined);
-    }
-    for (index, op) in shape.ops.iter().enumerate() {
-        if skip[index] {
-            continue;
+        .filter(|fusion| fusion.is_some())
+        .count() as u64;
+    let lazy = emitter.lazy;
+    scratch.asm = emitter.asm;
+    scratch.homes = emitter.initial;
+    scratch.words = emitter.words;
+    scratch.uses = emitter.uses;
+    scratch.cursor = emitter.cursor;
+    scratch.all = emitter.all;
+    scratch.sites = emitter.sites;
+    result.map(|()| (fused, lazy))
+}
+
+impl Emitter<'_> {
+    /// The pass over the operations of the block, after its analysis, and
+    /// its end.
+    fn body(
+        &mut self,
+        host_flags: bool,
+        slots: &[Slot],
+        spans: &[Span],
+        fused: &[Option<Fusion>],
+        skip: &[bool],
+    ) -> Result<(), Refused> {
+        let shape = self.shape;
+        let exit = self.exit;
+        // H5: the head of a block that chains loads its own frame and names
+        // itself, because a jump from another block reaches it.
+        if let Some(chain) = shape.chain {
+            self.asm.mov_imm(R14, chain.frame);
+            self.asm.mov_imm(RAX, chain.tag);
+            self.asm.store(Rm::Mem(R13, CONTEXT_BLOCK), RAX);
         }
-        let (reads, writes) = &effects[index];
-        let lazy = match op.code {
-            Code::Call => shape
-                .calls
-                .get(op.imm as usize)
-                .and_then(|call| call.condition.as_ref())
-                .filter(|lazy| host_flags && emitter.lazy_fits(lazy, reads, writes)),
-            _ => None,
-        };
-        if let Some((bytes, store)) = inline_access(op, shape.memory) {
-            emitter.access(index, op, reads, bytes, store);
-        } else if let Some(lazy) = lazy {
-            emitter.lazy_condition(index, lazy, reads);
-        } else if op.code == Code::Generic {
-            if !emitter.generic(index, op, reads) {
-                emitter.effect(index, reads, writes);
+        // H10: the head of the block takes its instructions from the budget,
+        // and leaves when the budget is spent.
+        let spent = self.asm.label();
+        let count = i32::try_from(shape.instructions).map_err(|_| Refused::Size)?;
+        self.asm
+            .alu_imm(Alu::Sub, Rm::Mem(R13, CONTEXT_BUDGET), count);
+        self.asm.jcc(Cond::S, spent);
+        self.asm.cold(true);
+        self.asm.bind(spent);
+        self.asm
+            .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_BUDGET), count);
+        self.asm.mov_imm(RAX, BUDGET);
+        self.asm.jmp_absolute(exit);
+        self.asm.cold(false);
+        // H7: the block counts its inlined loads and stores, for the hit rate.
+        let inlined = shape
+            .ops
+            .iter()
+            .filter(|op| inline_access(op, shape.memory).is_some())
+            .count();
+        if inlined != 0 {
+            let inlined = i32::try_from(inlined).map_err(|_| Refused::Size)?;
+            self.asm
+                .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_ACCESSES), inlined);
+        }
+        for (index, op) in shape.ops.iter().enumerate() {
+            if skip[index] {
+                continue;
             }
-        } else if op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard {
-            emitter.effect(index, reads, writes);
-        } else if op.code == Code::Guard {
-            emitter.guard(index, op, reads, fused[index]);
-        } else if let (Code::Select, Some(fusion)) = (op.code, fused[index]) {
-            emitter.fused_select(index, op, reads, fusion);
-        } else {
-            emitter.pure(index, op, reads)?;
+            let span = spans[index];
+            let (reads, writes) = (span.reads(slots), span.writes(slots));
+            let lazy = match op.code {
+                Code::Call => shape
+                    .calls
+                    .get(op.imm as usize)
+                    .and_then(|call| call.condition.as_ref())
+                    .filter(|lazy| host_flags && self.lazy_fits(lazy, reads, writes)),
+                _ => None,
+            };
+            if let Some((bytes, store)) = inline_access(op, shape.memory) {
+                self.access(index, op, reads, bytes, store);
+            } else if let Some(lazy) = lazy {
+                self.lazy_condition(index, lazy, reads);
+            } else if op.code == Code::Generic {
+                if !self.generic(index, op, reads) {
+                    self.effect(index, reads, writes);
+                }
+            } else if op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard {
+                self.effect(index, reads, writes);
+            } else if op.code == Code::Guard {
+                self.guard(index, op, reads, fused[index]);
+            } else if let (Code::Select, Some(fusion)) = (op.code, fused[index]) {
+                self.fused_select(index, op, reads, fusion);
+            } else {
+                self.pure(index, op, reads)?;
+            }
         }
+        self.outputs(slots, spans);
+        Ok(())
     }
-    let sites = emitter.outputs();
-    let fused = fused.iter().filter(|fusion| fusion.is_some()).count() as u64;
-    Ok((emitter.asm, sites, fused, emitter.lazy))
 }

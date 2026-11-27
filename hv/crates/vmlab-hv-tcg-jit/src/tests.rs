@@ -194,6 +194,10 @@ struct Env {
     watched: u64,
     /// The accesses that hits asked to keep: address, size, value, store.
     logged: Vec<(u64, u8, u128, bool)>,
+    /// What a miss of the jump cache (`JUMP`) gets: the code to go on to,
+    /// or 0. And the count of those calls.
+    serve: u64,
+    jumps: u64,
 }
 
 impl Env {
@@ -215,6 +219,8 @@ impl Env {
             misses: 0,
             watched: 0,
             logged: Vec::new(),
+            serve: 0,
+            jumps: 0,
         }
     }
 }
@@ -248,6 +254,10 @@ unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64, _block: *mut c_voi
     // SAFETY: the test passes its `Env`.
     let env = unsafe { &mut *env.cast::<Env>() };
     env.thunk_calls += 1;
+    if index == JUMP {
+        env.jumps += 1;
+        return env.serve;
+    }
     // SAFETY: the frame of the test, as long as its `words`.
     let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
     let request = index & !0xffff_ffff;
@@ -1270,7 +1280,7 @@ fn lazy_conditions_run_their_forms_inline_and_call_for_other_kinds() {
                     code: 4,
                     code_value: 11,
                     result: 5,
-                    cases: vec![(9, test), (3, FlagTest::Table(0x0ff0))],
+                    cases: vec![(9, test), (3, FlagTest::Table(0x0ff0))].into(),
                 };
                 let calls = vec![Effect {
                     reads: vec![kind_word, 2, 3, 4],
@@ -1324,7 +1334,7 @@ fn a_lazy_condition_for_another_code_is_a_call() {
         code: 4,
         code_value: 12,
         result: 5,
-        cases: vec![(1, FlagTest::Always(true))],
+        cases: vec![(1, FlagTest::Always(true))].into(),
     };
     let block = Block {
         ops: vec![Op {
@@ -1654,6 +1664,8 @@ struct Looping {
     ops: Vec<Op>,
     inputs: Vec<(Place, u32)>,
     outputs: Vec<(u32, Place)>,
+    /// A miss of the jump cache asks the thunk (`Chain::serve`).
+    serve: bool,
 }
 
 fn word(slot: Slot) -> Place {
@@ -1678,6 +1690,7 @@ impl Looping {
             }],
             inputs: vec![(word(1), 0), (word(5), 2)],
             outputs: vec![(0, word(2))],
+            serve: false,
         }
     }
 
@@ -1701,6 +1714,7 @@ impl Looping {
                 sites: true,
                 jumps: true,
                 verify: false,
+                serve: self.serve,
             }),
             next: Some(Next { pc: 1, kind }),
             memory: Memory::Thunk,
@@ -1717,11 +1731,26 @@ impl Looping {
         slots: &mut [u128; 3],
         budget: i64,
     ) -> (u64, Context) {
+        let (code, context, _) = self.run_served(jit, entry, slots, budget, 0);
+        (code, context)
+    }
+
+    /// `run`, with a thunk that answers a miss of the jump cache with
+    /// `serve`: the code, the context after, and the count of those misses.
+    fn run_served(
+        &mut self,
+        jit: &Jit,
+        entry: &Entry,
+        slots: &mut [u128; 3],
+        budget: i64,
+        serve: u64,
+    ) -> (u64, Context, u64) {
         let mut env = Env {
             ops: self.ops.clone(),
             frame: self.frame.as_mut_ptr(),
             words: self.frame.len(),
             calls: Vec::new(),
+            serve,
             ..Env::base()
         };
         let mut context = jit.context(budget, thunk, (&raw mut env).cast());
@@ -1735,8 +1764,72 @@ impl Looping {
                 self.frame.as_mut_ptr(),
             )
         };
-        (code, context)
+        (code, context, env.jumps)
     }
+}
+
+#[test]
+fn a_miss_of_the_jump_cache_asks_the_thunk_and_goes_on_to_the_code_it_gives() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    block.serve = true;
+    let entry = block.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    let pc = 0x4000_0100u64;
+    let mut slots = [0u128, u128::from(pc), u128::from(pc)];
+    // The thunk has no code: the block leaves with `LOOKUP`, after one ask.
+    let (code, context, jumps) = block.run_served(&jit, &entry, &mut slots, 100, 0);
+    assert_eq!((code, context.hits, jumps), (LOOKUP, 0, 1));
+    assert_eq!(slots[0], 1);
+    // The thunk gives the code: the run goes on until its budget, with no
+    // return to the owner, every turn through the thunk.
+    let (code, context, jumps) = block.run_served(&jit, &entry, &mut slots, 20, entry.address);
+    assert_eq!(
+        (code, context.budget, context.hits, jumps),
+        (BUDGET, 0, 0, 20)
+    );
+    assert_eq!(slots[0], 21);
+    // A filled entry hits inline and asks nothing.
+    jit.fill(pc, 9, &entry);
+    let (code, context, jumps) = block.run_served(&jit, &entry, &mut slots, 20, 0);
+    assert_eq!((code, context.hits, jumps), (BUDGET, 20, 0));
+    // A block that does not ask leaves at a miss without a call.
+    let mut plain = Looping::new();
+    let entry = plain.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    slots[2] = u128::from(pc + 4);
+    let (code, _, jumps) = plain.run_served(&jit, &entry, &mut slots, 20, entry.address);
+    assert_eq!((code, jumps), (LOOKUP, 0));
+}
+
+#[test]
+fn an_entry_of_the_jump_cache_hits_only_in_its_address_space() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut block = Looping::new();
+    let entry = block.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    let pc = 0x4000_0100u64;
+    let mut slots = [0u128, u128::from(pc), u128::from(pc)];
+    jit.set_jump_space(1);
+    jit.fill(pc, 9, &entry);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.hits), (BUDGET, 10));
+    // Another space: a miss, inline and in `jump_target`.
+    jit.set_jump_space(2);
+    assert_eq!(jit.jump_target(pc, 9), None);
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.hits), (LOOKUP, 0));
+    // The first space again: the entry was kept.
+    jit.set_jump_space(1);
+    assert_eq!(jit.jump_target(pc, 9), Some(entry.address));
+    let (code, context) = block.run(&jit, &entry, &mut slots, 10);
+    assert_eq!((code, context.hits), (BUDGET, 10));
+    assert_eq!(jit.stats.spaces, 3);
+    // An emptied cache misses in every space.
+    jit.clear_jumps();
+    assert_eq!(jit.jump_target(pc, 9), None);
+    // The largest space keeps the bits of the key and of the generation.
+    jit.set_jump_space(u16::MAX);
+    jit.fill(pc, 9, &entry);
+    assert_eq!(jit.jump_target(pc, 9), Some(entry.address));
+    assert_eq!(jit.jump_target(pc, 8), None);
 }
 
 #[test]
@@ -1764,6 +1857,45 @@ fn a_linked_jump_chains_until_the_budget_and_unlinks_to_its_stub() {
     assert_eq!(code, CHAIN);
     assert_eq!(slots[0], 12);
     assert_eq!((jit.stats.links, jit.stats.unlinks), (1, 1));
+}
+
+#[test]
+fn a_full_region_drops_the_part_written_longest_ago_and_the_links_into_it() {
+    // X goes into the first part, A and B into the second. A is linked to
+    // X and B to A. The drop of the first part sets the jump of A back to
+    // its stub and keeps B linked to A (H13c, card J11).
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut x = Looping::new();
+    let mut a = Looping::new();
+    let mut b = Looping::new();
+    let mut filler = Looping::new();
+    let relative = NextPc::Relative(word(4));
+    let to_x = x.compile(&mut jit, relative, 9);
+    let mut probe = to_x;
+    while probe.generation == to_x.generation {
+        probe = filler.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    let to_a = a.compile(&mut jit, relative, 9);
+    let to_b = b.compile(&mut jit, relative, 9);
+    assert_eq!(to_a.generation, to_b.generation);
+    assert!(jit.link(&to_a, 0, &to_x));
+    assert!(jit.link(&to_b, 0, &to_a));
+    let mut slots = [0u128, 0x4000_0100, 0];
+    // A runs and jumps to X, whose head finds the budget spent.
+    let (code, context) = a.run(&jit, &to_a, &mut slots, 1);
+    assert_eq!((code, context.chained), (BUDGET, 1));
+    assert_eq!(jit.stats.resets, 0);
+    while jit.stats.resets == 0 {
+        filler.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    assert!(!jit.current(&to_x));
+    assert!(jit.current(&to_a) && jit.current(&to_b));
+    assert_eq!(jit.linked(), 1);
+    // A leaves at its stub, and B still goes on to A.
+    let (code, context) = a.run(&jit, &to_a, &mut slots, 10);
+    assert_eq!((code, context.budget), (CHAIN, 9));
+    let (code, context) = b.run(&jit, &to_b, &mut slots, 10);
+    assert_eq!((code, context.budget, context.chained), (CHAIN, 8, 2));
 }
 
 #[test]

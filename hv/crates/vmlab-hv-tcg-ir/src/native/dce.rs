@@ -4,9 +4,10 @@ use super::{Graph, ScalarId};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// The scalars that `roots` reach.
-fn live(graph: &Graph, mut roots: Vec<ScalarId>) -> Vec<bool> {
-    let mut live = vec![false; graph.scalars.len()];
+/// The scalars that `roots` reach, into `live`. `roots` is used up.
+fn live(graph: &Graph, roots: &mut Vec<ScalarId>, live: &mut Vec<bool>) {
+    live.clear();
+    live.resize(graph.scalars.len(), false);
     while let Some(id) = roots.pop() {
         if std::mem::replace(&mut live[id], true) {
             continue;
@@ -28,7 +29,15 @@ fn live(graph: &Graph, mut roots: Vec<ScalarId>) -> Vec<bool> {
             _ => {}
         }
     }
-    live
+}
+
+/// The buffers of `prune_scalars_with`, which a translator keeps from one
+/// block to the next (3e DESIGN.md J11).
+#[derive(Default)]
+pub struct PruneBuffers {
+    roots: Vec<ScalarId>,
+    live: Vec<bool>,
+    map: Vec<ScalarId>,
 }
 
 /// Dead code elimination for a block whose exits name scalars directly
@@ -36,7 +45,18 @@ fn live(graph: &Graph, mut roots: Vec<ScalarId>) -> Vec<bool> {
 /// renumber. A register slot that a block writes twice keeps only the value
 /// of the last write, because the exit names only that one.
 pub fn prune_scalars<X: ExitScalars>(block: &mut BlockOf<X>) {
-    let mut roots = Vec::new();
+    prune_scalars_with(block, &mut PruneBuffers::default());
+}
+
+/// `prune_scalars` with the memory of `buffers`: no heap call of its own
+/// once they have grown.
+pub fn prune_scalars_with<X: ExitScalars>(block: &mut BlockOf<X>, buffers: &mut PruneBuffers) {
+    let PruneBuffers {
+        roots,
+        live: alive,
+        map,
+    } = buffers;
+    roots.clear();
     for event in &block.events {
         match *event {
             Event::Guard { condition, .. } => roots.push(condition),
@@ -67,8 +87,8 @@ pub fn prune_scalars<X: ExitScalars>(block: &mut BlockOf<X>) {
     for exit in &mut block.exits {
         exit.for_each_scalar(&mut |scalar| roots.push(*scalar));
     }
-    let live = live(&block.graph, roots);
-    let map = block.graph.retain(&live);
+    live(&block.graph, roots, alive);
+    block.graph.retain_into(alive, map);
     for event in &mut block.events {
         match event {
             Event::Guard { condition, .. } => *condition = map[*condition],
@@ -207,7 +227,8 @@ pub fn prune(block: &mut Block) -> Vec<usize> {
             _ => {}
         }
     }
-    let live_scalars = live(&block.graph, scalars);
+    let mut live_scalars = Vec::new();
+    live(&block.graph, &mut scalars, &mut live_scalars);
     let scalar_map = block.graph.retain(&live_scalars);
     let constants: Vec<_> = constants.into_iter().collect();
     let constant_map: std::collections::BTreeMap<_, _> = constants

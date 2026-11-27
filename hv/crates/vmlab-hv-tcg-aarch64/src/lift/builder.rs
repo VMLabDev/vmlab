@@ -219,6 +219,34 @@ pub struct Builder {
     /// The flags as the block set them last. `None`: the block has not set
     /// them, and they are in the flag slots.
     flags: Option<Flags>,
+    /// The lists of the exits of earlier blocks, for the exits of this one
+    /// (3e DESIGN.md J11).
+    spare: Spare,
+}
+
+/// The lists of the exits of a block that its translator keeps for the
+/// exits of the next one (3e DESIGN.md J11): the writes of each exit and
+/// the syndrome of an exception, empty, with their memory.
+#[derive(Default)]
+pub struct Spare {
+    writes: Vec<Vec<(usize, ScalarId)>>,
+    syndromes: Vec<Vec<ScalarId>>,
+}
+
+impl Spare {
+    /// Take the lists of the exits of `block`, which leaves it without
+    /// exits.
+    pub fn keep(&mut self, block: &mut BlockOf<A64Exit>) {
+        for exit in block.exits.drain(..) {
+            let mut writes = exit.writeback.writes;
+            writes.clear();
+            self.writes.push(writes);
+            if let A64Next::Exception { mut syndrome, .. } = exit.next {
+                syndrome.clear();
+                self.syndromes.push(syndrome);
+            }
+        }
+    }
 }
 
 /// The alignment that Device memory asks of a load or a store of a register
@@ -234,8 +262,16 @@ fn total(value: Option<ScalarId>) -> ScalarId {
 
 impl Builder {
     pub fn new(context: Context, pc: u64) -> Self {
+        Self::with_block(BlockOf::default(), Spare::default(), context, pc)
+    }
+
+    /// A builder that fills `block`, which is empty: the block of an earlier
+    /// translation, cleared, whose lists keep their memory, and that takes
+    /// the lists of its exits from `spare` (3e DESIGN.md J11).
+    pub fn with_block(block: BlockOf<A64Exit>, spare: Spare, context: Context, pc: u64) -> Self {
+        debug_assert!(block.events.is_empty() && block.graph.scalars.is_empty());
         Self {
-            block: BlockOf::default(),
+            block,
             current: [None; slot::COUNT],
             written: [false; slot::COUNT],
             context,
@@ -254,6 +290,7 @@ impl Builder {
             aligned: Vec::new(),
             unprivileged: false,
             flags: None,
+            spare,
         }
     }
 
@@ -1087,7 +1124,7 @@ impl Builder {
         current: [Option<ScalarId>; slot::COUNT],
         written: [bool; slot::COUNT],
     ) -> Vec<(usize, ScalarId)> {
-        let mut writes = Vec::new();
+        let mut writes = self.spare.writes.pop().unwrap_or_default();
         for slot in 0..slot::COUNT {
             let Some(value) = current[slot] else {
                 continue;
@@ -1107,7 +1144,9 @@ impl Builder {
     /// An exit that leaves the block before the instruction that is being
     /// lifted: the registers as they were before it, and its address as the
     /// PC, which the loop sets from the entry PC.
-    fn exit_before(&mut self, class: ExceptionClass, syndrome: Vec<ScalarId>) -> ExitId {
+    fn exit_before(&mut self, class: ExceptionClass, address: Option<ScalarId>) -> ExitId {
+        let mut syndrome = self.spare.syndromes.pop().unwrap_or_default();
+        syndrome.extend(address);
         let writes = self.writes(self.before, self.before_written);
         let at = self.pc.wrapping_sub(self.entry);
         self.block.exit(A64Exit {
@@ -1134,7 +1173,7 @@ impl Builder {
             unprivileged: self.unprivileged,
             device,
         };
-        let exit = self.exit_before(class, Vec::new());
+        let exit = self.exit_before(class, None);
         self.abort = Some((exit, device));
         exit
     }
@@ -1289,7 +1328,7 @@ impl Builder {
             unprivileged: self.unprivileged,
             device,
         };
-        let exit = self.exit_before(class, vec![address]);
+        let exit = self.exit_before(class, Some(address));
         self.block.events.push(Event::Guard {
             condition: aligned,
             expected: true,
@@ -1324,7 +1363,12 @@ impl Builder {
     }
 
     /// End the block. `fallthrough` is the next PC when no instruction set one.
-    pub fn finish(mut self, fallthrough: u64) -> BlockOf<A64Exit> {
+    pub fn finish(self, fallthrough: u64) -> BlockOf<A64Exit> {
+        self.finish_keeping(fallthrough).0
+    }
+
+    /// `finish`, with the spare lists that the exits did not take.
+    pub fn finish_keeping(mut self, fallthrough: u64) -> (BlockOf<A64Exit>, Spare) {
         let next = match (self.trap, self.branch) {
             (Some(trap), _) => A64Next::Trap {
                 pc: self.pc.wrapping_sub(self.entry),
@@ -1345,6 +1389,6 @@ impl Builder {
             completed,
         });
         self.block.events.push(Event::Exit(exit));
-        self.block
+        (self.block, self.spare)
     }
 }
