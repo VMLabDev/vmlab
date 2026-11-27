@@ -1227,7 +1227,7 @@ impl Emitter<'_> {
         self.asm.bind(stub);
         if let Some(index) = self.native_side(op) {
             let shape = self.shape;
-            self.side_exit(&shape.sides[index]);
+            self.side_exit(&shape.sides[index], at as usize);
             self.asm.cold(false);
             self.release(&all, at);
             self.all = all;
@@ -1272,10 +1272,23 @@ impl Emitter<'_> {
     /// are, the PC, the instructions that did not run, and a jump that the
     /// owner links. Every word goes to the frame first, so that an output
     /// cannot write over the slot of an input that a later one reads.
-    fn side_exit(&mut self, side: &Side) {
+    fn side_exit(&mut self, side: &Side, at: usize) {
         let Some(next) = self.shape.next else {
             return;
         };
+        // The head counted the inlined accesses of the whole block (H7).
+        let memory = self.shape.memory;
+        let after = self.shape.ops[at + 1..]
+            .iter()
+            .filter(|op| inline_access(op, memory).is_some())
+            .count();
+        if after != 0 {
+            self.asm.alu_imm(
+                Alu::Sub,
+                Rm::Mem(R13, CONTEXT_ACCESSES),
+                after as i32,
+            );
+        }
         for (_, place) in &side.outputs {
             for word in [place.slot, place.slot + 1].into_iter().take(1 + usize::from(place.wide)) {
                 let w = self.words[usize::from(word)];

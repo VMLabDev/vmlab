@@ -80,3 +80,36 @@ fn the_replay_check_catches_a_seeded_defect() {
     );
     eprintln!("K3 with the defect: {difference}");
 }
+
+/// K2 with blocks that join (card J14): direct branches inside each image,
+/// so that the compiled side makes superblocks and leaves through their
+/// side exits, against the interpreter, which makes none.
+#[test]
+fn superblocks_leave_what_the_interpreter_leaves() {
+    let seed = 0x3e_0014;
+    match jitdiff::run_joins(seed, 3_000, Options::default()) {
+        Ok(report) => {
+            eprintln!("K2 joins: seed {seed:#x}: {report:?}");
+            assert!(report.compiled_blocks > report.refused_blocks);
+            assert!(report.joins > 1_000 && report.side_exits > 500, "{report:?}");
+        }
+        Err(difference) => panic!("{difference}"),
+    }
+}
+
+/// K3 on the same rounds: the replay check of every superblock.
+#[test]
+fn the_replay_check_finds_no_difference_on_superblocks() {
+    let seed = 0x3e_0014;
+    let options = Options {
+        check: true,
+        ..Options::default()
+    };
+    match jitdiff::run_joins(seed, 1_000, options) {
+        Ok(report) => {
+            eprintln!("K3 joins: seed {seed:#x}: {report:?}");
+            assert!(report.checked_blocks > 0 && report.side_exits > 0, "{report:?}");
+        }
+        Err(difference) => panic!("{difference}"),
+    }
+}
