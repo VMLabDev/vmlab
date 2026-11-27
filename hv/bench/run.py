@@ -111,6 +111,24 @@ def make_backend(args, run_dir, arch, smp, pin, overlay, code_fd, vars_fd):
     )
 
 
+def measures_boot_mips(args, arch):
+    return (args.backend == "vmlab-hv" and arch == "aarch64"
+            and args.guest == "debian-13" and args.suite == "boot")
+
+
+def boot_instructions(stderr, vcpus):
+    counts = {}
+    for line in stderr.splitlines():
+        if line.startswith("boot instructions: "):
+            cpu, count = map(int, line.removeprefix("boot instructions: ").split())
+            if cpu in counts or count < 0:
+                raise lib.BenchError(f"invalid boot instruction count for vCPU {cpu}")
+            counts[cpu] = count
+    if counts.keys() != set(range(vcpus)) or not sum(counts.values()):
+        raise lib.BenchError(f"missing boot instruction counts for {vcpus} vCPUs: {counts}")
+    return sum(counts.values())
+
+
 def one_repeat(args, arch, smp, pin, version, index):
     """One VM: launch → ready → workloads → clean shutdown. Returns samples."""
     run_dir = os.path.join(
@@ -122,8 +140,10 @@ def one_repeat(args, arch, smp, pin, version, index):
     backend = make_backend(args, run_dir, arch, smp, pin, overlay, code_fd, vars_fd)
 
     result = {"run": run_dir, "arch": arch, "vcpus": smp, "backend": args.backend}
-    session = backend.launch()
+    boot_mips = measures_boot_mips(args, arch)
+    session = backend.launch(boot_mips=True) if boot_mips else backend.launch()
     agent = None
+    stopped_at_ready = False
     try:
         backend.release_cpus()
         result["t_release"] = round(session.elapsed(), 2)
@@ -133,13 +153,14 @@ def one_repeat(args, arch, smp, pin, version, index):
         agent, hello = lib.wait_for_agent(
             backend.agent_socket(), deadline, vm_exited=session.exit_code
         )
-        result["boot_to_agent_ready"] = round(session.elapsed(), 2)
+        ready_seconds = session.elapsed()
+        result["boot_to_agent_ready"] = round(ready_seconds, 2)
         result["agent_hello"] = {
             k: hello.get(k) for k in ("agent_version", "os", "features")
         }
         log(f"agent ready after {result['boot_to_agent_ready']}s")
         boot = {"boot_to_agent_ready": result["boot_to_agent_ready"]}
-        if counts_instructions(args, arch):
+        if counts_instructions(args, arch) and not boot_mips:
             instructions = backend.instructions(smp)
             result["boot_instructions"] = instructions
             boot["boot_mips"] = round(
@@ -148,6 +169,16 @@ def one_repeat(args, arch, smp, pin, version, index):
             log(f"{instructions} instructions to agent ready: {boot['boot_mips']} MIPS")
 
         if args.suite == "boot":
+            if boot_mips:
+                # Quit at the handshake so the final vCPU counts exclude guest shutdown.
+                backend.quit()
+                stopped_at_ready = True
+                agent.close()
+                agent = None
+                if session.wait_exit(30) != 0:
+                    raise lib.BenchError("VM failed to exit cleanly at agent ready")
+                result["boot_instructions"] = boot_instructions(session.stderr_text(), smp)
+                boot["boot_mips"] = result["boot_instructions"] / ready_seconds / 1e6
             result["samples"] = boot
             return result, backend, session, agent, None
 
@@ -218,7 +249,7 @@ def one_repeat(args, arch, smp, pin, version, index):
                         agent.shutdown()
                 finally:
                     agent.close()
-            if args.backend == "vmlab-hv":
+            if args.backend == "vmlab-hv" and not stopped_at_ready:
                 backend.quit()
             if agent is not None and session.wait_exit(SHUTDOWN_TIMEOUT) is None:
                 log(f"VM did not exit after powerdown within {SHUTDOWN_TIMEOUT}s")
@@ -259,6 +290,9 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         "template": version,
         "host_cpus": os.cpu_count(),
     }
+    if "boot_mips" in workloads:
+        env["boot_instruction_counts"] = []
+        env["boot_block_counts_enabled"] = "VMLAB_HV_BOOT_BLOCK_COUNTS" in os.environ
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} {arch} smp={smp} {args.guest} repeat {i}/{args.repeats}")
         result, backend, session, agent, digest = one_repeat(
@@ -266,6 +300,8 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         )
         env["loadavg_end"] = lib.read_loadavg()
         env["backend_version"] = backend.backend_version()
+        if "boot_instructions" in result:
+            env["boot_instruction_counts"].append(result["boot_instructions"])
         for w in workloads:
             all_samples[w].append(result["samples"][w])
         if digest is not None:
@@ -1256,8 +1292,8 @@ def main(argv=None):
             try:
                 records = run_config(args, arch, smp, pin, version, commit, dirty, host)
                 for r in records:
-                    log(f"history: {r['workload']} median={r['median']}s "
-                        f"spread={r['spread']}s")
+                    log(f"history: {r['workload']} median={r['median']}{r['unit']} "
+                        f"spread={r['spread']}{r['unit']}")
             except lib.BackendUnsupported as skip:
                 log(f"SKIP {skip.backend} {arch} smp={smp}: {skip.reason}")
                 log("(no history recorded for this configuration)")

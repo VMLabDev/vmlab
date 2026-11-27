@@ -216,9 +216,8 @@ D28_BAR = {
     "idle_cpu_pct": None,
 }
 
-# Which way is a regression, for bench-check. Everything the TCG suite
-# records is seconds; idle CPU is a percentage — both grow when worse. The
-# phase-2 throughput workloads are rates that shrink when worse.
+# Which way is a regression, for bench-check. Time and idle CPU grow when
+# worse. Throughput and boot MIPS shrink when worse.
 DIRECTION = {
     name: ("lower" if unit in ("s", "%cpu") else "higher")
     for name, unit in UNIT.items()
