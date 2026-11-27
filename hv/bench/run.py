@@ -166,6 +166,8 @@ def one_repeat(args, arch, smp, pin, version, index):
                 # Quit at the handshake so the final vCPU counts exclude guest shutdown.
                 backend.quit()
                 stopped_at_ready = True
+                agent.close()
+                agent = None
                 if session.wait_exit(30) != 0:
                     raise lib.BenchError("VM failed to exit cleanly at agent ready")
                 result["boot_instructions"] = boot_instructions(session.stderr_text(), smp)
@@ -225,9 +227,7 @@ def one_repeat(args, arch, smp, pin, version, index):
         try:
             if agent is not None:
                 try:
-                    if stopped_at_ready:
-                        pass
-                    elif args.guest.startswith("alpine-"):
+                    if args.guest.startswith("alpine-"):
                         # Ask BusyBox init to run Alpine's shutdown sequence.
                         # The guest may close the connection before exec replies.
                         try:
@@ -278,6 +278,7 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
     }
     if "boot_mips" in workloads:
         env["boot_instruction_counts"] = []
+        env["boot_block_counts_enabled"] = "VMLAB_HV_BOOT_BLOCK_COUNTS" in os.environ
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} {arch} smp={smp} {args.guest} repeat {i}/{args.repeats}")
         result, backend, session, agent, digest = one_repeat(

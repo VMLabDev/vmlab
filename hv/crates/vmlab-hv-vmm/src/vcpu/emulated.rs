@@ -101,6 +101,9 @@ pub struct EmulatedVcpu {
     counter: Option<(Counter, u64)>,
 }
 
+/// The count of the system counter of a machine now.
+pub type Counter = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 impl EmulatedVcpu {
     /// The VM calls this after joining its vCPU workers.
     pub(crate) fn report_boot_counts(&self, instructions: bool) {
@@ -111,6 +114,7 @@ impl EmulatedVcpu {
             eprintln!("boot block counts: {} {counts:?}", self.id);
         }
     }
+
     /// The vCPU `id` in the reset state `state`, on `memory`, with the
     /// system counter of `clock`.
     pub fn new(id: u8, memory: GuestBus, state: State, clock: Clock) -> Self {
@@ -291,9 +295,6 @@ impl EmulatedVcpu {
         Exit::Fail(ExitReason::Error(format!("vcpu {}: {what}", self.id)))
     }
 }
-
-/// The count of the system counter of a machine now.
-pub type Counter = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl VcpuBackend for EmulatedVcpu {
     fn run(&mut self, running: bool) -> Exit {
