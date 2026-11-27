@@ -139,6 +139,22 @@ class JitReportTests(unittest.TestCase):
                           report["code_mails"], report["code_pages"], report["wait_ms"]),
                          (40, 38, 5, 7, 2))
 
+    def test_a_report_with_the_compiles_by_cause(self):
+        line = ('{"level":"INFO","message":"vcpu 0: JIT: 1000 instructions, 7 of them in the '
+                'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
+                '0 resets of the region, 3 ms of compiling; machine: 0 exclusive loads, '
+                '0 exclusive stores, 0 code mails, 0 code pages, 0 ms waiting; compiles: '
+                '20 first, 4 after a drop of the region, 5 after an invalidation, 2 after an '
+                'eviction, 1 drops for the memory; translations: 28 blocks, 6 ms"}\n')
+        with tempfile.TemporaryDirectory() as run_dir:
+            with open(Path(run_dir) / "stderr.log", "w") as log:
+                log.write(line)
+            report = lib.last_jit_report(run_dir)
+        self.assertEqual((report["compiles_first"], report["compiles_region"],
+                          report["compiles_invalidated"], report["compiles_evicted"],
+                          report["memory_resets"], report["translations"],
+                          report["translation_ms"]), (20, 4, 5, 2, 1, 28, 6))
+
 
 if __name__ == "__main__":
     unittest.main()

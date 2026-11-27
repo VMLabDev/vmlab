@@ -294,7 +294,7 @@ impl EmulatedVcpu {
         self.jit_report = self.cpu.instructions + JIT_REPORT;
         let jit = self.cpu.jit_counts();
         log::info!(
-            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting",
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting; compiles: {} first, {} after a drop of the region, {} after an invalidation, {} after an eviction, {} drops for the memory; translations: {} blocks, {} ms",
             self.id,
             self.cpu.instructions,
             jit.interpreted_instructions,
@@ -328,6 +328,13 @@ impl EmulatedVcpu {
             jit.machine.code_mails,
             jit.machine.code_pages,
             jit.machine.wait_ns / 1_000_000,
+            jit.compiles_first,
+            jit.compiles_region,
+            jit.compiles_invalidated,
+            jit.compiles_evicted,
+            jit.memory_resets,
+            jit.translations,
+            jit.translation_ns / 1_000_000,
         );
     }
 
