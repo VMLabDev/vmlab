@@ -36,13 +36,22 @@ fn cpu_key(id: usize) -> String {
     format!("virt/cpu{id}")
 }
 
+/// The slots of a saved CPU: the register file of version 1, with the
+/// flags as four slots of one bit, N to V, at `FLAG_SLOT`. The CPU keeps
+/// its flags lazy (card #1142), and a save computes them.
+const SAVED_SLOTS: usize = slot::COUNT + 1;
+const FLAG_SLOT: usize = slot::FLAGS_KIND;
+/// The slots of the CPU that follow the flags, as saved.
+const AFTER_FLAGS: usize = slot::FLAGS_B + 1;
+
 /// One CPU as a snapshot keeps it.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SavedCpu {
     version: u32,
     /// The name of the CPU model: a restore into another one refuses.
     model: String,
-    /// Each slot as its low and its high 64 bits.
+    /// Each slot as its low and its high 64 bits, in the layout of
+    /// `SAVED_SLOTS`.
     slots: Vec<[u64; 2]>,
     el: u8,
     sp_sel: bool,
@@ -57,13 +66,18 @@ pub(crate) struct SavedCpu {
 
 impl SavedCpu {
     pub(crate) fn of(state: &State) -> Self {
+        let nzcv = state.nzcv();
+        let flags = (0..4).rev().map(|bit| u128::from(nzcv >> bit & 1));
+        let slots = state.slots[..FLAG_SLOT]
+            .iter()
+            .copied()
+            .chain(flags)
+            .chain(state.slots[AFTER_FLAGS..].iter().copied());
         Self {
             version: CPU_VERSION,
             model: state.system.model.name.into(),
-            slots: state
-                .slots
-                .iter()
-                .map(|value| [*value as u64, (*value >> 64) as u64])
+            slots: slots
+                .map(|value| [value as u64, (value >> 64) as u64])
                 .collect(),
             el: state.context.el,
             sp_sel: state.context.sp_sel,
@@ -96,7 +110,7 @@ impl SavedCpu {
                 self.model, model.name
             ));
         }
-        if self.slots.len() != slot::COUNT
+        if self.slots.len() != SAVED_SLOTS
             || self.regs.len() != sysreg::COUNT
             || self
                 .regs
@@ -109,10 +123,20 @@ impl SavedCpu {
         if self.el > 1 || self.daif > 0xf || self.timers.iter().any(|(control, _)| *control > 3) {
             return Err("the CPU state is outside what this CPU can be in".into());
         }
-        let mut state = State::reset_as(0, model);
-        for (slot, [low, high]) in state.slots.iter_mut().zip(&self.slots) {
-            *slot = u128::from(*low) | u128::from(*high) << 64;
+        let value = |&[low, high]: &[u64; 2]| u128::from(low) | u128::from(high) << 64;
+        let flags = &self.slots[FLAG_SLOT..FLAG_SLOT + 4];
+        if flags.iter().any(|saved| value(saved) > 1) {
+            return Err("the CPU state is outside what this CPU can be in".into());
         }
+        let mut state = State::reset_as(0, model);
+        let others = self.slots[..FLAG_SLOT]
+            .iter()
+            .chain(&self.slots[FLAG_SLOT + 4..]);
+        let places = (0..FLAG_SLOT).chain(AFTER_FLAGS..slot::COUNT);
+        for (index, saved) in places.zip(others) {
+            state.slots[index] = value(saved);
+        }
+        state.set_nzcv(flags.iter().fold(0, |nzcv, saved| nzcv << 1 | value(saved) as u8));
         state.context = Context {
             el: self.el,
             sp_sel: self.sp_sel,
@@ -237,7 +261,12 @@ mod tests {
         state.context.el = 0;
         state.context.sp_sel = false;
         state.daif = 0x5;
-        state.set_nzcv(0b1010);
+        // Lazy flags: the compare of 1 with 2 (N set, C clear), saved as
+        // the four bits of version 1.
+        state.slots[slot::FLAGS_KIND] = 0b1110;
+        state.slots[slot::FLAGS_A] = 1;
+        state.slots[slot::FLAGS_B] = 2;
+        assert_eq!(state.nzcv(), 0b1000);
         state.system.regs[sysreg::reg::TCR_EL1] = 0x35_5551_0010;
         state.system.regs[sysreg::reg::CPACR_EL1] = 3 << 20;
         state.system.timers[1] = Timer {
@@ -249,6 +278,9 @@ mod tests {
         let bytes = serde_json::to_vec(&saved).unwrap();
         let back: SavedCpu = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, saved);
+        assert_eq!(saved.slots.len(), 73);
+        assert_eq!(saved.slots[35..39], [[1, 0], [0, 0], [0, 0], [0, 0]]);
+        assert_eq!(saved.slots[39 + 5], [u64::MAX - 7, u64::MAX]);
         assert_eq!(back.state(&sysreg::V8_0).unwrap(), state);
     }
 
@@ -262,6 +294,9 @@ mod tests {
                 .unwrap_err()
                 .contains("this machine has the CPU")
         );
+        let mut flags = SavedCpu::of(&state);
+        flags.slots[FLAG_SLOT] = [2, 0];
+        assert!(flags.state(&sysreg::V8_0).is_err());
         let mut short = SavedCpu::of(&state);
         short.regs.pop();
         assert!(short.state(&sysreg::V8_0).is_err());

@@ -69,9 +69,8 @@ fn add_or_subtract(
     right: ScalarId,
 ) -> (ScalarId, Flags) {
     if subtract {
-        let inverted = b.not(width, right);
         let carry = b.imm(1, 1);
-        b.add_with_carry(width, left, inverted, carry)
+        b.sub_with_carry(width, left, right, carry)
     } else {
         let carry = b.imm(1, 0);
         b.add_with_carry(width, left, right, carry)
@@ -174,12 +173,14 @@ fn carry_body(
     (rd, rn, rm): (u32, u32, u32),
 ) -> Lifted {
     let left = b.x(rn, width);
-    let mut right = b.x(rm, width);
-    if subtract {
-        right = b.not(width, right);
-    }
-    let carry = b.read(slot::C);
-    let (result, flags) = b.add_with_carry(width, left, right, carry);
+    let right = b.x(rm, width);
+    let carry = b.condition(Condition::Cs);
+    let carry = b.to_bit(carry);
+    let (result, flags) = if subtract {
+        b.sub_with_carry(width, left, right, carry)
+    } else {
+        b.add_with_carry(width, left, right, carry)
+    };
     if set_flags {
         b.set_flags(flags);
     }
@@ -268,16 +269,7 @@ fn conditional_compare(
     let holds = b.condition(Condition::from_bits(condition));
     // CCMP compares by subtracting, CCMN by adding.
     let (_, compared) = add_or_subtract(b, width, !negative, left, right);
-    let mut pick = |flag: ScalarId, bit: u32| {
-        let given = b.imm(1, u64::from((nzcv >> bit) & 1));
-        b.select(1, holds, flag, given)
-    };
-    let flags = Flags {
-        n: pick(compared.n, 3),
-        z: pick(compared.z, 2),
-        c: pick(compared.c, 1),
-        v: pick(compared.v, 0),
-    };
+    let flags = b.chosen_flags(holds, compared, (nzcv & 15) as u8);
     b.set_flags(flags);
     Lifted::Next
 }

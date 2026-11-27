@@ -19,16 +19,16 @@ pub mod slot {
     pub const SP_EL1: usize = 32;
     pub const SP_EL2: usize = 33;
     pub const PC: usize = 34;
-    /// The flags are four slots of one bit (G3c).
-    pub const N: usize = 35;
-    pub const Z: usize = 36;
-    pub const C: usize = 37;
-    pub const V: usize = 38;
-    /// V0 to V31 are the slots 39 to 70.
-    pub const V0: usize = 39;
-    pub const FPCR: usize = 71;
-    pub const FPSR: usize = 72;
-    pub const COUNT: usize = 73;
+    /// The flags are lazy (card #1142, `crate::flags`): a kind of four
+    /// bits and two operands of 64 bits, from which N, Z, C and V follow.
+    pub const FLAGS_KIND: usize = 35;
+    pub const FLAGS_A: usize = 36;
+    pub const FLAGS_B: usize = 37;
+    /// V0 to V31 are the slots 38 to 69.
+    pub const V0: usize = 38;
+    pub const FPCR: usize = 70;
+    pub const FPSR: usize = 71;
+    pub const COUNT: usize = 72;
 }
 
 const fn bits(name: &'static str, width: u16) -> Slot {
@@ -74,10 +74,9 @@ static SLOTS: [Slot; slot::COUNT] = [
     bits("sp_el1", 64),
     bits("sp_el2", 64),
     bits("pc", 64),
-    bits("n", 1),
-    bits("z", 1),
-    bits("c", 1),
-    bits("v", 1),
+    bits("flags_kind", 4),
+    bits("flags_a", 64),
+    bits("flags_b", 64),
     bits("v0", 128),
     bits("v1", 128),
     bits("v2", 128),
@@ -149,7 +148,7 @@ impl Context {
 /// The state of one CPU. Every slot is a `u128`, so that the slot executor
 /// copies values in and out without a case per type. A value is always
 /// inside the width of its slot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct State {
     pub slots: [u128; slot::COUNT],
     pub context: Context,
@@ -293,19 +292,21 @@ impl State {
         self.slots[slot::FPSR] = value.into();
     }
 
-    /// N, Z, C and V as the bits 3 to 0.
+    /// N, Z, C and V as the bits 3 to 0, computed from the lazy flag
+    /// slots.
     pub fn nzcv(&self) -> u8 {
-        ((self.slots[slot::N] as u8 & 1) << 3)
-            | ((self.slots[slot::Z] as u8 & 1) << 2)
-            | ((self.slots[slot::C] as u8 & 1) << 1)
-            | (self.slots[slot::V] as u8 & 1)
+        crate::flags::nzcv(
+            self.slots[slot::FLAGS_KIND] as u8,
+            self.slots[slot::FLAGS_A] as u64,
+            self.slots[slot::FLAGS_B] as u64,
+        )
     }
 
+    /// Set the flags as the explicit kind.
     pub fn set_nzcv(&mut self, nzcv: u8) {
-        self.slots[slot::N] = u128::from((nzcv >> 3) & 1);
-        self.slots[slot::Z] = u128::from((nzcv >> 2) & 1);
-        self.slots[slot::C] = u128::from((nzcv >> 1) & 1);
-        self.slots[slot::V] = u128::from(nzcv & 1);
+        self.slots[slot::FLAGS_KIND] = crate::flags::EXPLICIT.into();
+        self.slots[slot::FLAGS_A] = u128::from(nzcv & 15);
+        self.slots[slot::FLAGS_B] = 0;
     }
 
     /// PSTATE in the layout of an SPSR, which is also what a debugger calls
@@ -320,6 +321,27 @@ impl State {
             | u32::from(self.context.sp_sel)
     }
 }
+
+/// Two states are equal when their architectural state is: the flags by
+/// their value, whatever kind and operands they are kept as.
+impl PartialEq for State {
+    fn eq(&self, other: &Self) -> bool {
+        let flags = slot::FLAGS_KIND..=slot::FLAGS_B;
+        self.slots
+            .iter()
+            .zip(&other.slots)
+            .enumerate()
+            .all(|(index, (a, b))| flags.contains(&index) || a == b)
+            && self.nzcv() == other.nzcv()
+            && self.context == other.context
+            && self.daif == other.daif
+            && self.il == other.il
+            && self.pstate13 == other.pstate13
+            && self.system == other.system
+    }
+}
+
+impl Eq for State {}
 
 impl State {
     /// Put a PSTATE in the layout of `cpsr` into the state. The stack
@@ -351,11 +373,11 @@ mod tests {
         assert_eq!(SLOTS[slot::X30].name, "x30");
         assert_eq!(SLOTS[slot::SP_EL1].name, "sp_el1");
         assert_eq!(SLOTS[slot::PC].name, "pc");
-        assert_eq!(SLOTS[slot::V].name, "v");
+        assert_eq!(SLOTS[slot::FLAGS_B].name, "flags_b");
         assert_eq!(SLOTS[slot::V0].name, "v0");
         assert_eq!(SLOTS[slot::V0 + 31].name, "v31");
         assert_eq!(SLOTS[slot::FPSR].name, "fpsr");
-        assert_eq!(SLOTS[slot::N].ty, ScalarType::Bits(1));
+        assert_eq!(SLOTS[slot::FLAGS_KIND].ty, ScalarType::Bits(4));
         assert_eq!(SLOTS[slot::V0].ty, ScalarType::Bits(128));
     }
 
