@@ -705,6 +705,52 @@ the flat images, `vmlab-hv` with `env.jit` for the boot).
   through the thunk, which puts the words that it reads into the frame and
   saves the caller-saved registers that hold values. J3 inlines them.
 
+### G3, measured by card J4
+
+Helios, 2026-11-27, one vCPU, *measured*. Before: `b640db7c` (`next` with
+J1). After: `f286f9b3`. Other cards ran boots and builds at the same time
+(load average 7 to 27 of 32 threads). The rows are in
+`bench/history/aarch64.jsonl`.
+
+| Workload | JIT, J1 | JIT, J4 | Gain |
+|---|---|---|---|
+| Scalar loop, flat, MIPS (median of 3, cores 28 to 31) | 163.6 | 1,901.9 | 11.6 times |
+| CoreMark mix, flat, MIPS | 143.6 | 315.2 | 2.2 times |
+| Debian 13 boot to agent ready, s (median of 3, cores 12 to 15) | 168.4 (166.3 to 170.5) | 136.4 (132.4 to 157.8) | 1.23 times |
+| The same, boot MIPS | 106.5 | 132.1 | 1.24 times |
+
+- **J4a. Where the exits go.** An exit of a block is a linked jump, a hit
+  of the jump cache, or a return to the Rust loop. CoreMark: 54.37 million
+  linked, 1.65 million hits, 463 to the loop. The boot, the last report of
+  the first run (18.0e9 instructions): 2,496 million linked (81 %), 339
+  million hits (11 %), 247 million to the loop (8 %), of which 106 million
+  are misses of the jump cache (a hit rate of 76 %) and 33 million are jumps
+  not linked yet. The jump cache was emptied 1.28 million times: every write
+  of TTBR0 or TTBR1, every TLBI, and every new epoch. The kernel has no
+  hardware PAN (`cortex-a53`), so it writes TTBR0 at every entry from EL0
+  and every return to it.
+- **J4b. The interpreter share** is that of J1: 47.4 million of 18.0e9
+  instructions (0.26 %) in 6.0 million runs of 361 refused blocks. No
+  instruction of the flat images runs in the interpreter.
+- **J4c. With `VMLAB_HV_JIT_CHAIN=0`** the flat rows are those of J1 (163.1
+  and 142.9 MIPS): the switch leaves the code of J1.
+- **J4d. Code.** The boot compiled 826,000 blocks to 284 MB of code (344
+  bytes a block) and dropped the region 4 times, against 550,000 blocks, 120
+  MB and one drop before: the exits are longer, and every drop compiles the
+  working set again.
+- **J4e. Two boots fell into emergency mode** at the first commits of the
+  card (`01d6a923`, `e8e239ff`), both with heavy work of other processes on
+  the host: udev did not find the EFI partition within its 90 s, where the
+  other boots needed 22 to 35 s. A boot with only the linked jumps, one with
+  only the jump cache, and one with both passed at low load. Then each clear
+  of the jump cache wrote its 128 KiB, and a phase with many system calls
+  paid two to four of those writes for each. Since `ca9d9be6` a clear moves
+  a generation that every key holds, and the three boots of the rows passed
+  at a load of 15 to 27. The basis that the cause was the clear, not a
+  defect of the chaining, is that (not proven): the failed phase ran the
+  same instructions in more host time, the boots of each half and the boots
+  after the change passed, and no difference showed in K2 or K1.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
