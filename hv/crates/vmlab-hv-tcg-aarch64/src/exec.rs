@@ -3408,7 +3408,10 @@ unsafe fn run_chained<M: Memory>(
     let state_pointer: *mut State = state;
     // SAFETY: as above.
     let frame = unsafe { (*first).frame.as_mut_ptr() };
-    let budget = budget.min(jit::seat::MOST) as i64;
+    // The count of a run is a `u32`: a run of more instructions counted
+    // `u32::MAX` for them, so a flat image of more than 2^32 instructions
+    // on one run lost the rest from its count (found by card J14).
+    let budget = budget.min(jit::seat::MOST).min(u64::from(u32::MAX)) as i64;
     let mut env = Env {
         state: state_pointer,
         memory,
