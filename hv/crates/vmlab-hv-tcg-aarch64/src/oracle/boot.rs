@@ -74,6 +74,19 @@ pub struct Options {
     pub vars: PathBuf,
     /// The names of the system registers in each instruction record.
     pub system: Vec<String>,
+    /// A window of a boot (`oracle::window`): the leader starts from a state
+    /// of our machine and not from the firmware. `code` and `vars` are then
+    /// not used.
+    pub window: Option<WindowImage>,
+}
+
+/// What the leader of a window starts from: the RAM of our machine at the
+/// start of the window, loaded at `RAM_BASE`, and the prelude that puts the
+/// registers in place, as the image of its flash.
+#[derive(Clone, Debug)]
+pub struct WindowImage {
+    pub ram: PathBuf,
+    pub prelude: PathBuf,
 }
 
 impl Options {
@@ -81,9 +94,37 @@ impl Options {
     /// device that the user did not name, the random seed of its device
     /// tree off, and a clock that counts instructions (DESIGN.md M4).
     fn machine(&self) -> Vec<String> {
+        // A window starts the CPU at EL2, so that its prelude can write every
+        // register of EL1 and leave with `ERET` (`oracle::window`).
+        let machine = if self.window.is_some() {
+            "virt,dtb-randomness=off,virtualization=on"
+        } else {
+            "virt,dtb-randomness=off"
+        };
+        let flash = match &self.window {
+            Some(window) => vec![
+                "-bios".into(),
+                window.prelude.display().to_string(),
+                "-device".into(),
+                format!(
+                    "loader,file={},addr={:#x},force-raw=on",
+                    window.ram.display(),
+                    super::leader::RAM_BASE
+                ),
+            ],
+            None => vec![
+                "-drive".into(),
+                format!(
+                    "if=pflash,format=raw,readonly=on,file={}",
+                    self.code.display()
+                ),
+                "-drive".into(),
+                format!("if=pflash,format=raw,file={}", self.vars.display()),
+            ],
+        };
         [
             "-machine",
-            "virt,dtb-randomness=off",
+            machine,
             "-cpu",
             &self.cpu,
             "-accel",
@@ -104,15 +145,7 @@ impl Options {
         ]
         .into_iter()
         .map(String::from)
-        .chain([
-            "-drive".into(),
-            format!(
-                "if=pflash,format=raw,readonly=on,file={}",
-                self.code.display()
-            ),
-            "-drive".into(),
-            format!("if=pflash,format=raw,file={}", self.vars.display()),
-        ])
+        .chain(flash)
         .collect()
     }
 
@@ -642,6 +675,7 @@ mod tests {
             code: "/f/code.fd".into(),
             vars: "/d/vars.fd".into(),
             system: vec!["ESR_EL1".into(), "FAR_EL1".into()],
+            window: None,
         };
         let argv = options.argv().join(" ");
         assert!(argv.starts_with(
@@ -659,5 +693,31 @@ mod tests {
         let dump = options.dump_argv(Path::new("/d/x.dtb")).join(" ");
         assert!(dump.contains("-machine virt,dtb-randomness=off,dumpdtb=/d/x.dtb -cpu"));
         assert!(!dump.contains("-plugin"));
+    }
+
+    #[test]
+    fn the_leader_of_a_window_starts_at_el2_from_the_prelude_with_our_ram() {
+        let options = Options {
+            qemu: "qemu-system-aarch64".into(),
+            plugin: "/p/a64lock.so".into(),
+            directory: "/d".into(),
+            cpu: "cortex-a53".into(),
+            ram_mib: 2048,
+            code: PathBuf::new(),
+            vars: PathBuf::new(),
+            system: vec![],
+            window: Some(WindowImage {
+                ram: "/w/window-3.ram".into(),
+                prelude: "/d/prelude.bin".into(),
+            }),
+        };
+        let argv = options.argv().join(" ");
+        assert!(argv.starts_with(
+            "-machine virt,dtb-randomness=off,virtualization=on -cpu cortex-a53 -accel tcg -smp 1 -m 2048"
+        ));
+        assert!(argv.contains(
+            "-bios /d/prelude.bin -device loader,file=/w/window-3.ram,addr=0x40000000,force-raw=on"
+        ));
+        assert!(!argv.contains("pflash"));
     }
 }

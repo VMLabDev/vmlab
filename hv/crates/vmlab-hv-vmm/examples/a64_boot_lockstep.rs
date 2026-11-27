@@ -378,6 +378,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             .iter()
             .map(|register| register.qemu.to_string())
             .collect(),
+        window: None,
     };
     let dtb = boot::dump_device_tree(&options)?;
     let fw_cfg_files = boot::capture_fw_cfg(&options)?;
