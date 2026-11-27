@@ -1990,7 +1990,7 @@ impl<M: Memory> Cpu<M> {
             // Mail of a CPU that waits on this one is taken here.
             self.take_mail();
             spins = spins.wrapping_add(1);
-            if spins % 64 == 0 {
+            if spins.is_multiple_of(64) {
                 std::thread::yield_now();
             } else {
                 std::hint::spin_loop();
@@ -2411,7 +2411,7 @@ impl<M: Memory> Cpu<M> {
         while left > 0 {
             if let Some(deadline) = deadline {
                 blocks += 1;
-                if blocks % CLOCK_BLOCKS == 0 && self.clock.count() >= deadline {
+                if blocks.is_multiple_of(CLOCK_BLOCKS) && self.clock.count() >= deadline {
                     break;
                 }
             }
