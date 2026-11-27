@@ -673,6 +673,38 @@ in J4 as a count). The eager write-back of H3 is only an option.
 
 Each J card replaces the estimate of its row by a measured bench row.
 
+### G1, measured by card J1
+
+Helios, 2026-11-27, one vCPU, *measured*. Other cards ran boots and builds
+at the same time (load average 5 to 19 of 32 threads), so the interpreter
+side moved by a factor of 1.6 between two runs of the same commit. The rows
+are in `bench/history/aarch64.jsonl` (backends `interpreter` and `jit` for
+the flat images, `vmlab-hv` with `env.jit` for the boot).
+
+| Workload | Interpreter | JIT (J1) | Gain |
+|---|---|---|---|
+| CoreMark mix, flat, MIPS (median of 3, cores 28 to 31) | 93.4 | 147.7 | 1.58 times |
+| Scalar loop, flat, MIPS | 95.1 | 167.2 | 1.76 times |
+| Debian 13 boot to agent ready, s (cores 12 to 15) | 244.5, and 390.5 in an earlier run | 193.1, and 186.9 in an earlier run | 1.27 to 2.1 times |
+| The same, average MIPS over 18.01e9 instructions (3d:M2) | 74, and 46 | 93, and 96 | |
+
+- **J1a.** CoreMark's checksums hold on both sides. No instruction of the
+  flat images runs in the interpreter (H2b). In the boot, 52.3 million of
+  19.0e9 instructions (0.28 %) ran in the interpreter, in 6.7 million runs
+  of 361 blocks that the emitter refused: `RBIT` has no inline form yet, and
+  the string functions of the kernel and of glibc use it.
+- **J1b.** Compile time is larger than B1 said. The boot compiled 1.13
+  million blocks in 12.4 s (11 µs a block, 6 % of the boot) to 448 MB of
+  code (395 bytes a block), and the 64 MiB region was full and dropped 6
+  times (H13c). CoreMark: 337 blocks in 1.5 ms (4.4 µs a block). The basis
+  of an explanation, not measured: the emitter allocates its use lists and
+  effect lists on the heap per block, and every drop of the region compiles
+  the working set again.
+- **J1c.** The gain is below the estimate of G1 (1.7 to 2 times on CoreMark).
+  The basis of an explanation, not measured: every load and store goes
+  through the thunk, which puts the words that it reads into the frame and
+  saves the caller-saved registers that hold values. J3 inlines them.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same

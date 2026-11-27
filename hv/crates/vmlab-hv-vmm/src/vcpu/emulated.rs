@@ -32,6 +32,8 @@ use crate::vm::ExitReason;
 const SLICE: u64 = 1 << 16;
 /// The slice while the trace log is on.
 const DEBUG_SLICE: u64 = 64;
+/// With the JIT on, a line of its counts after this many instructions.
+const JIT_REPORT: u64 = 1_000_000_000;
 
 /// The longest sleep of a halted vCPU whose timer has no deadline. A wake
 /// ends the sleep at once, so this bounds only a wake that was lost.
@@ -99,6 +101,8 @@ pub struct EmulatedVcpu {
     /// the CPU is set from it before each slice, so that it stands still
     /// while the machine is paused.
     counter: Option<(Counter, u64)>,
+    /// The instruction count at which `log_jit` writes next.
+    jit_report: u64,
 }
 
 /// The count of the system counter of a machine now.
@@ -137,6 +141,13 @@ impl EmulatedVcpu {
             fiq: line(true),
         };
         let mut cpu = Cpu::new(memory, state);
+        // `VMLAB_HV_JIT=1` compiles the blocks of the guest to host code
+        // (3e DESIGN.md J1).
+        if let Some(error) = &cpu.jit_error {
+            log::warn!("vcpu {id}: VMLAB_HV_JIT asks for the JIT, which does not start: {error}");
+        } else if cpu.jit_enabled() {
+            log::info!("vcpu {id}: the JIT is on");
+        }
         cpu.clock = clock;
         cpu.lines = Some(shared);
         if std::env::var_os("VMLAB_HV_BOOT_BLOCK_COUNTS").is_some() {
@@ -152,6 +163,7 @@ impl EmulatedVcpu {
             hypercall: None,
             logged: 0,
             counter: None,
+            jit_report: JIT_REPORT,
         }
     }
 
@@ -241,6 +253,28 @@ impl EmulatedVcpu {
 
     /// Write what the guest asked for and this CPU does not have to the
     /// log, each once (DESIGN.md G3f).
+    /// With the JIT on, every `JIT_REPORT` instructions: how many ran in
+    /// the interpreter (H2b) and what the emitter made, for the bench rows.
+    fn log_jit(&mut self) {
+        if self.cpu.instructions < self.jit_report || !self.cpu.jit_enabled() {
+            return;
+        }
+        self.jit_report = self.cpu.instructions + JIT_REPORT;
+        let jit = self.cpu.jit_counts();
+        log::info!(
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling",
+            self.id,
+            self.cpu.instructions,
+            jit.interpreted_instructions,
+            jit.interpreted_runs,
+            jit.compiled,
+            jit.refused,
+            jit.bytes,
+            jit.resets,
+            jit.compile_ns / 1_000_000
+        );
+    }
+
     fn log_unknown(&mut self) {
         if self.cpu.unknown.len() == self.logged {
             return;
@@ -344,6 +378,7 @@ impl VcpuBackend for EmulatedVcpu {
         }
         self.drive_timer();
         self.log_unknown();
+        self.log_jit();
         match stop {
             Stop::Budget => Exit::Again,
             Stop::Halt => Exit::Halt,
