@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vmlab_hv_devices::IrqLine;
-use vmlab_hv_tcg_aarch64::exec::Unknown;
+use vmlab_hv_tcg_aarch64::exec::{Lines, Unknown};
 use vmlab_hv_tcg_aarch64::timer::Clock;
 use vmlab_hv_tcg_aarch64::{Cpu, State, Stop};
 
@@ -37,22 +37,32 @@ const DEBUG_SLICE: u64 = 64;
 /// ends the sleep at once, so this bounds only a wake that was lost.
 const IDLE: Duration = Duration::from_millis(100);
 
-/// One interrupt input of the core: a level that any thread sets.
+/// One interrupt input of the core: a level that any thread sets. The core
+/// reads it before every block (`Cpu::lines`).
 pub struct CpuLine {
-    level: AtomicBool,
+    lines: Arc<Lines>,
+    fiq: bool,
     waker: Arc<Waker>,
 }
 
 impl CpuLine {
+    fn atomic(&self) -> &AtomicBool {
+        if self.fiq {
+            &self.lines.fiq
+        } else {
+            &self.lines.irq
+        }
+    }
+
     /// The level of the line now.
     pub fn level(&self) -> bool {
-        self.level.load(Ordering::SeqCst)
+        self.atomic().load(Ordering::SeqCst)
     }
 }
 
 impl IrqLine for CpuLine {
     fn set_level(&self, high: bool) {
-        if self.level.swap(high, Ordering::SeqCst) != high && high {
+        if self.atomic().swap(high, Ordering::SeqCst) != high && high {
             self.waker.notify();
         }
     }
@@ -99,18 +109,21 @@ impl EmulatedVcpu {
     /// system counter of `clock`.
     pub fn new(id: u8, memory: GuestBus, state: State, clock: Clock) -> Self {
         let waker = Arc::new(Waker::default());
-        let line = || {
+        let shared = Arc::new(Lines::default());
+        let line = |fiq| {
             Arc::new(CpuLine {
-                level: AtomicBool::new(false),
+                lines: shared.clone(),
+                fiq,
                 waker: waker.clone(),
             })
         };
         let lines = CpuLines {
-            irq: line(),
-            fiq: line(),
+            irq: line(false),
+            fiq: line(true),
         };
         let mut cpu = Cpu::new(memory, state);
         cpu.clock = clock;
+        cpu.lines = Some(shared);
         Self {
             id,
             cpu,
@@ -122,6 +135,12 @@ impl EmulatedVcpu {
             logged: 0,
             counter: None,
         }
+    }
+
+    /// Join the vCPU to the TLB mailboxes of its machine as CPU `id`, so
+    /// that the Inner Shareable TLB maintenance of one vCPU reaches it.
+    pub fn set_shootdown(&mut self, shootdown: Arc<vmlab_hv_tcg_aarch64::shootdown::Shootdown>) {
+        self.cpu.shootdown = Some((shootdown, usize::from(self.id)));
     }
 
     /// Take the system counter from `counter`, at `frequency` counts per
@@ -199,7 +218,7 @@ impl EmulatedVcpu {
     }
 
     fn interrupted(&self) -> bool {
-        self.lines.irq.level.load(Ordering::SeqCst) || self.lines.fiq.level.load(Ordering::SeqCst)
+        self.lines.irq.level() || self.lines.fiq.level()
     }
 
     /// Write what the guest asked for and this CPU does not have to the
@@ -273,13 +292,15 @@ impl VcpuBackend for EmulatedVcpu {
         self.waker.clear();
         self.sync_counter();
         self.drive_timer();
-        self.cpu.irq = self.lines.irq.level.load(Ordering::SeqCst);
-        self.cpu.fiq = self.lines.fiq.level.load(Ordering::SeqCst);
+        self.cpu.irq = self.lines.irq.level();
+        self.cpu.fiq = self.lines.fiq.level();
         // The debug log names the last exception of each slice. With the
         // trace log on, the slices are short, so that it names nearly
         // every one.
         let debug = log::log_enabled!(log::Level::Debug);
-        let short = log::log_enabled!(log::Level::Trace);
+        // Short slices cost most of the speed of the CPU, so they follow
+        // what the stderr log writes, not what the recorder keeps.
+        let short = crate::diagnostics::report::stderr_enabled(log::Level::Trace, module_path!());
         let before = self.cpu.exceptions;
         let stop = self.cpu.run(if short { DEBUG_SLICE } else { SLICE });
         if debug
@@ -289,7 +310,7 @@ impl VcpuBackend for EmulatedVcpu {
             use vmlab_hv_tcg_aarch64::sysreg::reg;
             let regs = &self.cpu.state.system.regs;
             log::debug!(
-                "vcpu {}: exception {} of the guest: {:?} from {:#x} to {:#x}, ESR_EL1 {:#x}, FAR_EL1 {:#x}, ELR_EL1 {:#x}, after {} instructions",
+                "vcpu {}: exception {} of the guest: {:?} from {:#x} to {:#x}, ESR_EL1 {:#x}, FAR_EL1 {:#x}, ELR_EL1 {:#x}, after {} instructions and {} translated blocks in {} ms",
                 self.id,
                 self.cpu.exceptions,
                 taken.cause,
@@ -298,7 +319,9 @@ impl VcpuBackend for EmulatedVcpu {
                 regs[reg::ESR_EL1],
                 regs[reg::FAR_EL1],
                 regs[reg::ELR_EL1],
-                self.cpu.instructions
+                self.cpu.instructions,
+                self.cpu.translations,
+                self.cpu.translation_ns / 1_000_000
             );
         }
         self.drive_timer();
@@ -355,9 +378,7 @@ impl VcpuBackend for EmulatedVcpu {
             let lines = &self.lines;
             let waker = &self.waker;
             waker.wait(timer.unwrap_or(IDLE).min(IDLE), || {
-                waker.kicked()
-                    || lines.irq.level.load(Ordering::SeqCst)
-                    || lines.fiq.level.load(Ordering::SeqCst)
+                waker.kicked() || lines.irq.level() || lines.fiq.level()
             });
         }
     }

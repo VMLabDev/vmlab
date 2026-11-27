@@ -297,7 +297,7 @@ pub fn prune(block: &mut Block) -> Vec<usize> {
     }
     fn intern(
         bindings: &mut Arc<Vec<super::block::Binding>>,
-        pool: &mut std::collections::HashMap<
+        pool: &mut super::fasthash::FastMap<
             Vec<super::block::Binding>,
             Arc<Vec<super::block::Binding>>,
         >,
@@ -308,7 +308,7 @@ pub fn prune(block: &mut Block) -> Vec<usize> {
             pool.insert(bindings.as_ref().clone(), bindings.clone());
         }
     }
-    let mut pool = std::collections::HashMap::new();
+    let mut pool = super::fasthash::FastMap::default();
     for exit in &mut block.exits {
         intern(&mut exit.globals, &mut pool);
         for frame in &mut exit.frames {

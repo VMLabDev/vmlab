@@ -16,25 +16,23 @@ use crate::generated::decode::{
     BaseCmpBranch, BaseTestBranch, BranchCond, BranchImm, BranchReg, CallImm, Record,
 };
 use crate::state::slot;
-use vmlab_hv_tcg_ir::native::Binary;
+use vmlab_hv_tcg_ir::native::{Binary, ScalarId};
 
 /// The address that a PC-relative field of `bits` bits names: the field
 /// counts instructions from the branch.
-fn target(b: &Builder, field: u32, bits: u32) -> u64 {
-    b.pc()
-        .wrapping_add((sign_extend(field.into(), bits) << 2) as u64)
+fn target(b: &mut Builder, field: u32, bits: u32) -> ScalarId {
+    b.pc_plus((sign_extend(field.into(), bits) << 2) as u64)
 }
 
 /// The next PC of a conditional branch: `target` where `taken` holds.
-fn conditional_branch(b: &mut Builder, taken: vmlab_hv_tcg_ir::native::ScalarId, target: u64) {
-    let target = b.imm(64, target);
-    let next = b.imm(64, b.pc().wrapping_add(4));
+fn conditional_branch(b: &mut Builder, taken: ScalarId, target: ScalarId) {
+    let next = b.pc_plus(4);
     let pc = b.select(64, taken, target, next);
     b.branch(pc);
 }
 
 fn link(b: &mut Builder) {
-    let next = b.imm(64, b.pc().wrapping_add(4));
+    let next = b.pc_plus(4);
     b.write(slot::X0 + 30, next);
 }
 
@@ -43,7 +41,7 @@ pub fn branch(b: &mut Builder, record: Record, f: &BranchImm) -> Lifted {
     if record != Record::B {
         return Lifted::Unsupported;
     }
-    let target = b.imm(64, target(b, f.addr, 26));
+    let target = target(b, f.addr, 26);
     b.branch(target);
     Lifted::Branch
 }
@@ -53,7 +51,7 @@ pub fn call(b: &mut Builder, record: Record, f: &CallImm) -> Lifted {
     if record != Record::BL {
         return Lifted::Unsupported;
     }
-    let target = b.imm(64, target(b, f.addr, 26));
+    let target = target(b, f.addr, 26);
     link(b);
     b.branch(target);
     Lifted::Branch

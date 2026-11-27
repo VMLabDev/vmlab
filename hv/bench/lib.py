@@ -29,10 +29,16 @@ RUN_DIR = os.path.join(BENCH_DIR, "run")
 
 TEMPLATE_ROOT = os.path.expanduser("~/.local/share/vmlab/templates")
 # What vmlab's firmware::Sources::installed picks on this host (notes/03).
+# VMLAB_HV_FIRMWARE_DIR_AARCH64 names another directory of the AAVMF pair,
+# as for the virt tests of vmlab-hv (guest/fetch-firmware.sh aarch64).
+AARCH64_FIRMWARE_DIR = os.environ.get(
+    "VMLAB_HV_FIRMWARE_DIR_AARCH64",
+    os.path.expanduser("~/.local/share/vmlab/guest/firmware/aarch64"),
+)
 FIRMWARE = {
     "aarch64": (
-        os.path.expanduser("~/.local/share/vmlab/guest/firmware/aarch64/AAVMF_CODE.fd"),
-        os.path.expanduser("~/.local/share/vmlab/guest/firmware/aarch64/AAVMF_VARS.fd"),
+        os.path.join(AARCH64_FIRMWARE_DIR, "AAVMF_CODE.fd"),
+        os.path.join(AARCH64_FIRMWARE_DIR, "AAVMF_VARS.fd"),
     ),
     "riscv64": (
         "/usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd",

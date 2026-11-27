@@ -786,7 +786,7 @@ pub fn assemble(
     }
 
     // The PCI host. The firmware, or the kernel, places the BARs.
-    let pci_root = Arc::new(Mutex::new(PciRoot::q35(map::PCI_MMIO64_BASE)));
+    let pci_root = Arc::new(Mutex::new(PciRoot::virt(map::PCI_MMIO64_BASE)));
     pci_root
         .lock()
         .set_mmio64_window(map::PCI_MMIO64_BASE, map::PCI_MMIO64_SIZE);
@@ -821,13 +821,17 @@ pub fn assemble(
         // Pin INTA of a slot is one of the four lines of the host, by the
         // slot (the `interrupt-map` of the device tree).
         let line = map::PCI_INTX_SPI + u32::from(slot) % 4;
+        // QEMU's virt presents a virtio function on its root bus as a
+        // transitional one (1af4:1000 to 1af4:103f, with an I/O BAR, read
+        // from its monitor). AAVMF's driver of a modern-only function wants
+        // a subsystem ID of 0x40 or more, so it would bind none of ours.
         Ok((
             slot,
             function,
             PciWiring {
                 msi: msi.clone(),
                 intx: Some(spi(line)),
-                transitional: false,
+                transitional: true,
                 msix_vectors: vectors,
                 doorbells: None,
             },
@@ -926,6 +930,7 @@ pub fn assemble(
     )
     .map_err(VmmError::Other)?;
     let mut vcpus = Vec::with_capacity(cpus);
+    let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(cpus));
     for (id, lines) in late.iter().enumerate() {
         let mut vcpu = EmulatedVcpu::new(
             id as u8,
@@ -933,6 +938,9 @@ pub fn assemble(
             State::reset(0),
             Clock::host(0, COUNTER_FREQUENCY),
         );
+        if cpus > 1 {
+            vcpu.set_shootdown(shootdown.clone());
+        }
         let counter = clock.clone();
         vcpu.set_counter(Arc::new(move || counter.count()), COUNTER_FREQUENCY);
         vcpu.set_timer_lines(TimerLines {
