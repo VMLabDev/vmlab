@@ -261,10 +261,19 @@ pub fn disk_serial(disk: &Disk) -> String {
         Some(pci) => {
             let slot = u16::from(pci.device & 0x1f) | (u16::from(pci.function & 0x7) << 5);
             let bus = u16::from(pci.bus);
-            [bus >> 12, bus >> 8, bus >> 4, bus, slot >> 12, slot >> 8, slot >> 4, slot]
-                .iter()
-                .map(|nibble| format!("{:02X}", nibble & 0xf))
-                .collect()
+            [
+                bus >> 12,
+                bus >> 8,
+                bus >> 4,
+                bus,
+                slot >> 12,
+                slot >> 8,
+                slot >> 4,
+                slot,
+            ]
+            .iter()
+            .map(|nibble| format!("{:02X}", nibble & 0xf))
+            .collect()
         }
         None => disk.id.clone(),
     }
@@ -284,11 +293,13 @@ mod tests {
         Disk {
             channel: None,
             unit: None,
-            pci: pci.map(|(bus, device, function)| vmlab_hv_proto::machine::PciAddress {
-                bus,
-                device,
-                function,
-            }),
+            pci: pci.map(
+                |(bus, device, function)| vmlab_hv_proto::machine::PciAddress {
+                    bus,
+                    device,
+                    function,
+                },
+            ),
             bus: Default::default(),
             port: None,
             cdrom: false,
@@ -323,9 +334,18 @@ mod tests {
     /// viostor writes the EUI-64; the function sits in bits 5 to 7.
     #[test]
     fn the_serial_spells_each_nibble_of_bus_and_slot() {
-        assert_eq!(disk_serial(&disk_at("d", Some((0, 0x1f, 0)))), "000000000000010F");
-        assert_eq!(disk_serial(&disk_at("d", Some((0, 2, 1)))), "0000000000000202");
-        assert_eq!(disk_serial(&disk_at("d", Some((0x12, 2, 0)))), "0000010200000002");
+        assert_eq!(
+            disk_serial(&disk_at("d", Some((0, 0x1f, 0)))),
+            "000000000000010F"
+        );
+        assert_eq!(
+            disk_serial(&disk_at("d", Some((0, 2, 1)))),
+            "0000000000000202"
+        );
+        assert_eq!(
+            disk_serial(&disk_at("d", Some((0x12, 2, 0)))),
+            "0000010200000002"
+        );
     }
 
     /// A disk the VMM places reports its id: one per disk, and the same at

@@ -572,12 +572,10 @@ impl Block {
                 Ok(()) => S_OK,
                 Err(_) => S_IOERR,
             },
-            T_GET_ID => {
-                match writer.write_all(&self.serial) {
-                    Ok(()) => S_OK,
-                    Err(_) => S_IOERR,
-                }
-            }
+            T_GET_ID => match writer.write_all(&self.serial) {
+                Ok(()) => S_OK,
+                Err(_) => S_IOERR,
+            },
             T_DISCARD => self.discard(&mut reader),
             _ => S_UNSUPP,
         };
