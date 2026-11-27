@@ -165,6 +165,17 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
             reads.extend(leave(op.imm)?);
             (reads, Vec::new())
         }
+        // Two words from `dst` on, and from `b` (low) and `dst` (high).
+        Code::LoadPair => {
+            let mut reads = vec![op.a];
+            reads.extend(leave(op.imm)?);
+            (reads, vec![op.dst, op.dst.checked_add(1)?])
+        }
+        Code::StorePair => {
+            let mut reads = vec![op.a, op.b, op.dst];
+            reads.extend(leave(op.imm)?);
+            (reads, Vec::new())
+        }
         Code::Access | Code::Call => {
             let effect = if op.code == Code::Access {
                 shape.accesses.get(op.imm as usize)?
