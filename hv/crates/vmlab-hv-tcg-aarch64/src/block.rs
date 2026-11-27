@@ -189,66 +189,124 @@ fn low(width: u8) -> u64 {
 
 /// Run one operation that is not an effect. `false`: an arithmetic
 /// operation outside its domain, which only a generic operation has.
-#[inline(always)]
+///
+/// # Panics
+/// When a word that the operation names is outside `frame`, or its generic
+/// operation outside `generics`.
+#[cfg(test)]
 pub(crate) fn step(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
-    let a = frame[usize::from(op.a)];
-    let b = frame[usize::from(op.b)];
-    let width = u32::from(op.aux);
-    let value = match op.code {
-        Code::Add => a.wrapping_add(b) & op.imm,
-        Code::Sub => a.wrapping_sub(b) & op.imm,
-        Code::Mul => a.wrapping_mul(b) & op.imm,
-        Code::And => a & b & op.imm,
-        Code::Or => (a | b) & op.imm,
-        Code::Xor => (a ^ b) & op.imm,
-        Code::ShiftLeft => (if b < 64 { a << b } else { 0 }) & op.imm,
-        Code::ShiftRight => (if b < 64 { a >> b } else { 0 }) & op.imm,
-        Code::ArithmeticShiftRight => {
-            let signed = ((a << (64 - width)) as i64) >> (64 - width);
-            (signed >> b.min(u64::from(width) - 1)) as u64 & op.imm
+    assert!(op_in_frame(op, frame.len(), generics.len()));
+    // SAFETY: checked just above.
+    unsafe { step_unchecked(op, frame, generics) }
+}
+
+/// Whether every word and every index that `op` names is inside a frame of
+/// `words` words and `generics` generic operations, for each code: what
+/// `step_unchecked` and the effects of `exec` read without a check.
+pub(crate) fn op_in_frame(op: &Op, words: usize, generics: usize) -> bool {
+    let word = |slot: Slot| usize::from(slot) < words;
+    word(op.a)
+        && word(op.b)
+        && word(op.dst)
+        && match op.code {
+            Code::Select => (op.imm as usize) < words,
+            Code::Widen => usize::from(op.dst) + 1 < words,
+            Code::Generic => (op.imm as usize) < generics,
+            _ => true,
         }
-        Code::Equal => u64::from(a == b),
-        Code::NotEqual => u64::from(a != b),
-        Code::Less => u64::from(a < b),
-        Code::LessEqual => u64::from(a <= b),
-        Code::IsZero => u64::from(a == 0),
-        Code::BitNot => !a & op.imm,
-        Code::Negate => a.wrapping_neg() & op.imm,
-        Code::SignExtend => ((a << (64 - width)) as i64 >> (64 - width)) as u64 & op.imm,
-        Code::LeadingZeros => u64::from((a & low(op.aux)).leading_zeros() - (64 - width)) & op.imm,
-        Code::TrailingZeros => u64::from((a & low(op.aux)).trailing_zeros().min(width)) & op.imm,
-        Code::ReverseBits => ((a & low(op.aux)).reverse_bits() >> (64 - width)) & op.imm,
-        Code::ReverseBytes => ((a & low(op.aux)).swap_bytes() >> (64 - width)) & op.imm,
-        Code::PopCount => u64::from((a & low(op.aux)).count_ones()) & op.imm,
-        Code::Slice => (a >> width) & op.imm,
-        Code::Concat => ((a << width) | b) & op.imm,
-        Code::Select => {
-            if frame[op.imm as usize] != 0 {
-                a
-            } else {
-                b
+}
+
+/// The word `slot` of the frame, without a bounds check.
+///
+/// # Safety
+/// `slot` is inside `frame`.
+#[inline(always)]
+pub(crate) unsafe fn word(frame: &[u64], slot: usize) -> u64 {
+    debug_assert!(slot < frame.len());
+    // SAFETY: the caller's promise.
+    unsafe { *frame.get_unchecked(slot) }
+}
+
+/// Write the word `slot` of the frame, without a bounds check.
+///
+/// # Safety
+/// `slot` is inside `frame`.
+#[inline(always)]
+pub(crate) unsafe fn set_word(frame: &mut [u64], slot: usize, value: u64) {
+    debug_assert!(slot < frame.len());
+    // SAFETY: the caller's promise.
+    unsafe { *frame.get_unchecked_mut(slot) = value }
+}
+
+/// `step` without the bounds checks: the loop of `exec` runs the operations
+/// of a block whose words it checked once, when the block was made
+/// (`op_in_frame`). The checks were a part of every operation.
+///
+/// # Safety
+/// `op_in_frame(op, frame.len(), generics.len())` holds.
+#[inline(always)]
+pub(crate) unsafe fn step_unchecked(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
+    // SAFETY: the caller's promise covers every word and index read here.
+    unsafe {
+        let a = word(frame, usize::from(op.a));
+        let b = word(frame, usize::from(op.b));
+        let width = u32::from(op.aux);
+        let value = match op.code {
+            Code::Add => a.wrapping_add(b) & op.imm,
+            Code::Sub => a.wrapping_sub(b) & op.imm,
+            Code::Mul => a.wrapping_mul(b) & op.imm,
+            Code::And => a & b & op.imm,
+            Code::Or => (a | b) & op.imm,
+            Code::Xor => (a ^ b) & op.imm,
+            Code::ShiftLeft => (if b < 64 { a << b } else { 0 }) & op.imm,
+            Code::ShiftRight => (if b < 64 { a >> b } else { 0 }) & op.imm,
+            Code::ArithmeticShiftRight => {
+                let signed = ((a << (64 - width)) as i64) >> (64 - width);
+                (signed >> b.min(u64::from(width) - 1)) as u64 & op.imm
             }
+            Code::Equal => u64::from(a == b),
+            Code::NotEqual => u64::from(a != b),
+            Code::Less => u64::from(a < b),
+            Code::LessEqual => u64::from(a <= b),
+            Code::IsZero => u64::from(a == 0),
+            Code::BitNot => !a & op.imm,
+            Code::Negate => a.wrapping_neg() & op.imm,
+            Code::SignExtend => ((a << (64 - width)) as i64 >> (64 - width)) as u64 & op.imm,
+            Code::LeadingZeros => u64::from((a & low(op.aux)).leading_zeros() - (64 - width)) & op.imm,
+            Code::TrailingZeros => u64::from((a & low(op.aux)).trailing_zeros().min(width)) & op.imm,
+            Code::ReverseBits => ((a & low(op.aux)).reverse_bits() >> (64 - width)) & op.imm,
+            Code::ReverseBytes => ((a & low(op.aux)).swap_bytes() >> (64 - width)) & op.imm,
+            Code::PopCount => u64::from((a & low(op.aux)).count_ones()) & op.imm,
+            Code::Slice => (a >> width) & op.imm,
+            Code::Concat => ((a << width) | b) & op.imm,
+            Code::Select => {
+                if word(frame, op.imm as usize) != 0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            Code::Widen => {
+                set_word(frame, usize::from(op.dst) + 1, 0);
+                a
+            }
+            Code::Generic => return generics.get_unchecked(op.imm as usize).run(frame),
+            // The loop of `exec` runs the effects.
+            Code::Guard
+            | Code::Load1
+            | Code::Load2
+            | Code::Load4
+            | Code::Load8
+            | Code::Store1
+            | Code::Store2
+            | Code::Store4
+            | Code::Store8
+            | Code::Access
+            | Code::Call => return true,
+        };
+        set_word(frame, usize::from(op.dst), value);
+        true
         }
-        Code::Widen => {
-            frame[usize::from(op.dst) + 1] = 0;
-            a
-        }
-        Code::Generic => return generics[op.imm as usize].run(frame),
-        // The loop of `exec` runs the effects.
-        Code::Guard
-        | Code::Load1
-        | Code::Load2
-        | Code::Load4
-        | Code::Load8
-        | Code::Store1
-        | Code::Store2
-        | Code::Store4
-        | Code::Store8
-        | Code::Access
-        | Code::Call => return true,
-    };
-    frame[usize::from(op.dst)] = value;
-    true
 }
 
 fn is_wide(ty: ScalarType) -> bool {

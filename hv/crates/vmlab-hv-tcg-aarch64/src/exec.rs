@@ -72,7 +72,7 @@ pub const BLOCK_INSTRUCTIONS: u32 = 64;
 const CLOCK_BLOCKS: u32 = 64;
 
 /// The block cache is direct-mapped by the PC.
-const CACHE_ENTRIES: usize = 1 << 14;
+const CACHE_ENTRIES: usize = 1 << 16;
 /// The heap bytes of the young generation of the store of a cache: the
 /// blocks that a block of another PC took the entry of (`Cache`). The old
 /// generation holds as much again at most.
@@ -1106,6 +1106,16 @@ fn compile(
     let Some(outputs) = block_outputs else {
         return Err(host("a block without an exit"));
     };
+    // The loop reads the words of an operation without a check.
+    let words = lowering.frame.len();
+    let generics = lowering.generics.len();
+    if !lowering
+        .ops
+        .iter()
+        .all(|op| block::op_in_frame(op, words, generics))
+    {
+        return Err(host("an operation of a block names a word outside its frame"));
+    }
     Ok(Compiled {
         phys,
         context,
@@ -1140,7 +1150,8 @@ fn load<M: Memory, const N: usize>(
     memory: &mut M,
     side: &mut Side,
 ) -> Result<(), (u32, Failed)> {
-    let at = frame[usize::from(op.a)];
+    // SAFETY: `compile` checked the words of every operation.
+    let at = unsafe { block::word(frame, usize::from(op.a)) };
     let user = side.user || op.aux & UNPRIVILEGED != 0;
     // The common case: the TLB holds the page with the permission, nothing
     // keeps the accesses, and the memory holds the address. A read that
@@ -1151,7 +1162,8 @@ fn load<M: Memory, const N: usize>(
     {
         let mut bytes = [0u8; 8];
         if memory.read(phys, &mut bytes[..N]).is_ok() {
-            frame[usize::from(op.dst)] = u64::from_le_bytes(bytes);
+            // SAFETY: as above.
+            unsafe { block::set_word(frame, usize::from(op.dst), u64::from_le_bytes(bytes)) };
             return Ok(());
         }
     }
@@ -1173,8 +1185,13 @@ fn store<M: Memory, const N: usize>(
     side: &mut Side,
     single: bool,
 ) -> Result<(), (u32, Failed)> {
-    let at = frame[usize::from(op.a)];
-    let value = frame[usize::from(op.b)];
+    // SAFETY: `compile` checked the words of every operation.
+    let (at, value) = unsafe {
+        (
+            block::word(frame, usize::from(op.a)),
+            block::word(frame, usize::from(op.b)),
+        )
+    };
     let exit = op.imm as u32;
     let user = side.user || op.aux & UNPRIVILEGED != 0;
     // The common case: the TLB holds the page with the permission, the page
@@ -1239,7 +1256,8 @@ impl Compiled {
     ) -> Result<(), (u32, Failed)> {
         match op.code {
             Code::Guard => {
-                if (frame[usize::from(op.a)] != 0) != (op.aux != 0) {
+                // SAFETY: `compile` checked the words of every operation.
+                if (unsafe { block::word(frame, usize::from(op.a)) } != 0) != (op.aux != 0) {
                     return Self::guard(op.imm as u32, frame, leaves, memory, side);
                 }
                 Ok(())
@@ -1412,7 +1430,10 @@ impl Compiled {
         side.user = self.context.el == 0;
         for op in &self.ops {
             if (op.code as u8) < FIRST_EFFECT {
-                if !block::step(op, &mut self.frame, &self.generics) {
+                // SAFETY: `compile` checked every operation against the
+                // frame and the generic operations of the block, and
+                // neither changes size after it.
+                if !unsafe { block::step_unchecked(op, &mut self.frame, &self.generics) } {
                     return (
                         0,
                         Some(Halt::Stop(host(
