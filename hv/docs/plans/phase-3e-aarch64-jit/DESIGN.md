@@ -1063,6 +1063,48 @@ The rows are in `bench/history/aarch64.jsonl`.
   systemd, of the 30.7e9 of a whole boot (3d:M2). T1 (J8) still asks for
   Fedora at agent ready.
 
+### T1, measured by card J8
+
+Helios, 2026-11-28, *measured*. The JIT is on by default (Q2): every boot
+of the after column ran with no `VMLAB_HV_JIT` in its environment, and each
+vCPU said in its log that the JIT was on. Other cards ran builds and boots
+at the same time (load average 2 to 10 of 32 threads). The rows are in
+`bench/history/aarch64.jsonl` with the note "card J8". The boots of the
+1 vCPU column ran on cores 20 to 23, those of the 2 vCPU column on cores 24
+to 27, the two columns side by side.
+
+| Template | 1 vCPU, s (each repeat) | 2 vCPUs, s (each repeat) |
+|---|---|---|
+| alpine-3.23 | 124.3, 88.4, 93.9 | 108.6, 120.3, 96.3 |
+| debian-13 | 92.5, 78.2, 96.2 | 57.4, 60.2, 53.6 |
+| fedora-44 | 168.5, 148.4, 150.4 | 168.5, 159.0, 160.4 |
+| ubuntu-24.04 | 108.7, 107.0, 106.8 | 100.3, 96.4, 95.0 |
+
+- **J8a. T1 holds.** All 24 boots reached agent ready. No serial log of
+  the 24 has a line of emergency mode, a failed dependency or a timed-out
+  job. The boot MIPS row of Debian at one vCPU is 195.5 (189.6 to 230.3),
+  above 150. Fedora at one vCPU, which fell into emergency mode in every
+  run of J6 (J6f) and of #1048, reached agent ready in 148 to 169 s.
+- **J8b. The fallback count is zero** in every boot: no block refused, and
+  85 to 7,788 instructions a boot in the interpreter at the budget (H2c).
+- **J8c. Before and after.** The JIT code did not change, only its default,
+  so the two sides measure the same code. Before: `next` (`a734a48c`) with
+  `VMLAB_HV_JIT=1`. After: this card with no switch. Side by side, Debian at
+  one vCPU, the median of 3, cores 12 to 15 and 16 to 19: 70.1 s (256.5
+  MIPS) before and 74.6 s (241.2 MIPS) after, inside the spread of each
+  side (23.9 and 23.0 s). An earlier pair one after the other on cores 20
+  to 23: 57.1 s before and 76.2 s after, with the load of the host
+  changing between them. The flat images, cores 16 to 19: CoreMark 2,036
+  MIPS before and 2,075 after, the scalar loop 2,091 and 2,126. No
+  instruction of the flat images ran in the interpreter.
+- **J8d. bench-check** compares a JIT row with the JIT row before it and an
+  interpreter row with the interpreter row before it, leaves the rows of K3
+  out, and fails a JIT row whose boots ran more blocks in the interpreter
+  for a missing form than the JIT row before it.
+- **J8e. K7.** The snapshot, debug port and reset tests of card C14 run with
+  the JIT and on the interpreter, in `vmlab-hv-vmm` and at S1 over the
+  control socket (VERIFICATION.md, card J8).
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same

@@ -2327,3 +2327,72 @@ of the design.
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn. QEMU ran as the oracle of K1.
+
+## Card J8, #1159 (2026-11-28)
+
+Bar T1 of 3e, and the JIT on by default (3e DESIGN.md T1, J8, Q2). The
+measured rows are in J8 of the design.
+
+### What changed
+
+- The CPU of an aarch64 machine runs the JIT by default:
+  `EmulatedVcpu::new` turns it on unless `VMLAB_HV_JIT` is `0`, `off` or
+  `false` (`exec::machine_jit_from_environment`, H2e). `VMLAB_HV_JIT_CHECK`
+  turns it on whatever `VMLAB_HV_JIT` says. A JIT that does not start is a
+  warning, and the CPU runs the interpreter. A bare `Cpu::new`, as the tests
+  and the tools of this crate build one, still starts the JIT only when
+  `VMLAB_HV_JIT` names it (`exec::jit_from_environment`), so that a test of
+  the interpreter stays one (H2a). The vCPU says at its start which of the
+  two it runs.
+- `bench/lib.py` reads the switch the same way, so the rows of a run with no
+  switch say `env.jit: true`.
+- `bench-check` compares the aarch64 rows of vmlab-hv within their JIT mode:
+  a JIT row with the JIT row before it, an interpreter row (`VMLAB_HV_JIT=0`,
+  and every row from before the JIT) with the interpreter row before it. A
+  row of K3 measures the check and is not gated. A JIT row also fails when
+  more of its blocks ran in the interpreter for a missing form (H2b) than in
+  the JIT row before it.
+- The boot lockstep (O4) leaves the interrupts to the leader again. A CPU of
+  a machine reads the lines of its machine before every block since card
+  C13, so the follower took an interrupt that its GIC had pending where the
+  leader took none (K4 below). The lockstep now runs its CPU without those
+  lines, and the lines still tell the checks of the lockstep the level of
+  the GIC. Its report says whether the CPU ran the JIT, and how many runs
+  were compiled.
+
+### Equal behaviour
+
+- K7 (`vmlab-hv-vmm`, `virt::tests`): the snapshot test (save, load, the
+  CPU, the GIC, the timer and RAM back, the TLB empty), the debug port test
+  (pause, the registers, steps, a register write, memory by virtual address,
+  detach) and the reset in place each run with the JIT and on the
+  interpreter, and check that the JIT side ran compiled code before and
+  after the load or the reset, and the interpreter side none.
+- K7 at S1 (`vmlab-hv`, `virt_acceptance`): the snapshot test of C14 over
+  the control socket runs twice, with `VMLAB_HV_JIT=1` and `=0`, in the same
+  process and in a new one on the same disk, and reads in the log of the
+  machine which of the two its vCPU ran.
+- K4: see J8 of the design for the run and what it found.
+- K1: no emitter form changed, so no group had to run. K2 ran in `ci::check`
+  (`tests/jit.rs`).
+
+### Tests
+
+- `vmlab-hv-vmm`: `a_snapshot_of_an_emulated_machine_brings_its_cpu_gic_timer_and_ram_back`,
+  `the_debug_port_reads_steps_and_writes_an_emulated_cpu` and
+  `a_guest_reset_runs_the_boot_again_in_place` over both runners.
+- `vmlab-hv`: `snapshots_of_an_emulated_aarch64_machine_online_and_offline`
+  (the JIT) and `..._on_the_interpreter`.
+- `bench`: `test_jit_rows_compare_with_jit_rows_only`,
+  `test_a_slower_jit_row_fails`, `test_a_row_of_the_check_is_not_gated`,
+  `test_more_refused_blocks_fail_a_jit_row`, and the switch with no value.
+
+### Sources read for this card
+
+- The state of this crate, of `vmlab-hv-vmm` (the emulated vCPU, the `virt`
+  tests, the boot lockstep), of `vmlab-hv` (`virt_acceptance.rs`) and of the
+  bench.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the oracle of K4.
