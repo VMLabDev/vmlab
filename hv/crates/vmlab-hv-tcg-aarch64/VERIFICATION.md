@@ -1527,12 +1527,14 @@ of the interpreter, not an instruction or a device that a boot misses.
 `bench/run.py --backend vmlab-hv --arch aarch64 --suite boot` on helios,
 the templates of `~/.local/share/vmlab/templates/aarch64`, AAVMF of
 `guest/fetch-firmware.sh`, 2 GiB, pinned to four cores, under the memory cap
-(`systemd-run --scope -p MemoryMax=24G`). One run each.
+(`systemd-run --scope -p MemoryMax=24G`). One run each at commit `29189e7f`
+(the code of this card less its tests and lints), Debian at 1 vCPU three
+times.
 
 | Template | 1 vCPU | 2 vCPUs |
 |---|---|---|
 | alpine-3.23 | agent ready in 358 s | agent ready in 356 s |
-| debian-13 | agent ready in 278 s and 302 s; one run of three in emergency mode | agent ready in 247 s |
+| debian-13 | agent ready in 278 s, 285 s and 302 s; one run of an earlier commit of this card in emergency mode | agent ready in 247 s |
 | fedora-44 | emergency mode | emergency mode |
 | ubuntu-24.04 | emergency mode | agent ready in 317 s |
 
@@ -1571,8 +1573,8 @@ same results. `timer` gives the same results after the deadline exit above.
 
 ### What this card does not do
 
-- Fedora at 1 and 2 vCPUs, Ubuntu at 1 vCPU and one Debian run at 1 vCPU
-  do not reach agent ready: the speed above.
+- Fedora at 1 and 2 vCPUs and Ubuntu at 1 vCPU do not reach agent ready,
+  and Debian at 1 vCPU is near its device timeouts: the speed above.
 - O4 for Debian did not run: at the 0.59 million instructions a second of
   card C10 the 18e9 instructions of the boot take about 8.5 hours.
 - The S1 test of the aarch64 guest asset (`s1_aarch64.rs`, card C14) did
