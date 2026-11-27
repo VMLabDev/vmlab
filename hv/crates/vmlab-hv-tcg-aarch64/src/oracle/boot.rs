@@ -81,8 +81,9 @@ pub struct Options {
 }
 
 /// What the leader of a window starts from: the RAM of our machine at the
-/// start of the window, loaded at `RAM_BASE`, and the prelude that puts the
-/// registers in place, as the image of its flash.
+/// start of the window above its first `window::LOW` bytes, loaded there,
+/// and the image of its flash: the prelude that puts the registers in place
+/// and copies those first bytes, where QEMU puts its device tree first.
 #[derive(Clone, Debug)]
 pub struct WindowImage {
     pub ram: PathBuf,
@@ -109,7 +110,7 @@ impl Options {
                 format!(
                     "loader,file={},addr={:#x},force-raw=on",
                     window.ram.display(),
-                    super::leader::RAM_BASE
+                    super::leader::RAM_BASE + super::window::LOW
                 ),
             ],
             None => vec![
@@ -716,7 +717,7 @@ mod tests {
             "-machine virt,dtb-randomness=off,virtualization=on -cpu cortex-a53 -accel tcg -smp 1 -m 2048"
         ));
         assert!(argv.contains(
-            "-bios /d/prelude.bin -device loader,file=/w/window-3.ram,addr=0x40000000,force-raw=on"
+            "-bios /d/prelude.bin -device loader,file=/w/window-3.ram,addr=0x40100000,force-raw=on"
         ));
         assert!(!argv.contains("pflash"));
     }

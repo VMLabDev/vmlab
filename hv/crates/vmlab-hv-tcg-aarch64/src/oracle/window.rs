@@ -33,6 +33,13 @@ const MAGIC: &str = "vmlab-a64-window 1";
 
 /// Where the data of the prelude starts in its flash image.
 pub const DATA: u64 = 0x1_0000;
+/// The first bytes of RAM, where QEMU puts the device tree of a machine that
+/// starts from its flash. The leader gets the RAM above them as a file, and
+/// the prelude copies these from its flash image, at `LOW_IN_FLASH`.
+pub const LOW: u64 = 0x10_0000;
+const LOW_IN_FLASH: u64 = 0x10_0000;
+/// Where RAM starts.
+const RAM_BASE: u64 = 0x4000_0000;
 const AT_X: u32 = 0;
 const AT_SP: u32 = 248;
 const AT_PC: u32 = 256;
@@ -233,6 +240,26 @@ fn ldr_q(rt: u32, rn: u32, offset: u32) -> u32 {
     0x3dc0_0000 | (offset / 16) << 10 | (rn & 31) << 5 | (rt & 31)
 }
 
+/// `LDR Xt, [Xn], #8`.
+fn ldr_next(rt: u32, rn: u32) -> u32 {
+    0xf840_0400 | 8 << 12 | (rn & 31) << 5 | (rt & 31)
+}
+
+/// `STR Xt, [Xn], #8`.
+fn str_next(rt: u32, rn: u32) -> u32 {
+    0xf800_0400 | 8 << 12 | (rn & 31) << 5 | (rt & 31)
+}
+
+/// `SUBS Xd, Xn, #1`.
+fn subs_one(rd: u32, rn: u32) -> u32 {
+    0xf100_0400 | (rn & 31) << 5 | (rd & 31)
+}
+
+/// `B.NE` to an offset in instructions.
+fn b_ne(offset: i32) -> u32 {
+    0x5400_0001 | (offset as u32 & 0x7_ffff) << 5
+}
+
 /// `SUB Xd, Xn, Xm`.
 fn sub(rd: u32, rn: u32, rm: u32) -> u32 {
     0xcb00_0000 | (rm & 31) << 16 | (rn & 31) << 5 | (rd & 31)
@@ -256,12 +283,18 @@ fn target(register: &Compared, value: u64) -> Option<(u16, u64)> {
     }
 }
 
-/// The flash image of the leader: the prelude at 0, its data at `DATA`.
-/// `None`: the file misses a register of `compared()`.
-pub fn prelude(start: &Start) -> Option<Vec<u8>> {
+/// The flash image of the leader: the prelude at 0, its data at `DATA`,
+/// and `low`, the first `LOW` bytes of our RAM, at `LOW_IN_FLASH`. `None`:
+/// the file misses a register of `compared()`.
+pub fn prelude(start: &Start, low: &[u8]) -> Option<Vec<u8>> {
     let list = compared();
     let values = start.values(&list)?;
     let mut words = Vec::new();
+    // The first bytes of RAM, eight at a time.
+    words.extend(asm::load(2, LOW_IN_FLASH));
+    words.extend(asm::load(3, RAM_BASE));
+    words.extend(asm::load(4, LOW / 8));
+    words.extend([ldr_next(0, 2), str_next(0, 3), subs_one(4, 4), b_ne(-3)]);
     // X1 points at the data.
     words.extend(asm::load(1, DATA));
     // EL1 in AArch64 with no trap to EL2, the FP registers open to EL2,
@@ -341,6 +374,10 @@ pub fn prelude(start: &Start) -> Option<Vec<u8>> {
         data[at..at + 16].copy_from_slice(&value.to_le_bytes());
     }
     image.extend(data);
+    image.resize(LOW_IN_FLASH as usize, 0);
+    let mut first = low.to_vec();
+    first.resize(LOW as usize, 0);
+    image.extend(first);
     Some(image)
 }
 
@@ -396,7 +433,7 @@ mod tests {
     #[test]
     fn the_prelude_is_instructions_that_end_in_eret_and_data_that_holds_the_state() {
         let start = Start::of(&sample(), 1, 0x99);
-        let image = prelude(&start).expect("the prelude builds");
+        let image = prelude(&start, &[0x5a; 16]).expect("the prelude builds");
         let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
         let mut code = Vec::new();
         let mut at = 0;
@@ -437,6 +474,16 @@ mod tests {
         assert_eq!(sub(0, 0, 2), 0xcb02_0000);
         assert_eq!(ldr(2, 1, 272), 0xf940_8822);
         assert_eq!(ldr_q(5, 1, 512), 0x3dc0_8025);
+        // The copy of the first bytes of RAM, and those bytes in the image.
+        assert!(code.windows(4).any(|four| four
+            == [ldr_next(0, 2), str_next(0, 3), subs_one(4, 4), b_ne(-3)]));
+        assert_eq!(ldr_next(0, 2), 0xf840_8440);
+        assert_eq!(str_next(0, 3), 0xf800_8460);
+        assert_eq!(subs_one(4, 4), 0xf100_0484);
+        assert_eq!(b_ne(-3), 0x54ff_ffa1);
+        assert_eq!(image.len() as u64, LOW_IN_FLASH + LOW);
+        assert_eq!(image[LOW_IN_FLASH as usize + 15], 0x5a);
+        assert_eq!(image[LOW_IN_FLASH as usize + 16], 0);
     }
 
     #[test]

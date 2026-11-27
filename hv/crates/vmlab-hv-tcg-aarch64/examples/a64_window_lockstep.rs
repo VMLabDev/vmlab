@@ -69,8 +69,9 @@ const CORE: [&str; 20] = [
     "SP_EL1",
 ];
 /// The instructions that the leader may run before the first one of the
-/// window: the prelude.
-const PRELUDE_LIMIT: u64 = 10_000;
+/// window: the prelude, with its copy of the first MiB of RAM in four
+/// instructions for every eight bytes.
+const PRELUDE_LIMIT: u64 = 4 * window::LOW / 8 + 10_000;
 const SILENCE: Duration = Duration::from_secs(60);
 const KEPT: usize = 256;
 
@@ -153,6 +154,8 @@ struct Outcome {
     instructions: u64,
     differences: u64,
     exceptions: u64,
+    /// Exceptions that the leader took at the fetch of an instruction.
+    fetch_aborts: u64,
     counters: u64,
     timed: u64,
     identity: BTreeMap<String, u64>,
@@ -223,6 +226,52 @@ fn external_abort(cpu: &Cpu<FlatMemory>) -> bool {
     matches!(class, 0x20 | 0x21 | 0x24 | 0x25) && (0x10..=0x17).contains(&status)
 }
 
+/// The descriptors of the walk of `va` in our memory, for the 4K granule.
+fn walk(cpu: &mut Cpu<FlatMemory>, va: u64) -> Vec<(u32, u64, u64)> {
+    use vmlab_hv_tcg::Memory;
+    let regs = &cpu.state.system.regs;
+    let tcr = regs[reg::TCR_EL1];
+    let (table, size) = if va >> 63 == 0 {
+        (regs[reg::TTBR0_EL1], tcr & 63)
+    } else {
+        (regs[reg::TTBR1_EL1], tcr >> 16 & 63)
+    };
+    let bits = 64 - size;
+    let mut level = 4 - (bits - 12).div_ceil(9) as u32;
+    let mut table = table & 0x0000_ffff_ffff_fffe;
+    let mut found = Vec::new();
+    while level <= 3 {
+        let shift = 12 + 9 * (3 - level);
+        let index = va >> shift & 0x1ff;
+        let at = table + index * 8;
+        let mut bytes = [0u8; 8];
+        if cpu.memory.read(at, &mut bytes).is_err() {
+            break;
+        }
+        let descriptor = u64::from_le_bytes(bytes);
+        found.push((level, at, descriptor));
+        if descriptor & 1 == 0 || (level < 3 && descriptor & 2 == 0) {
+            break;
+        }
+        table = descriptor & 0x0000_ffff_ffff_f000;
+        level += 1;
+    }
+    found
+}
+
+/// Write `bytes` to `path` with a hole for every page of zeros.
+fn write_sparse(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::create(path)?;
+    file.set_len(bytes.len() as u64)?;
+    for (index, page) in bytes.chunks(4096).enumerate() {
+        if page.iter().any(|byte| *byte != 0) {
+            file.write_all_at(page, index as u64 * 4096)?;
+        }
+    }
+    Ok(())
+}
+
 fn run_window(
     arguments: &Arguments,
     number: u32,
@@ -235,11 +284,18 @@ fn run_window(
         .filter(|register| arguments.all || CORE.contains(&register.qemu))
         .filter(|register| !arguments.ignore.iter().any(|name| name == register.qemu))
         .collect();
+    let mut data = std::fs::read(ram)?;
+    data.resize(arguments.ram_mib as usize * 1024 * 1024, 0);
+    // QEMU puts its device tree into the first bytes of RAM: the prelude
+    // copies ours there, and the leader loads the rest as a file.
+    let low = window::LOW as usize;
     let prelude = directory.join("prelude.bin");
     std::fs::write(
         &prelude,
-        window::prelude(start).ok_or("the window file misses a register")?,
+        window::prelude(start, &data[..low]).ok_or("the window file misses a register")?,
     )?;
+    let high = directory.join("ram-high.bin");
+    write_sparse(&high, &data[low..])?;
     let options = boot::Options {
         qemu: arguments.qemu.clone(),
         plugin: arguments.plugin.clone(),
@@ -253,13 +309,10 @@ fn run_window(
             .map(|register| register.qemu.to_string())
             .collect(),
         window: Some(WindowImage {
-            ram: ram.to_path_buf(),
+            ram: high.clone(),
             prelude,
         }),
     };
-
-    let mut data = std::fs::read(ram)?;
-    data.resize(arguments.ram_mib as usize * 1024 * 1024, 0);
     let state = start.state().ok_or("the window has no state of our CPU")?;
     let mut cpu = Cpu::new(FlatMemory::new(RAM_BASE, data), state);
     if machine_jit_from_environment() && !cpu.jit_enabled() {
@@ -321,6 +374,14 @@ fn run_window(
             );
             for line in &found {
                 println!("  {line}");
+            }
+            // Where our tables put the PC of each side, for a difference of
+            // a translation.
+            for (side, address) in [("ours", cpu.state.pc()), ("the leader's", current.core.pc)] {
+                println!("  the walk of {side} PC {address:#x} in our RAM:");
+                for (level, at, descriptor) in walk(&mut cpu, address) {
+                    println!("    level {level}: {descriptor:#018x} at {at:#x}");
+                }
             }
             let mut text = String::new();
             for (pc, encoding) in &kept {
@@ -438,6 +499,25 @@ fn run_window(
             }
             Some(Adopt::Call) | None => {}
         }
+        // The leader took an exception at the fetch of the next instruction
+        // (an instruction abort): it has no record of its own, and the next
+        // record is at the vector. Our CPU takes it in its next step.
+        if cpu.taken.is_none()
+            && cpu.state.pc() != next.core.pc
+            && discontinuities
+                .iter()
+                .any(|(kind, from, _)| *kind == 2 && *from == cpu.state.pc())
+        {
+            outcome.fetch_aborts += 1;
+            if cpu.step().is_ok() && external_abort(&cpu) {
+                outcome.ended = "a fetch outside RAM".into();
+                return Ok(outcome);
+            }
+            if cpu.taken.is_some() {
+                outcome.exceptions += 1;
+            }
+            let _ = cpu.take_accesses();
+        }
         current = next;
     }
 }
@@ -470,13 +550,14 @@ fn main() -> Result<(), Error> {
         match run_window(&arguments, *number, &start, &ram) {
             Ok(outcome) => {
                 println!(
-                    "window {number}: {} instructions of the boot, EL{} at {:#x}: {} instructions compared in {:.1} s, {} exceptions, {} counter reads; ended: {}",
+                    "window {number}: {} instructions of the boot, EL{} at {:#x}: {} instructions compared in {:.1} s, {} exceptions ({} at a fetch), {} counter reads; ended: {}",
                     start.instructions,
                     start.el(),
                     start.core.pc,
                     outcome.instructions,
                     clock.elapsed().as_secs_f64(),
                     outcome.exceptions,
+                    outcome.fetch_aborts,
                     outcome.counters,
                     outcome.ended
                 );
