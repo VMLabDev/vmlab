@@ -784,8 +784,9 @@ enum Halt {
 
 /// A block as the loop runs it: the pre-decoded form of `block`.
 struct Compiled {
-    pc: u64,
-    /// The physical address of the first instruction.
+    /// The physical address of the first instruction. No block holds its
+    /// virtual address: it computes its addresses from the PC at its entry
+    /// (`Builder::code_address`).
     phys: u64,
     context: Context,
     /// The stamp of the memory for the bytes of the code, and the epoch of
@@ -913,7 +914,7 @@ fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
 }
 
 fn compile(
-    pc: u64,
+    phys: u64,
     context: Context,
     instructions: u32,
     mut block: BlockOf<A64Exit>,
@@ -1106,8 +1107,7 @@ fn compile(
         return Err(host("a block without an exit"));
     };
     Ok(Compiled {
-        pc,
-        phys: pc,
+        phys,
         context,
         stamp: None,
         epoch: 0,
@@ -1448,9 +1448,9 @@ impl Compiled {
     }
 }
 
-/// The translated blocks of a CPU: an entry for each PC, picked by the low
-/// bits of the PC, and a store of the blocks that lost their entry to
-/// another PC. A kernel and its programs run more code than the entries
+/// The translated blocks of a CPU: an entry for each code address, picked
+/// by the low bits of the physical address, and a store of the blocks that
+/// lost their entry to other code. A kernel and its programs run more code than the entries
 /// cover, so without the store the same blocks were translated again and
 /// again (card C13).
 ///
@@ -1489,12 +1489,14 @@ impl Cache {
         }
     }
 
-    /// The entry of `pc`. The bits above the page fold in, so that the
-    /// code of a kernel and of its programs at the same offsets of their
-    /// halves meet less.
+    /// The entry of the code at the physical address `phys`. One block
+    /// serves the code at every virtual address that maps it, so the entry
+    /// is picked by where the code is, not by the PC. The bits above the
+    /// low ones fold in, so that code at the same offsets of distant pages
+    /// meets less.
     #[inline(always)]
-    fn index(pc: u64) -> usize {
-        ((pc >> 2) ^ (pc >> 22) ^ (pc >> 44)) as usize & (CACHE_ENTRIES - 1)
+    fn index(phys: u64) -> usize {
+        ((phys >> 2) ^ (phys >> 22) ^ (phys >> 44)) as usize & (CACHE_ENTRIES - 1)
     }
 
     /// Put `block` in the entry at `index`, and keep the block that was
@@ -1519,12 +1521,11 @@ impl Cache {
     }
 
     /// Bring the block of the code at `phys` in `context` back from the
-    /// store into the entry at `index`, for the PC `pc`, when the store has
-    /// it. Whether it still holds the code of the memory is for the caller
-    /// to check.
-    fn revive(&mut self, index: usize, pc: u64, phys: u64, context: Context) -> bool {
+    /// store into the entry at `index`, when the store has it. Whether it
+    /// still holds the code of the memory is for the caller to check.
+    fn revive(&mut self, index: usize, phys: u64, context: Context) -> bool {
         let key = (phys, context);
-        let mut block = match self.young.remove(&key) {
+        let block = match self.young.remove(&key) {
             Some(block) => {
                 self.young_bytes = self.young_bytes.saturating_sub(block.heap_bytes());
                 block
@@ -1534,7 +1535,6 @@ impl Cache {
                 None => return false,
             },
         };
-        block.pc = pc;
         self.put(index, block);
         true
     }
@@ -2195,8 +2195,7 @@ impl<M: Memory> Cpu<M> {
         }
         self.side.mark_code(phys);
         let mut compiled =
-            compile(pc, context, count, builder.finish(at)).map_err(Refused::Stop)?;
-        compiled.phys = phys;
+            compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
         compiled.stamp = self.memory.code_stamp(phys, count.max(1) as usize * 4);
         compiled.epoch = self.epoch;
         Ok(compiled)
@@ -2229,10 +2228,10 @@ impl<M: Memory> Cpu<M> {
         self.side.code_written = false;
     }
 
-    /// Whether the block of the cache at `index` is the one for `pc` at
+    /// Whether the block of the cache at `index` is the one for the code at
     /// `phys` in `context`, and holds the code that the memory holds.
     #[inline(always)]
-    fn usable(&mut self, single: bool, index: usize, pc: u64, phys: u64, context: Context) -> bool {
+    fn usable(&mut self, single: bool, index: usize, phys: u64, context: Context) -> bool {
         let cache = if single {
             &mut self.singles
         } else {
@@ -2241,7 +2240,7 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return false;
         };
-        if block.pc != pc || block.phys != phys || block.context != context {
+        if block.phys != phys || block.context != context {
             return false;
         }
         if block.epoch == self.epoch {
@@ -2286,7 +2285,6 @@ impl<M: Memory> Cpu<M> {
         }
         let pc = self.state.pc();
         let context = self.state.context;
-        let index = Cache::index(pc);
         let phys = match self.code_address() {
             Ok(phys) => phys,
             Err(Refused::Stop(stop)) => return Err(stop),
@@ -2295,15 +2293,16 @@ impl<M: Memory> Cpu<M> {
                 return Ok((0, Some(Halt::Taken)));
             }
         };
-        let mut ready = self.usable(single, index, pc, phys, context);
+        let index = Cache::index(phys);
+        let mut ready = self.usable(single, index, phys, context);
         if !ready {
             let cache = if single {
                 &mut self.singles
             } else {
                 &mut self.blocks
             };
-            ready = cache.revive(index, pc, phys, context)
-                && self.usable(single, index, pc, phys, context);
+            ready = cache.revive(index, phys, context)
+                && self.usable(single, index, phys, context);
         }
         if !ready {
             let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
@@ -2411,15 +2410,18 @@ impl<M: Memory> Cpu<M> {
             // this CPU has dropped them too.
             self.take_mail();
             self.read_lines();
-            let pc = self.state.pc();
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);
-            let index = Cache::index(pc);
+            let fetched = if quiet {
+                self.code_address().ok()
+            } else {
+                None
+            };
+            let index = fetched.map_or(0, Cache::index);
             // The common case: the TLB holds the page of the code, and the
             // block is translated and fits the budget.
-            let outcome = if quiet
-                && let Ok(phys) = self.code_address()
-                && self.usable(false, index, pc, phys, context)
+            let outcome = if let Some(phys) = fetched
+                && self.usable(false, index, phys, context)
                 && let Some(block) = self.blocks.entries[index].as_mut()
                 && u64::from(block.instructions) <= left
             {
@@ -2432,7 +2434,7 @@ impl<M: Memory> Cpu<M> {
                 // long as `BLOCK_INSTRUCTIONS`.
                 let cached = self.blocks.entries[index]
                     .as_ref()
-                    .filter(|block| block.pc == pc && block.context == context)
+                    .filter(|block| Some(block.phys) == fetched && block.context == context)
                     .map(|block| u64::from(block.instructions));
                 let single = match cached {
                     Some(length) => length > left,
