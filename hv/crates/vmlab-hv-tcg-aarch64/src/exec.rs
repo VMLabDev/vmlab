@@ -434,10 +434,7 @@ impl Side {
         if self.mmu.fast().is_none() {
             return;
         }
-        if let Some(&entry) = self
-            .mmu
-            .hit_host(va, bytes, mmu::needed(kind, self.user))
-        {
+        if let Some(&entry) = self.mmu.hit_host(va, bytes, mmu::needed(kind, self.user)) {
             self.fill_fast(va, &entry, kind == Kind::Write);
         }
     }

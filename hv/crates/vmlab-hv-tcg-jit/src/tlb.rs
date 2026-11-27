@@ -237,7 +237,10 @@ mod tests {
         assert_eq!(entry.phys, 0x8000_5000);
         // Aligned accesses of every size hit, up to the last of the page.
         for bytes in [1u8, 2, 4, 8] {
-            assert!(tlb.lookup(1, false, 0x1234_6000 - u64::from(bytes), bytes).is_some());
+            assert!(
+                tlb.lookup(1, false, 0x1234_6000 - u64::from(bytes), bytes)
+                    .is_some()
+            );
         }
         // One that is not aligned to its size misses, and so does every one
         // that crosses into the next page.
@@ -306,7 +309,10 @@ mod tests {
         assert!(tlb.lookup(1, false, 0x5000, 8).is_some());
         assert!(tlb.lookup(1, true, 0x5000, 8).is_none());
         assert!(tlb.lookup(0, true, 0x8000, 8).is_none());
-        assert_eq!(tlb.lookup(0, true, 0x6000, 8).map(|entry| entry.watch), Some(0x78));
+        assert_eq!(
+            tlb.lookup(0, true, 0x6000, 8).map(|entry| entry.watch),
+            Some(0x78)
+        );
         assert_eq!(tlb.len(), 2);
         tlb.flush();
         assert!(tlb.is_empty() && tlb.lookup(1, false, 0x5000, 8).is_none());

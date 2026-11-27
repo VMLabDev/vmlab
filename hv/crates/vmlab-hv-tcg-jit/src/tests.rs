@@ -4,8 +4,8 @@
 //! operations.
 
 use super::*;
-use std::sync::atomic::AtomicU32;
 use emit::THUNK_ACCESS;
+use std::sync::atomic::AtomicU32;
 use tlb::FastTlb;
 use vmlab_hv_tcg_ir::block::{Code, Op, Place, Slot, op_in_frame, step_unchecked};
 
@@ -814,7 +814,10 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
         }
         let ran = compiled_on(&mut jit, &block, &mut got, 100, &mut got_ram, Some(tlb));
         assert_eq!(ran.code, code, "round {round}");
-        assert!(got_ram == expected_ram, "round {round}: the memories differ");
+        assert!(
+            got_ram == expected_ram,
+            "round {round}: the memories differ"
+        );
         if code == DONE {
             assert_eq!(got, expected, "round {round}");
         } else {
@@ -832,7 +835,10 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
         watched += ran.watched;
     }
     assert!(left > 100, "{left} blocks left");
-    assert!(misses > 1000 && hits > 1000, "{misses} misses, {hits} logged hits");
+    assert!(
+        misses > 1000 && hits > 1000,
+        "{misses} misses, {hits} logged hits"
+    );
     assert!(watched > 100, "{watched} stores into the watched page");
 }
 
@@ -886,7 +892,14 @@ fn a_hit_asks_nothing_and_a_miss_fills_the_tlb_for_the_next_run() {
     let want = u64::from_le_bytes(ram[8..16].try_into().expect("eight bytes"));
     // An empty TLB: both miss.
     let mut slots = [0u128; 1];
-    let ran = compiled_on(&mut jit, &block, &mut slots, 10, &mut ram, Some(FastTlb::new()));
+    let ran = compiled_on(
+        &mut jit,
+        &block,
+        &mut slots,
+        10,
+        &mut ram,
+        Some(FastTlb::new()),
+    );
     assert_eq!((ran.code, ran.misses, ran.thunk_calls), (DONE, 2, 2));
     assert_eq!(slots[0], u128::from(want));
     assert_eq!(&ram[0x1004..0x1008], &0xeeff_1122u32.to_le_bytes());
@@ -895,7 +908,15 @@ fn a_hit_asks_nothing_and_a_miss_fills_the_tlb_for_the_next_run() {
     let watch = AtomicU32::new(0);
     let host = ram.as_ptr() as usize;
     tlb.fill(1, false, RAM, host, 0, 0, 12);
-    tlb.fill(1, true, RAM + 0x1000, host + 0x1000, &watch as *const _ as usize, 0x1000, 12);
+    tlb.fill(
+        1,
+        true,
+        RAM + 0x1000,
+        host + 0x1000,
+        &watch as *const _ as usize,
+        0x1000,
+        12,
+    );
     ram[8] ^= 0xff;
     let mut slots = [0u128; 1];
     let shape = Shape {

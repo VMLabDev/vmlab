@@ -235,9 +235,7 @@ fn a_memory_without_host_pages_fills_nothing() {
         ) -> vmlab_hv_tcg::Result<bool> {
             self.0.store_conditional(address, bytes, generation)
         }
-        fn transaction_lock(
-            &self,
-        ) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
+        fn transaction_lock(&self) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
             None
         }
     }
@@ -310,7 +308,12 @@ fn every_flush_of_the_tlb_empties_the_fast_tlb() {
     // ldr x1, [x0] ; <the operation of x3> ; then the end.
     let mut cases: Vec<(&str, u32, u64, bool)> = vec![
         ("TLBI VMALLE1", asm::sys(op::TLBI_VMALLE1, 3), 0, true),
-        ("TLBI VAAE1 of the page", asm::sys(op::TLBI_VAAE1, 3), VA >> 12, true),
+        (
+            "TLBI VAAE1 of the page",
+            asm::sys(op::TLBI_VAAE1, 3),
+            VA >> 12,
+            true,
+        ),
         (
             "TLBI VAAE1 of another page",
             asm::sys(op::TLBI_VAAE1, 3),
@@ -355,7 +358,10 @@ fn every_flush_of_the_tlb_empties_the_fast_tlb() {
         machine.cpu.state.set_pc(CODE);
         machine.cpu.step().unwrap();
         assert!(machine.holds(EL1, false, VA), "{name}");
-        assert!(matches!(machine.cpu.run(10), Stop::Hypercall { .. }), "{name}");
+        assert!(
+            matches!(machine.cpu.run(10), Stop::Hypercall { .. }),
+            "{name}"
+        );
         assert_eq!(machine.cpu.taken, None, "{name}");
         assert_eq!(!machine.holds(EL1, false, VA), flushed, "{name}");
     }

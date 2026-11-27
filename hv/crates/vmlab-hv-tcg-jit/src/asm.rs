@@ -574,18 +574,30 @@ mod tests {
                 let sized = |size: &str| text.replacen("qword", size, 1);
                 let (byte, word, dword) = (sized("byte"), sized("word"), sized("dword"));
                 let name32 = NAMES32[d];
-                add(format!("movzx {name32}, {byte}"), &|a| a.load_sized(dst, *mem, 1));
-                add(format!("movzx {name32}, {word}"), &|a| a.load_sized(dst, *mem, 2));
-                add(format!("mov {name32}, {dword}"), &|a| a.load_sized(dst, *mem, 4));
-                add(format!("mov {name}, {text}"), &|a| a.load_sized(dst, *mem, 8));
+                add(format!("movzx {name32}, {byte}"), &|a| {
+                    a.load_sized(dst, *mem, 1)
+                });
+                add(format!("movzx {name32}, {word}"), &|a| {
+                    a.load_sized(dst, *mem, 2)
+                });
+                add(format!("mov {name32}, {dword}"), &|a| {
+                    a.load_sized(dst, *mem, 4)
+                });
+                add(format!("mov {name}, {text}"), &|a| {
+                    a.load_sized(dst, *mem, 8)
+                });
                 add(format!("mov {byte}, {}", NAMES8[d]), &|a| {
                     a.store_sized(*mem, dst, 1)
                 });
                 add(format!("mov {word}, {}", NAMES16[d]), &|a| {
                     a.store_sized(*mem, dst, 2)
                 });
-                add(format!("mov {dword}, {name32}"), &|a| a.store_sized(*mem, dst, 4));
-                add(format!("mov {text}, {name}"), &|a| a.store_sized(*mem, dst, 8));
+                add(format!("mov {dword}, {name32}"), &|a| {
+                    a.store_sized(*mem, dst, 4)
+                });
+                add(format!("mov {text}, {name}"), &|a| {
+                    a.store_sized(*mem, dst, 8)
+                });
             }
             for value in [
                 1u64,
@@ -645,9 +657,10 @@ mod tests {
             });
             add(format!("cmp {text}, 0"), &|a| a.alu_imm(Alu::Cmp, *mem, 0));
             add(format!("call {text}"), &|a| a.call_indirect(*mem));
-            add(format!("test {}, 1", text.replacen("qword", "byte", 1)), &|a| {
-                a.test_byte_imm(*mem, 1)
-            });
+            add(
+                format!("test {}, 1", text.replacen("qword", "byte", 1)),
+                &|a| a.test_byte_imm(*mem, 1),
+            );
         }
         for (cond, text) in [
             (Cond::B, "b"),
