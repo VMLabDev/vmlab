@@ -124,6 +124,12 @@ impl EmulatedVcpu {
         }
     }
 
+    /// Join the vCPU to the TLB mailboxes of its machine as CPU `id`, so
+    /// that the Inner Shareable TLB maintenance of one vCPU reaches it.
+    pub fn set_shootdown(&mut self, shootdown: Arc<vmlab_hv_tcg_aarch64::shootdown::Shootdown>) {
+        self.cpu.shootdown = Some((shootdown, usize::from(self.id)));
+    }
+
     /// Take the system counter from `counter`, at `frequency` counts per
     /// second, in place of the clock that the vCPU was made with.
     pub fn set_counter(&mut self, counter: Counter, frequency: u64) {

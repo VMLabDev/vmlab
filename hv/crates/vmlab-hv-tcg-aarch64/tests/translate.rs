@@ -727,3 +727,75 @@ fn the_guest_takes_the_abort_and_returns_to_the_access() {
         0x9600_004b
     );
 }
+
+#[test]
+fn an_inner_shareable_tlbi_reaches_the_other_cpus() {
+    use std::sync::Arc;
+    use vmlab_hv_tcg_aarch64::shootdown::Shootdown;
+    // The second CPU keeps a translation of VA in its TLB, and its
+    // descriptor changes. The first CPU runs `tlbi <op>, x3`: the forms of
+    // CRm 3 drop the entry of the second CPU too, those of CRm 7 do not.
+    for (operation, argument, flushed) in [
+        (0x0418u16, 0u64, true),
+        (0x0419, VA >> 12 | 1 << 48, true),
+        (0x041a, 1 << 48, true),
+        (0x041b, VA >> 12, true),
+        (0x041a, 2 << 48, false),
+        (op::TLBI_VMALLE1, 0, false),
+    ] {
+        let shootdown = Arc::new(Shootdown::new(2));
+        let mut first = Machine::new(&[asm::sys(operation, 3), HVC]);
+        first.cpu.shootdown = Some((shootdown.clone(), 0));
+        first.cpu.state.set_x(3, argument);
+        let mut second = Machine::new(&[ldr(1, 0), HVC]);
+        second.cpu.shootdown = Some((shootdown, 1));
+        let entry = second.map(VA, DATA | AF | NOT_GLOBAL);
+        second.cpu.memory.write(DATA, &1u64.to_le_bytes()).unwrap();
+        second.cpu.memory.write(OTHER, &2u64.to_le_bytes()).unwrap();
+        second.cpu.state.set_x(0, VA);
+        assert!(matches!(second.cpu.run(10), Stop::Hypercall { .. }));
+        assert_eq!(second.cpu.state.x(1), 1);
+        second
+            .cpu
+            .memory
+            .write(entry, &(OTHER | AF | NOT_GLOBAL | VALID_PAGE).to_le_bytes())
+            .unwrap();
+        // The second CPU is outside its run loop: the first does not wait.
+        assert!(matches!(first.cpu.run(10), Stop::Hypercall { .. }));
+        assert_eq!(first.cpu.taken, None);
+        second.cpu.state.set_pc(CODE);
+        assert!(matches!(second.cpu.run(10), Stop::Hypercall { .. }));
+        assert_eq!(
+            second.cpu.state.x(1),
+            if flushed { 2 } else { 1 },
+            "{operation:#x} {argument:#x}"
+        );
+    }
+}
+
+#[test]
+fn a_cpu_waits_until_the_running_cpus_took_its_tlbi() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use vmlab_hv_tcg_aarch64::shootdown::Shootdown;
+    // The second CPU spins in a loop of one branch on its own thread. The
+    // first runs `tlbi vmalle1is` and comes back only after the second
+    // took it, whose run loop then ends at its budget.
+    let shootdown = Arc::new(Shootdown::new(2));
+    let mut first = Machine::new(&[asm::sys(0x0418, 3), HVC]);
+    first.cpu.shootdown = Some((shootdown.clone(), 0));
+    let mut second = Machine::new(&[0x1400_0000]);
+    second.cpu.shootdown = Some((shootdown, 1));
+    let done = Arc::new(AtomicBool::new(false));
+    let spinner = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                assert_eq!(second.cpu.run(1000), Stop::Budget);
+            }
+        })
+    };
+    assert!(matches!(first.cpu.run(10), Stop::Hypercall { .. }));
+    done.store(true, Ordering::SeqCst);
+    spinner.join().unwrap();
+}

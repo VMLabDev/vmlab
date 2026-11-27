@@ -53,6 +53,7 @@ use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
 use crate::mmu::{self, Kind, Miss, Mmu, Regime};
+use crate::shootdown::Invalidation;
 use crate::state::{Context, State, slot};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
@@ -1450,6 +1451,10 @@ pub struct Cpu<M> {
     /// What the guest asked for that the CPU does not have, each once. The
     /// owner of the CPU writes it to its log.
     pub unknown: std::collections::BTreeSet<Unknown>,
+    /// The mailboxes of the machine's CPUs and the index of this one: a
+    /// TLB maintenance operation of the Inner Shareable domain reaches the
+    /// others through them. `None`: the CPU is alone.
+    pub shootdown: Option<(std::sync::Arc<crate::shootdown::Shootdown>, usize)>,
     blocks: Cache,
     /// Blocks of one instruction, for `step` and for the end of a budget.
     singles: Cache,
@@ -1484,6 +1489,7 @@ impl<M: Memory> Cpu<M> {
             instructions: 0,
             translations: 0,
             unknown: std::collections::BTreeSet::new(),
+            shootdown: None,
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
@@ -1735,20 +1741,31 @@ impl<M: Memory> Cpu<M> {
                 self.state.system.regs[reg::PAR_EL1] = par;
                 Some(Ok(()))
             }
-            // TLBI of the EL1&0 regime, on this CPU or on all of them: a
-            // machine with more CPUs hands the second kind on.
-            (0, 8, 3 | 7, op2) if !el0 => {
+            // TLBI of the EL1&0 regime, on this CPU (CRm 7) or on all of
+            // them (CRm 3, the Inner Shareable domain): the second kind goes
+            // to the other CPUs of the machine too.
+            (0, 8, crm @ (3 | 7), op2) if !el0 => {
                 let asid = (value >> 48) as u16;
-                match op2 {
+                let invalidation = match op2 {
                     // VMALLE1.
-                    0 => self.side.mmu.flush(),
+                    0 => Invalidation::All,
                     // VAE1 and VALE1: one address of one ASID.
-                    1 | 5 => self.side.mmu.flush_page(Regime::El10, value, Some(asid)),
+                    1 | 5 => Invalidation::Page {
+                        argument: value,
+                        asid: Some(asid),
+                    },
                     // ASIDE1.
-                    2 => self.side.mmu.flush_asid(Regime::El10, asid),
+                    2 => Invalidation::Asid(asid),
                     // VAAE1 and VAALE1: one address of every ASID.
-                    3 | 7 => self.side.mmu.flush_page(Regime::El10, value, None),
+                    3 | 7 => Invalidation::Page {
+                        argument: value,
+                        asid: None,
+                    },
                     _ => return self.unknown_operation(encoding, read),
+                };
+                self.invalidate(invalidation);
+                if crm == 3 {
+                    self.broadcast(invalidation);
                 }
                 Some(Ok(()))
             }
@@ -1757,6 +1774,47 @@ impl<M: Memory> Cpu<M> {
         match done {
             Some(done) => Ok(done),
             None => self.unknown_operation(encoding, read),
+        }
+    }
+
+    fn invalidate(&mut self, invalidation: Invalidation) {
+        match invalidation {
+            Invalidation::All => self.side.mmu.flush(),
+            Invalidation::Page { argument, asid } => {
+                self.side.mmu.flush_page(Regime::El10, argument, asid)
+            }
+            Invalidation::Asid(asid) => self.side.mmu.flush_asid(Regime::El10, asid),
+        }
+    }
+
+    /// Hand `invalidation` to the other CPUs, and return when every one of
+    /// them that runs has applied it (`shootdown.rs`).
+    fn broadcast(&mut self, invalidation: Invalidation) {
+        let Some((shootdown, id)) = self.shootdown.clone() else {
+            return;
+        };
+        shootdown.post(id, invalidation);
+        let mut spins = 0u32;
+        while shootdown.outstanding(id) {
+            // Mail of a CPU that waits on this one is taken here.
+            self.take_mail();
+            spins = spins.wrapping_add(1);
+            if spins % 64 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Apply what the other CPUs invalidated.
+    fn take_mail(&mut self) {
+        let mail = match &self.shootdown {
+            Some((shootdown, id)) => shootdown.take(*id),
+            None => return,
+        };
+        for invalidation in mail.into_iter().flatten() {
+            self.invalidate(invalidation);
         }
     }
 
@@ -2094,6 +2152,7 @@ impl<M: Memory> Cpu<M> {
     /// that comes before it. `taken` says which.
     pub fn step(&mut self) -> Result<(), Stop> {
         self.taken = None;
+        self.take_mail();
         self.check_generation();
         let result = self.run_block(true);
         self.settle();
@@ -2110,15 +2169,25 @@ impl<M: Memory> Cpu<M> {
 
     /// Run up to `budget` instructions and say why the loop stopped.
     pub fn run(&mut self, budget: u64) -> Stop {
+        if let Some((shootdown, id)) = &self.shootdown {
+            shootdown.set_running(*id, true);
+        }
         self.check_generation();
         let stop = self.run_inner(budget);
         self.settle();
+        if let Some((shootdown, id)) = &self.shootdown {
+            shootdown.set_running(*id, false);
+        }
+        // Mail posted after this is taken before the next block.
         stop
     }
 
     fn run_inner(&mut self, budget: u64) -> Stop {
         let mut left = budget;
         while left > 0 {
+            // Another CPU invalidated translations: no block starts before
+            // this CPU has dropped them too.
+            self.take_mail();
             let pc = self.state.pc();
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);

@@ -883,6 +883,7 @@ pub fn assemble(
     )
     .map_err(VmmError::Other)?;
     let mut vcpus = Vec::with_capacity(cpus);
+    let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(cpus));
     for (id, lines) in late.iter().enumerate() {
         let mut vcpu = EmulatedVcpu::new(
             id as u8,
@@ -890,6 +891,9 @@ pub fn assemble(
             State::reset(0),
             Clock::host(0, COUNTER_FREQUENCY),
         );
+        if cpus > 1 {
+            vcpu.set_shootdown(shootdown.clone());
+        }
         let counter = clock.clone();
         vcpu.set_counter(Arc::new(move || counter.count()), COUNTER_FREQUENCY);
         vcpu.set_timer_lines(TimerLines {
