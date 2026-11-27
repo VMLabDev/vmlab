@@ -908,7 +908,12 @@ JIT_REPORT = re.compile(
     r"(?:; fallbacks: (?P<refused_runs>\d+) runs of refused blocks, (?P<budget_runs>\d+) at the "
     r"budget; exits: (?P<exits_end>\d+) at the end, (?P<exits_exception>\d+) exceptions, "
     r"(?P<exits_retry>\d+) stores into code, (?P<exits_stop>\d+) stops; K3: "
-    r"(?P<checked_blocks>\d+) blocks checked, (?P<checked_instructions>\d+) instructions)?")
+    r"(?P<checked_blocks>\d+) blocks checked, (?P<checked_instructions>\d+) instructions)?"
+    # The exits of card J4 (chaining and the jump cache), when the line has them.
+    r"(?:; chaining: (?P<chained>\d+) chained, (?P<jump_hits>\d+) jump cache hits, "
+    r"(?P<unlinked>\d+) unlinked, (?P<lookups>\d+) jump cache misses, (?P<entered>\d+) runs "
+    r"entered; (?P<links>\d+) links, (?P<unlinks>\d+) unlinks, (?P<fills>\d+) fills"
+    r"(?:, (?P<clears>\d+) clears of the jump cache)?)?")
 
 
 def last_jit_report(run_dir):

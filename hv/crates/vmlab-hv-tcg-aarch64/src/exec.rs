@@ -2131,20 +2131,17 @@ impl Compiled {
     }
 }
 
-/// What the thunk of compiled code reaches: the parts of the block that it
-/// runs an effect with, and the CPU around it.
+/// What the thunk of compiled code reaches: the CPU around the blocks that
+/// run. The block of an operation is the one that its head named in the
+/// context (3e DESIGN.md H5): a chained run passes through many.
 struct Env<'a, M> {
-    ops: &'a [Op],
-    generics: &'a [Generic],
-    accesses: &'a [Access16],
-    calls: &'a [Call],
-    leaves: &'a [Leave],
-    frame: *mut u64,
-    words: usize,
     state: *mut State,
     memory: &'a mut M,
     side: &'a mut Side,
-    single: bool,
+    context: *mut jit::Context,
+    /// The budget when the thunk spent it so that the run leaves at the
+    /// next block head: a store went into a page of translated code.
+    kicked: Option<i64>,
     /// Why the block left, when an effect did not complete.
     failed: Option<(u32, Failed)>,
     stop: Option<Stop>,
@@ -2156,26 +2153,35 @@ struct Env<'a, M> {
 /// What the thunk returns when the block leaves.
 const THUNK_LEFT: u64 = 2;
 
+/// The budget that the thunk leaves when it ends a chained run: far below
+/// zero, so that no block head takes its instructions from it.
+const KICKED: i64 = i64::MIN / 2;
+
 /// The thunk of compiled code (3e DESIGN.md J1): it runs the operation
-/// `index` of the block as the interpreter does. The emitter put every word
+/// `index` of `block` as the interpreter does. The emitter put every word
 /// that the operation reads into the frame, and reads what it writes from
 /// there.
 ///
 /// # Safety
-/// `env` is the `Env<M>` of the block that runs, and `index` one of its
-/// operations, which `compile` checked against the frame.
-unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u64) -> u64 {
+/// `env` is the `Env<M>` of the run, `block` the `Compiled` whose code
+/// runs (its tag), and `index` one of its operations, which `compile`
+/// checked against the frame.
+unsafe extern "sysv64" fn thunk<M: Memory>(
+    env: *mut std::ffi::c_void,
+    index: u64,
+    tag: *mut std::ffi::c_void,
+) -> u64 {
     // SAFETY: the caller's promise. Compiled code holds no reference into
-    // the environment while it calls.
+    // the environment or the block while it calls.
     let env = unsafe { &mut *env.cast::<Env<M>>() };
-    let op = &env.ops[index as usize];
-    // SAFETY: the frame of the block, which nothing else touches while the
-    // thunk runs.
-    let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
+    // SAFETY: as above: the block is alive while its code runs.
+    let compiled = unsafe { &mut *tag.cast::<Compiled>() };
+    let op = &compiled.ops[index as usize];
+    let frame = compiled.frame.as_mut_slice();
     if (op.code as u8) < FIRST_EFFECT {
         // SAFETY: `compile` checked every operation against the frame and
         // the generic operations of the block.
-        if unsafe { block::step_unchecked(op, frame, env.generics) } {
+        if unsafe { block::step_unchecked(op, frame, &compiled.generics) } {
             return 0;
         }
         env.stop = Some(host("an arithmetic operation outside its domain"));
@@ -2184,18 +2190,31 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
     // SAFETY: the state of the CPU, which compiled code does not touch
     // while it calls.
     let state = unsafe { &mut *env.state };
+    let written = env.side.code_written;
     match Compiled::effect(
         op,
         frame,
-        env.accesses,
-        env.calls,
-        env.leaves,
+        &compiled.accesses,
+        &compiled.calls,
+        &compiled.leaves,
         state,
         env.memory,
         env.side,
-        env.single,
+        compiled.instructions == 1,
     ) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // A block of one instruction made a store into a page of
+            // translated code: no block after it may run before the loop
+            // looked at the code again (H11).
+            if !written && env.side.code_written && env.kicked.is_none() {
+                // SAFETY: the context of the run, which compiled code does
+                // not hold while it calls.
+                let context = unsafe { &mut *env.context };
+                env.kicked = Some(context.budget);
+                context.budget = KICKED;
+            }
+            0
+        }
         Err(failed) => {
             env.failed = Some(failed);
             THUNK_LEFT
@@ -2209,22 +2228,26 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
 ///
 /// # Safety
 /// As for `thunk`, and the `Env<M>` holds a replay.
-unsafe extern "sysv64" fn replay_thunk<M: Memory>(env: *mut std::ffi::c_void, index: u64) -> u64 {
-    // SAFETY: the caller's promise. The reference ends before `thunk` makes
-    // its own.
+unsafe extern "sysv64" fn replay_thunk<M: Memory>(
+    env: *mut std::ffi::c_void,
+    index: u64,
+    tag: *mut std::ffi::c_void,
+) -> u64 {
+    // SAFETY: the caller's promise. The references end before `thunk`
+    // makes its own.
     let done = unsafe {
         let env = &mut *env.cast::<Env<M>>();
-        let op = &env.ops[index as usize];
-        let frame = std::slice::from_raw_parts_mut(env.frame, env.words);
-        let accesses = env.accesses;
+        let compiled = &mut *tag.cast::<Compiled>();
+        let op = &compiled.ops[index as usize];
+        let frame = compiled.frame.as_mut_slice();
         match env.replay.as_deref_mut() {
-            Some(replay) => replay.access(op, frame, accesses),
+            Some(replay) => replay.access(op, frame, &compiled.accesses),
             None => None,
         }
     };
     let Some(done) = done else {
         // SAFETY: the caller's promise.
-        return unsafe { thunk::<M>(env, index) };
+        return unsafe { thunk::<M>(env, index, tag) };
     };
     // SAFETY: as above.
     let env = unsafe { &mut *env.cast::<Env<M>>() };
@@ -2450,8 +2473,17 @@ const POISON: u64 = 0x6b33_dead_6b33_dead;
 impl Compiled {
     /// Compile the block, or mark it as one that the emitter refuses. `pc`
     /// is the address that it is entered at now, for the perf map. With
-    /// `check`, the block keeps what K3 needs.
-    fn compile_code(&mut self, jit: &mut jit::Jit, pc: u64, check: bool) {
+    /// `check`, the block keeps what K3 needs. With `sites` and `jumps`, its
+    /// exits look for the code of the next block (3e DESIGN.md H5, H6).
+    fn compile_code(
+        &mut self,
+        jit: &mut jit::Jit,
+        pc: u64,
+        check: bool,
+        sites: bool,
+        jumps: bool,
+        verify: bool,
+    ) {
         // What a leave reads from the frame: its outputs, its address, and
         // every word that its own operations read (card S4). A word that
         // those operations compute first is in the list too, which costs a
@@ -2529,12 +2561,24 @@ impl Compiled {
                 leave: None,
             })
             .collect();
-        // The compiled code writes the next PC with the outputs, as it is
-        // in the frame: a distance from the entry is added after it runs.
-        let mut outputs = self.outputs.clone();
-        if let Some((place, _)) = self.next {
-            outputs.push((crate::state::slot::PC as u32, place));
-        }
+        // The compiled code sets the PC (3e DESIGN.md H5): the last
+        // instruction that the loop runs, else the next PC of the block.
+        let next = match (self.terminal, self.next) {
+            (Some((distance, _)), _) => Some(jit::NextPc::Fixed(distance)),
+            (None, Some((place, true))) => Some(jit::NextPc::Relative(place)),
+            (None, Some((place, false))) => Some(jit::NextPc::Absolute(place)),
+            (None, None) => None,
+        };
+        let tag: *mut Compiled = self;
+        let chain = jit::Chain {
+            frame: self.frame.as_mut_ptr() as u64,
+            tag: tag as u64,
+            key: context_key(self.context),
+            page_offset: (self.phys & 0xfff) as u32,
+            sites,
+            jumps,
+            verify,
+        };
         let shape = jit::Shape {
             ops: &self.ops,
             generics: &self.generics,
@@ -2543,8 +2587,13 @@ impl Compiled {
             calls: &calls,
             leaves: &leaves,
             inputs: &self.inputs,
-            outputs: &outputs,
+            outputs: &self.outputs,
             instructions: self.instructions,
+            chain: Some(chain),
+            next: next.map(|kind| jit::Next {
+                pc: crate::state::slot::PC as u32,
+                kind,
+            }),
         };
         match jit.compile(&shape) {
             Ok(entry) => {
@@ -2569,12 +2618,224 @@ impl Compiled {
             }
         }
     }
+}
 
-    /// Run the compiled code of the block. `None`: the budget did not hold
-    /// the block, and nothing ran. With `replay`, the loads and stores are
-    /// served from it (K3).
+/// The key of a context in the jump cache (3e DESIGN.md H6): every field,
+/// and a bit that no empty entry has.
+fn context_key(context: Context) -> u64 {
+    1 << 63
+        | u64::from(context.el)
+        | u64::from(context.sp_sel) << 8
+        | u64::from(context.fp) << 9
+        | u64::from(context.tbi) << 16
+        | u64::from(context.strict) << 24
+}
+
+/// How a run of compiled code ended, for the link that the next block
+/// makes (3e DESIGN.md H5, H6).
+#[derive(Clone, Copy, Debug)]
+enum Pending {
+    /// The exit `site` of the code `from` has no link: the block at `pc`
+    /// in the context of `key` is its target.
+    Site {
+        from: jit::Entry,
+        site: usize,
+        pc: u64,
+        key: u64,
+    },
+    /// The jump cache had no entry for `pc` in the context of `key`.
+    Lookup { pc: u64, key: u64 },
+    /// The jump cache had an entry for `pc` in the context of `key`, with
+    /// the code `code`, and did not take it (`Chain::verify`).
+    Verify { pc: u64, key: u64, code: u64 },
+}
+
+/// The chaining of a CPU: whether it is on, the link that the next block
+/// makes, and what it must agree with to make it.
+struct Chaining {
+    /// Linked jumps (H5) and the jump cache (H6).
+    sites: bool,
+    jumps: bool,
+    /// Hits of the jump cache come back to the loop, which compares them
+    /// with its own lookup (`VMLAB_HV_JIT_CHAIN=verify`).
+    verify: bool,
+    /// Hits that named other code than the lookup found.
+    mismatches: u64,
+    pending: Option<Pending>,
+    /// The epoch and the count of changes of the MMU at the exit that left
+    /// `pending`. A link is made in the same of both.
+    epoch: u64,
+    mmu: u64,
+    /// The count of changes of the MMU that the jump cache holds entries
+    /// of.
+    seen: u64,
+}
+
+/// What a run of compiled code did: the instructions that completed, why
+/// it left before the end of its last block, the last instruction that the
+/// loop runs, and the link that the next block makes.
+struct Ran {
+    count: u32,
+    halt: Option<Halt>,
+    terminal: Option<Trap>,
+    pending: Option<Pending>,
+}
+
+/// Run compiled code from the block `first`, through every block that its
+/// jumps and the jump cache reach. `None`: the budget did not hold the
+/// first block, and nothing ran. With `replay`, the loads and stores are
+/// served from it (K3).
+///
+/// # Safety
+/// `first` is a block of the caches of the CPU whose code is current, and
+/// every block that a linked jump or the jump cache reaches is alive (the
+/// CPU unlinks a block before it drops it).
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_chained<M: Memory>(
+    first: *mut Compiled,
+    entry: &jit::Entry,
+    jit: &jit::Jit,
+    state: &mut State,
+    memory: &mut M,
+    side: &mut Side,
+    budget: u64,
+    counts: &mut JitCounts,
+    replay: Option<&mut Replay>,
+) -> Option<Ran> {
+    // SAFETY: the caller's promise.
+    let context_el = unsafe { (*first).context.el };
+    side.user = context_el == 0;
+    let state_pointer: *mut State = state;
+    // SAFETY: as above.
+    let frame = unsafe { (*first).frame.as_mut_ptr() };
+    let budget = budget.min(i64::MAX as u64) as i64;
+    let mut env = Env {
+        state: state_pointer,
+        memory,
+        side,
+        context: std::ptr::null_mut(),
+        kicked: None,
+        failed: None,
+        stop: None,
+        replay,
+    };
+    let thunk: jit::Thunk = if env.replay.is_some() {
+        replay_thunk::<M>
+    } else {
+        thunk::<M>
+    };
+    let mut context = jit.context(budget, thunk, (&raw mut env).cast());
+    context.block = first.cast();
+    env.context = &raw mut context;
+    // SAFETY: `entry` is current and was compiled from `first`, whose frame
+    // and register slots are as large as its shape names. While the code
+    // runs, only it and the thunk touch the frames and the state, and the
+    // thunk reaches them through `env` and the tag of the block alone.
+    let code = unsafe {
+        jit.enter(
+            entry,
+            &raw mut context,
+            (&raw mut (*state_pointer).slots).cast(),
+            frame,
+        )
+    };
+    let failed = env.failed.take();
+    let stop = env.stop.take();
+    let left = match env.kicked {
+        Some(saved) => saved + (context.budget - KICKED),
+        None => context.budget,
+    };
+    // Every block head took its instructions from the budget, and gave them
+    // back when they did not fit.
+    let taken = u32::try_from(budget - left).unwrap_or(u32::MAX);
+    counts.chained += context.chained;
+    counts.jump_hits += context.hits;
+    let last = context.block.cast::<Compiled>();
+    // SAFETY: the head of the block that ran last stored it, and it is
+    // alive (above). Nothing else refers to it now.
+    let last = unsafe { &mut *last };
+    let key = context_key(last.context);
+    let pc = state.pc();
+    let ran = match code {
+        jit::DONE => Ran {
+            count: taken,
+            halt: None,
+            terminal: last.terminal.map(|(_, trap)| trap),
+            pending: None,
+        },
+        jit::BUDGET if taken == 0 => return None,
+        // The run stopped at the head of `last`, which did not run: the PC
+        // is its entry.
+        jit::BUDGET => Ran {
+            count: taken,
+            halt: None,
+            terminal: None,
+            pending: None,
+        },
+        jit::VERIFY => Ran {
+            count: taken,
+            halt: None,
+            terminal: None,
+            pending: Some(Pending::Verify {
+                pc,
+                key,
+                code: jit.jump_target(pc, key).unwrap_or(0),
+            }),
+        },
+        jit::LOOKUP => {
+            counts.lookups += 1;
+            Ran {
+                count: taken,
+                halt: None,
+                terminal: None,
+                pending: Some(Pending::Lookup { pc, key }),
+            }
+        }
+        code if (jit::CHAIN..jit::CHAIN + jit::SITES as u64).contains(&code) => {
+            counts.unlinked += 1;
+            Ran {
+                count: taken,
+                halt: None,
+                terminal: None,
+                pending: last.code.map(|from| Pending::Site {
+                    from,
+                    site: (code - jit::CHAIN) as usize,
+                    pc,
+                    key,
+                }),
+            }
+        }
+        _ => {
+            let (completed, halt) = match (failed, stop) {
+                (Some((exit, failed)), _) => last.leave(state, exit, failed),
+                (None, stop) => (
+                    0,
+                    Some(Halt::Stop(stop.unwrap_or_else(|| {
+                        host("compiled code left the block without a reason")
+                    }))),
+                ),
+            };
+            // The head of `last` took all of its instructions.
+            Ran {
+                count: taken.saturating_sub(last.instructions) + completed,
+                halt,
+                terminal: None,
+                pending: None,
+            }
+        }
+    };
+    counts.compiled_runs += 1;
+    counts.compiled_instructions += u64::from(ran.count);
+    Some(ran)
+}
+
+impl Compiled {
+    /// Run the compiled code of this block and of no other: the replay of
+    /// K3 checks one block. Its head takes the whole budget, so the head of
+    /// any block that its exit reaches leaves at once. `None`: the budget did
+    /// not hold the block, and nothing ran. With `replay`, the loads and
+    /// stores are served from it.
     #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
     fn run_code<M: Memory>(
         &mut self,
         entry: &jit::Entry,
@@ -2585,71 +2846,24 @@ impl Compiled {
         budget: u64,
         replay: Option<&mut Replay>,
     ) -> Option<(u32, Option<Halt>)> {
-        let pc = state.pc();
-        side.user = self.context.el == 0;
-        let state_pointer: *mut State = state;
-        let frame = self.frame.as_mut_ptr();
-        let mut env = Env {
-            ops: &self.ops,
-            generics: &self.generics,
-            accesses: &self.accesses,
-            calls: &self.calls,
-            leaves: &self.leaves,
-            frame,
-            words: self.frame.len(),
-            state: state_pointer,
-            memory,
-            side,
-            single: self.instructions == 1,
-            failed: None,
-            stop: None,
-            replay,
-        };
-        let mut context = jit::Context {
-            budget: budget.min(i64::MAX as u64) as i64,
-            thunk: if env.replay.is_some() {
-                replay_thunk::<M> as jit::Thunk
-            } else {
-                thunk::<M> as jit::Thunk
-            },
-            env: (&raw mut env).cast(),
-        };
-        // SAFETY: `entry` is current and was compiled from this block, whose
-        // frame and register slots are as large as its shape names. While
-        // the code runs, only it and the thunk touch the frame and the
-        // state, and the thunk reaches them through `env` alone.
-        let code = unsafe {
-            jit.enter(
+        let budget = budget.min(u64::from(self.instructions));
+        let mut counts = JitCounts::default();
+        // SAFETY: the block is alive and current, and nothing else refers
+        // to it during the call. Its exits reach only heads that leave.
+        let ran = unsafe {
+            run_chained(
+                self,
                 entry,
-                &mut context,
-                (&raw mut (*state_pointer).slots).cast(),
-                frame,
+                jit,
+                state,
+                memory,
+                side,
+                budget,
+                &mut counts,
+                replay,
             )
         };
-        let failed = env.failed.take();
-        let stop = env.stop.take();
-        match code {
-            jit::DONE => {
-                if let Some((_, true)) = self.next {
-                    state.set_pc(pc.wrapping_add(state.pc()));
-                }
-                // The loop runs the last instruction with the PC at it.
-                if let Some((distance, _)) = self.terminal {
-                    state.set_pc(pc.wrapping_add(distance));
-                }
-                Some((self.instructions, None))
-            }
-            jit::BUDGET => None,
-            _ => Some(match (failed, stop) {
-                (Some((exit, failed)), _) => self.leave(state, exit, failed),
-                (None, stop) => (
-                    0,
-                    Some(Halt::Stop(stop.unwrap_or_else(|| {
-                        host("compiled code left the block without a reason")
-                    }))),
-                ),
-            }),
-        }
+        ran.map(|ran| (ran.count, ran.halt))
     }
 
     /// K3 (3e DESIGN.md): run the block in the interpreter with the log of
@@ -2889,7 +3103,8 @@ impl Compiled {
 /// What the JIT of a CPU did, for the bench rows and the debug log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JitCounts {
-    /// Runs of compiled blocks, and their instructions.
+    /// Runs of compiled code that the loop entered, and the instructions
+    /// that they ran, through every block that they chained to.
     pub compiled_runs: u64,
     pub compiled_instructions: u64,
     /// Runs of blocks in the interpreter while the JIT is on, and their
@@ -2919,6 +3134,72 @@ pub struct JitCounts {
     pub bytes: u64,
     pub resets: u64,
     pub compile_ns: u64,
+    /// The exits of compiled blocks to the next block (H5, H6): through a
+    /// linked jump (`chained`), through a hit of the jump cache
+    /// (`jump_hits`), and to the loop through a jump that is not linked
+    /// yet (`unlinked`) or a miss of the jump cache (`lookups`). An exit
+    /// to the loop for another reason (the last instruction that the loop
+    /// runs, a fault, the budget) is in none of them.
+    pub chained: u64,
+    pub jump_hits: u64,
+    pub unlinked: u64,
+    pub lookups: u64,
+    /// Jumps linked and set back to their stubs, and entries of the jump
+    /// cache filled.
+    pub links: u64,
+    pub unlinks: u64,
+    pub fills: u64,
+    /// Times the jump cache was emptied.
+    pub clears: u64,
+}
+
+/// Make the link that the run before left for `block`, whose code is
+/// current: when the block is the one that its exit reached, in the same
+/// context, the same epoch and the same translation (3e DESIGN.md H5, H6).
+fn make_link(
+    jit: &mut jit::Jit,
+    chaining: &mut Chaining,
+    pending: Pending,
+    block: &Compiled,
+    pc: u64,
+    epoch: u64,
+    mmu: u64,
+) {
+    let Some(to) = block.code else {
+        return;
+    };
+    if chaining.epoch != epoch || chaining.mmu != mmu {
+        return;
+    }
+    let key = context_key(block.context);
+    match pending {
+        Pending::Site {
+            from,
+            site,
+            pc: target,
+            key: from_key,
+        } if target == pc && from_key == key => {
+            jit.link(&from, site, &to);
+        }
+        Pending::Lookup {
+            pc: target,
+            key: from_key,
+        } if target == pc && from_key == key => jit.fill(pc, key, &to),
+        Pending::Verify {
+            pc: target,
+            key: from_key,
+            code,
+        } if target != pc || from_key != key || code != to.address => {
+            chaining.mismatches += 1;
+            if chaining.mismatches <= 50 {
+                eprintln!(
+                    "jit verify: the jump cache named {code:#x} for pc {target:#x} key {from_key:#x}; the loop runs {:#x} at pc {pc:#x} key {key:#x}, phys {:#x}, epoch {epoch}/{}, mmu {mmu}/{}/{}",
+                    to.address, block.phys, chaining.epoch, chaining.mmu, chaining.seen
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 impl JitCounts {
@@ -2939,48 +3220,144 @@ struct JitRun<'a> {
     counts: &'a mut JitCounts,
     /// K3 checks this many runs of each compiled block, 0 none.
     check: u32,
+    /// Chaining of compiled blocks (3e DESIGN.md H5, H6).
+    chaining: &'a mut Chaining,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
-/// in the interpreter.
-fn execute<M: Memory>(
-    block: &mut Compiled,
+/// in the interpreter. A block of `blocks` (not `single`) makes the link
+/// that `pending` asks for, and its exits chain.
+///
+/// # Safety
+/// `block` is a block of the caches of the CPU, and nothing else refers to
+/// it during the call. The blocks that its code reaches are alive.
+#[allow(clippy::too_many_arguments)]
+unsafe fn execute<M: Memory>(
+    block: *mut Compiled,
     state: &mut State,
     memory: &mut M,
     side: &mut Side,
     run: JitRun,
+    pending: Option<Pending>,
+    epoch: u64,
     budget: u64,
-) -> (u32, Option<Halt>) {
-    let JitRun { jit, counts, check } = run;
+    single: bool,
+) -> Ran {
+    let JitRun {
+        jit,
+        counts,
+        check,
+        chaining,
+    } = run;
     let Some(jit) = jit.as_mut() else {
-        return block.run(state, memory, side);
+        // SAFETY: the caller's promise.
+        let (count, halt) = unsafe { (*block).run(state, memory, side) };
+        // SAFETY: as above.
+        let terminal = unsafe { (*block).terminal.map(|(_, trap)| trap) };
+        return Ran {
+            count,
+            halt,
+            terminal,
+            pending: None,
+        };
     };
-    if !block.refused && !block.code.is_some_and(|entry| jit.current(&entry)) {
-        block.compile_code(jit, state.pc(), check > 0);
+    // The jump cache holds the translations of the MMU as they were.
+    let mmu = side.mmu.changes();
+    if chaining.seen != mmu {
+        jit.clear_jumps();
+        chaining.seen = mmu;
     }
-    if let Some(entry) = block.code {
-        if block.checks < check {
-            block.checks += 1;
-            let done = block.check(&entry, jit, state, memory, side);
-            counts.checked_runs += 1;
-            counts.checked_instructions += u64::from(done.0);
-            counts.exit(&done.1);
-            return done;
+    {
+        // SAFETY: the caller's promise.
+        let compiled = unsafe { &mut *block };
+        if !compiled.refused && !compiled.code.is_some_and(|entry| jit.current(&entry)) {
+            compiled.compile_code(
+                jit,
+                state.pc(),
+                check > 0,
+                chaining.sites && !single,
+                chaining.jumps && !single,
+                chaining.verify,
+            );
         }
-        if let Some(done) = block.run_code(&entry, jit, state, memory, side, budget, None) {
-            counts.compiled_runs += 1;
-            counts.compiled_instructions += u64::from(done.0);
-            counts.exit(&done.1);
-            return done;
+        if let Some(pending) = pending
+            && !single
+            && compiled.code.is_some_and(|entry| jit.current(&entry))
+        {
+            make_link(jit, chaining, pending, compiled, state.pc(), epoch, mmu);
+        } else if !single && let Some(Pending::Verify { pc, key, code }) = pending {
+            chaining.mismatches += 1;
+            if chaining.mismatches <= 50 {
+                eprintln!(
+                    "jit verify: the jump cache named {code:#x} for pc {pc:#x} key {key:#x}; the loop runs a block without code at pc {:#x}, single {single}",
+                    state.pc()
+                );
+            }
+        }
+        // K3 checks the first runs of each compiled block, one block at a
+        // time.
+        if let Some(entry) = compiled.code
+            && jit.current(&entry)
+            && compiled.checks < check
+        {
+            compiled.checks += 1;
+            let (count, halt) = compiled.check(&entry, jit, state, memory, side);
+            counts.checked_runs += 1;
+            counts.checked_instructions += u64::from(count);
+            counts.exit(&halt);
+            return Ran {
+                count,
+                halt,
+                terminal: compiled.terminal.map(|(_, trap)| trap),
+                pending: None,
+            };
+        }
+    }
+    // SAFETY: as above.
+    let code = unsafe { (*block).code }.filter(|entry| jit.current(entry));
+    if let Some(entry) = code {
+        // SAFETY: the caller's promise, and the CPU unlinks a block before
+        // it drops it.
+        if let Some(ran) = unsafe {
+            run_chained(
+                block, &entry, jit, state, memory, side, budget, counts, None,
+            )
+        } {
+            counts.exit(&ran.halt);
+            if ran.pending.is_some() {
+                chaining.epoch = epoch;
+                chaining.mmu = side.mmu.changes();
+            }
+            return ran;
         }
         counts.exits_budget += 1;
     } else {
         counts.refused_runs += 1;
     }
-    let done = block.run(state, memory, side);
+    // SAFETY: the caller's promise.
+    let compiled = unsafe { &mut *block };
+    let (count, halt) = compiled.run(state, memory, side);
     counts.interpreted_runs += 1;
-    counts.interpreted_instructions += u64::from(done.0);
-    done
+    counts.interpreted_instructions += u64::from(count);
+    Ran {
+        count,
+        halt,
+        terminal: compiled.terminal.map(|(_, trap)| trap),
+        pending: None,
+    }
+}
+
+/// What `VMLAB_HV_JIT_CHAIN` leaves on of chaining (3e DESIGN.md J4, R3:
+/// the switch for a bisect): linked jumps and the jump cache. `0`, `off`
+/// and `false` turn both off, `sites` leaves only the linked jumps, `jumps`
+/// only the jump cache, and anything else, or nothing, both.
+pub fn chaining_from_environment() -> (bool, bool) {
+    match std::env::var("VMLAB_HV_JIT_CHAIN").as_deref() {
+        Ok("0" | "off" | "false") => (false, false),
+        Ok("sites") => (true, false),
+        Ok("jumps") => (false, true),
+        _ => (true, true),
+    }
 }
 
 /// Whether the switch `name` of the environment is on: `1`, `on` or
@@ -3037,6 +3414,9 @@ struct Cache {
     old: FastMap<BlockKey, Box<Compiled>>,
     /// The heap bytes of the blocks in `young`.
     young_bytes: usize,
+    /// A block was dropped since the owner last looked: compiled code
+    /// that chains to it must be unlinked (3e DESIGN.md H5).
+    dropped: bool,
 }
 
 /// A block of the store: the physical address of its code and the context
@@ -3055,6 +3435,7 @@ impl Cache {
             young: FastMap::default(),
             old: FastMap::default(),
             young_bytes: 0,
+            dropped: false,
         }
     }
 
@@ -3079,6 +3460,7 @@ impl Cache {
     fn keep(&mut self, block: Box<Compiled>) {
         let bytes = block.heap_bytes();
         if self.young_bytes + bytes > SPARE_BYTES {
+            self.dropped |= !self.old.is_empty();
             self.old = std::mem::take(&mut self.young);
             self.young_bytes = 0;
         }
@@ -3086,6 +3468,7 @@ impl Cache {
         let key = (block.phys, block.context);
         if let Some(replaced) = self.young.insert(key, block) {
             self.young_bytes = self.young_bytes.saturating_sub(replaced.heap_bytes());
+            self.dropped = true;
         }
     }
 
@@ -3182,10 +3565,17 @@ pub struct Cpu<M> {
     /// Why the JIT that `VMLAB_HV_JIT` asked for could not start. The owner
     /// of the CPU writes it to its log.
     pub jit_error: Option<String>,
+    /// Chaining of compiled blocks (3e DESIGN.md H5, H6).
+    chaining: Chaining,
 }
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
 pub const ZERO_BLOCK: usize = 64;
+
+/// The most instructions of one run of compiled code on a CPU of a machine
+/// (3e DESIGN.md H10): it reads its interrupt lines, its mail and its clock
+/// at least this often. 20 to 40 us at the speeds of J1.
+const CHAIN_SLICE: u64 = 4096;
 
 /// The most entries of `Cpu::unknown`. A guest that walks an encoding space
 /// must not fill the memory of the host.
@@ -3225,6 +3615,16 @@ impl<M: Memory> Cpu<M> {
             jit_check_runs: jit_check_runs_from_environment(),
             jit_perf_map: jit_perf_map_from_environment(),
             jit_error: None,
+            chaining: Chaining {
+                sites: chaining_from_environment().0,
+                jumps: chaining_from_environment().1,
+                verify: matches!(std::env::var("VMLAB_HV_JIT_CHAIN").as_deref(), Ok("verify")),
+                mismatches: 0,
+                pending: None,
+                epoch: 0,
+                mmu: 0,
+                seen: 0,
+            },
         };
         let started = if jit_check_from_environment() {
             cpu.set_jit_check(true)
@@ -3252,11 +3652,58 @@ impl<M: Memory> Cpu<M> {
         } else {
             None
         };
+        self.chaining.pending = None;
         Ok(())
     }
 
     pub fn jit_enabled(&self) -> bool {
         self.jit.is_some()
+    }
+
+    /// Turn the chaining of compiled blocks on or off (3e DESIGN.md J4, a
+    /// switch for a bisect). The code compiled so far is dropped, so that
+    /// every block is compiled again with its exits as the switch says.
+    pub fn set_chaining(&mut self, on: bool) -> std::io::Result<()> {
+        if (on, on) == (self.chaining.sites, self.chaining.jumps) {
+            return Ok(());
+        }
+        self.chaining.sites = on;
+        self.chaining.jumps = on;
+        self.chaining.pending = None;
+        if self.jit.is_some() {
+            let mut jit = jit::Jit::new()?;
+            jit.set_perf_map(self.jit_perf_map)?;
+            self.jit = Some(jit);
+        }
+        Ok(())
+    }
+
+    pub fn chaining_enabled(&self) -> bool {
+        self.chaining.sites || self.chaining.jumps
+    }
+
+    /// The jumps of compiled code that are linked now, for the tests.
+    pub fn jit_links(&self) -> usize {
+        self.jit.as_ref().map_or(0, jit::Jit::linked)
+    }
+
+    /// Set every linked jump back to its stub and empty the jump cache:
+    /// blocks are dropped, or the code under them may have changed.
+    fn unlink_all(&mut self) {
+        self.chaining.pending = None;
+        if let Some(jit) = &mut self.jit {
+            jit.unlink_all();
+        }
+    }
+
+    /// Unlink what chains to dropped blocks of the caches (3e DESIGN.md
+    /// H5): every jump, because a dropped block does not say which it was.
+    fn unlink_dropped(&mut self) {
+        if self.blocks.dropped || self.singles.dropped {
+            self.blocks.dropped = false;
+            self.singles.dropped = false;
+            self.unlink_all();
+        }
     }
 
     /// Turn K3 on or off (3e DESIGN.md K3). On: the JIT is on, and every
@@ -3270,6 +3717,8 @@ impl<M: Memory> Cpu<M> {
             if self.jit.is_none() {
                 self.set_jit(true)?;
             }
+            // Compiled code chains to the blocks that go now.
+            self.unlink_all();
             self.blocks = Cache::new();
             self.singles = Cache::new();
         }
@@ -3313,6 +3762,10 @@ impl<M: Memory> Cpu<M> {
             counts.bytes = jit.stats.bytes;
             counts.resets = jit.stats.resets;
             counts.compile_ns = jit.stats.compile_ns;
+            counts.links = jit.stats.links;
+            counts.unlinks = jit.stats.unlinks;
+            counts.fills = jit.stats.fills;
+            counts.clears = jit.stats.clears;
         }
         counts
     }
@@ -3370,6 +3823,12 @@ impl<M: Memory> Cpu<M> {
         let log = self.side.log.take();
         self.side = Side::new(&self.state);
         self.side.log = log;
+        // Compiled code chains to the blocks that go now (3e DESIGN.md K7).
+        self.unlink_all();
+        self.chaining.seen = self.side.mmu.changes();
+        if let Some(jit) = &mut self.jit {
+            jit.clear_jumps();
+        }
         self.blocks = Cache::new();
         self.singles = Cache::new();
         self.generation = self.memory.generation();
@@ -3952,6 +4411,10 @@ impl<M: Memory> Cpu<M> {
         let generation = self.memory.generation();
         if self.side.code_written || generation != expected {
             self.epoch += 1;
+            // Chained code skips the check of `usable`: no link may outlive
+            // the epoch in which both of its blocks were seen to hold the
+            // code of the memory (3e DESIGN.md H11).
+            self.unlink_all();
         }
         self.generation = generation;
         self.side.own_writes = 0;
@@ -4009,6 +4472,17 @@ impl<M: Memory> Cpu<M> {
     /// interrupt, the illegal state and a fetch that fails come before the
     /// block. `Err`: no block could be made.
     fn run_block(&mut self, single: bool) -> Result<(u32, Option<Halt>), Stop> {
+        self.run_block_within(single, 1, None)
+    }
+
+    /// `run_block` with the budget of a run of compiled code that chains,
+    /// and the link that the run before left.
+    fn run_block_within(
+        &mut self,
+        single: bool,
+        budget: u64,
+        pending: Option<Pending>,
+    ) -> Result<(u32, Option<Halt>), Stop> {
         if (self.irq || self.fiq || self.state.il) && self.asynchronous() {
             return Ok((0, Some(Halt::Taken)));
         }
@@ -4052,6 +4526,7 @@ impl<M: Memory> Cpu<M> {
             };
             cache.put(index, compiled);
         }
+        self.unlink_dropped();
         let cache = if single {
             &mut self.singles
         } else {
@@ -4060,25 +4535,47 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return Err(host("the block cache lost a block"));
         };
-        let (count, halt) = execute(
-            block,
-            &mut self.state,
-            &mut self.memory,
-            &mut self.side,
-            JitRun {
-                jit: &mut self.jit,
-                counts: &mut self.jit_counts,
-                check: if self.jit_check {
-                    self.jit_check_runs
-                } else {
-                    0
+        let block: *mut Compiled = &mut **block;
+        // SAFETY: the block is in its cache and nothing else refers to it.
+        // The blocks that compiled code chains to are alive: a dropped one
+        // was unlinked just above.
+        let ran = unsafe {
+            execute(
+                block,
+                &mut self.state,
+                &mut self.memory,
+                &mut self.side,
+                JitRun {
+                    jit: &mut self.jit,
+                    counts: &mut self.jit_counts,
+                    check: if self.jit_check {
+                        self.jit_check_runs
+                    } else {
+                        0
+                    },
+                    chaining: &mut self.chaining,
                 },
-            },
-            u64::MAX,
-        );
+                pending,
+                self.epoch,
+                budget,
+                single,
+            )
+        };
+        self.chaining.pending = ran.pending;
         // The loop runs the last instruction at the PC that the block left.
-        let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
-        Ok((count, self.finish(halt, terminal)))
+        let terminal = ran.terminal.map(|trap| (self.state.pc(), trap));
+        Ok((ran.count, self.finish(ran.halt, terminal)))
+    }
+
+    /// The budget of one run of compiled code, of `left` instructions: a
+    /// CPU of a machine leaves its runs often enough to see its interrupt
+    /// lines, its timer and the mail of the other CPUs (3e DESIGN.md H10).
+    fn slice(&self, left: u64) -> u64 {
+        if self.lines.is_some() || self.shootdown.is_some() {
+            left.min(CHAIN_SLICE)
+        } else {
+            left
+        }
     }
 
     /// Run the last instruction of a block that ran to its end.
@@ -4142,13 +4639,22 @@ impl<M: Memory> Cpu<M> {
             None
         };
         let mut blocks = 0u32;
+        // Instructions since the clock was read: a run of compiled code
+        // that chains is many blocks.
+        let mut unclocked = 0u64;
         while left > 0 {
             if let Some(deadline) = deadline {
                 blocks += 1;
-                if blocks.is_multiple_of(CLOCK_BLOCKS) && self.clock.count() >= deadline {
-                    break;
+                if blocks.is_multiple_of(CLOCK_BLOCKS) || unclocked >= CHAIN_SLICE {
+                    unclocked = 0;
+                    if self.clock.count() >= deadline {
+                        break;
+                    }
                 }
             }
+            // The link that the run before left, for the block that runs
+            // next and no other.
+            let pending = self.chaining.pending.take();
             // Another CPU invalidated translations: no block starts before
             // this CPU has dropped them too.
             self.take_mail();
@@ -4163,29 +4669,40 @@ impl<M: Memory> Cpu<M> {
             let index = fetched.map_or(0, Cache::index);
             // The common case: the TLB holds the page of the code, and the
             // block is translated and fits the budget.
+            let budget = self.slice(left);
             let outcome = if let Some(phys) = fetched
                 && self.usable(false, index, phys, context)
                 && let Some(block) = self.blocks.entries[index].as_mut()
                 && u64::from(block.instructions) <= left
             {
-                let (count, halt) = execute(
-                    block,
-                    &mut self.state,
-                    &mut self.memory,
-                    &mut self.side,
-                    JitRun {
-                        jit: &mut self.jit,
-                        counts: &mut self.jit_counts,
-                        check: if self.jit_check {
-                            self.jit_check_runs
-                        } else {
-                            0
+                let block: *mut Compiled = &mut **block;
+                // SAFETY: the block is in its cache and nothing else refers
+                // to it. The CPU unlinks every block before it drops one.
+                let ran = unsafe {
+                    execute(
+                        block,
+                        &mut self.state,
+                        &mut self.memory,
+                        &mut self.side,
+                        JitRun {
+                            jit: &mut self.jit,
+                            counts: &mut self.jit_counts,
+                            check: if self.jit_check {
+                                self.jit_check_runs
+                            } else {
+                                0
+                            },
+                            chaining: &mut self.chaining,
                         },
-                    },
-                    left,
-                );
-                let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
-                (count, self.finish(halt, terminal))
+                        pending,
+                        self.epoch,
+                        budget,
+                        false,
+                    )
+                };
+                self.chaining.pending = ran.pending;
+                let terminal = ran.terminal.map(|trap| (self.state.pc(), trap));
+                (ran.count, self.finish(ran.halt, terminal))
             } else {
                 // A whole block where the budget allows one, else one
                 // instruction. A block that is not translated yet can be as
@@ -4198,13 +4715,14 @@ impl<M: Memory> Cpu<M> {
                     Some(length) => length > left,
                     None => left < u64::from(BLOCK_INSTRUCTIONS),
                 };
-                match self.run_block(single) {
+                match self.run_block_within(single, budget, pending) {
                     Ok(outcome) => outcome,
                     Err(stop) => return stop,
                 }
             };
             let (count, halt) = outcome;
             self.instructions += u64::from(count);
+            unclocked += u64::from(count);
             left = left.saturating_sub(u64::from(count));
             match halt {
                 None => {}
