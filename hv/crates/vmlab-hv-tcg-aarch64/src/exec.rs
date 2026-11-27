@@ -69,7 +69,10 @@ pub const BLOCK_INSTRUCTIONS: u32 = 64;
 pub static BLOCK_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(BLOCK_INSTRUCTIONS);
 
 /// The block cache is direct-mapped by the PC.
-const CACHE_ENTRIES: usize = 1 << 12;
+const CACHE_ENTRIES: usize = 1 << 14;
+/// The most blocks that a cache keeps beside its entries: those that a
+/// block of another PC took the entry of. More empty the store.
+const SPARE_BLOCKS: usize = 1 << 14;
 
 /// The pages that hold translated code are a bit set over the low bits of
 /// the page number. Two pages with the same low bits share a bit, which
@@ -1413,19 +1416,60 @@ impl Compiled {
     }
 }
 
+/// The translated blocks of a CPU: an entry for each PC, picked by the low
+/// bits of the PC, and a store of the blocks that lost their entry to
+/// another PC. A kernel and its programs run more code than the entries
+/// cover, so without the store the same blocks were translated again and
+/// again (card C13).
 struct Cache {
     entries: Vec<Option<Box<Compiled>>>,
+    spare: std::collections::HashMap<(u64, Context), Box<Compiled>>,
 }
 
 impl Cache {
     fn new() -> Self {
         let mut entries = Vec::new();
         entries.resize_with(CACHE_ENTRIES, || None);
-        Self { entries }
+        Self {
+            entries,
+            spare: std::collections::HashMap::new(),
+        }
     }
 
+    /// The entry of `pc`. The bits above the page fold in, so that the
+    /// code of a kernel and of its programs at the same offsets of their
+    /// halves meet less.
+    #[inline(always)]
     fn index(pc: u64) -> usize {
-        (pc >> 2) as usize & (CACHE_ENTRIES - 1)
+        ((pc >> 2) ^ (pc >> 22) ^ (pc >> 44)) as usize & (CACHE_ENTRIES - 1)
+    }
+
+    /// Put `block` in the entry at `index`, and keep the block that was
+    /// there in the store.
+    fn put(&mut self, index: usize, block: Box<Compiled>) {
+        if let Some(old) = self.entries[index].replace(block) {
+            self.keep(old);
+        }
+    }
+
+    fn keep(&mut self, block: Box<Compiled>) {
+        if self.spare.len() >= SPARE_BLOCKS {
+            self.spare.clear();
+        }
+        self.spare.insert((block.pc, block.context), block);
+    }
+
+    /// Bring the block of `pc` in `context` back from the store into the
+    /// entry at `index`, when the store has it. Whether it still holds the
+    /// code of the memory is for the caller to check.
+    fn revive(&mut self, index: usize, pc: u64, context: Context) -> bool {
+        match self.spare.remove(&(pc, context)) {
+            Some(block) => {
+                self.put(index, block);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -2146,7 +2190,17 @@ impl<M: Memory> Cpu<M> {
                 return Ok((0, Some(Halt::Taken)));
             }
         };
-        if !self.usable(single, index, pc, phys, context) {
+        let mut ready = self.usable(single, index, pc, phys, context);
+        if !ready {
+            let cache = if single {
+                &mut self.singles
+            } else {
+                &mut self.blocks
+            };
+            ready = cache.revive(index, pc, context)
+                && self.usable(single, index, pc, phys, context);
+        }
+        if !ready {
             let limit = if single { 1 } else { BLOCK_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
             let compiled = match self.translate(phys, limit) {
                 Ok(compiled) => Box::new(compiled),
@@ -2161,7 +2215,7 @@ impl<M: Memory> Cpu<M> {
             } else {
                 &mut self.blocks
             };
-            cache.entries[index] = Some(compiled);
+            cache.put(index, compiled);
         }
         let cache = if single {
             &mut self.singles
