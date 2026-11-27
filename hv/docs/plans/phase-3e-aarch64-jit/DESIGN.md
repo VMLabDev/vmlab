@@ -312,6 +312,9 @@ No traces in the cards J1 to J8. A trace needs counters, a recorder and exits
 into the middle of other blocks. Chaining gives most of the gain of a trace
 for a loop (B1). Card J9 measures whether a superblock (several blocks
 compiled as one unit, with registers kept across the joins) is the next step.
+Card J14 built superblocks without counters: the lifter goes on at the target
+of a direct branch in the page of the block (section "J14, measured by card
+J14").
 
 ### H2. When
 
@@ -1865,6 +1868,147 @@ What changed:
   the rows: each was stopped and its row run again. J6f found the same
   timeout for Fedora.
 
+### J14, measured by card J14
+
+What card J14 built. No source was read for it: no QEMU source (X1 to X3)
+and no code of another JIT.
+
+- **J14a. A superblock is one block of the lifter** (`Builder::join`,
+  `Cpu::translate`). When an instruction ends a block with a direct branch
+  (`B`, `BL`, `B.cond`, `CBZ`, `CBNZ`, `TBZ`, `TBNZ`) and both of its targets
+  are inside the page at or after the entry of the block, the lifter goes on
+  at one target in the same block: the registers stay in the scalars of the
+  graph across the join, and in host registers in the compiled code. An
+  unconditional branch goes on at its target. A conditional branch goes on
+  at its taken target when that is at or before the branch (a loop, which
+  then runs as many turns as fit), else at the next instruction. The block
+  keeps its limit of 64 instructions and stays in its page. A target before
+  the entry is not joined: the code stamp of the block covers its entry to
+  the end of its page.
+- **J14b. The side exit.** A joined conditional branch puts a guard into the
+  block. Where the branch goes the other way, the guard leaves through a
+  side exit: its outputs are the registers after the branch, its next PC is
+  the other target, and the instructions up to the branch are complete
+  (`Leave::side`, `Halt::Branch`). The lifter computes the registers of a side
+  exit on the main path, so it has no cold operations, and it makes at most 8
+  (`SIDE_EXITS`). The interpreter leaves there as at the end of a block, with
+  no last instruction to run.
+- **J14c. In compiled code** a side exit is a stub of its own
+  (`emit::Side`, `Emitter::side_exit`): it writes the outputs from where
+  their words are, moves the PC, counts the instructions after it that the
+  head took in `Context::refund`, and leaves through a jump that the owner
+  links as it links an exit of the end (H5). `jit::SITES` is 10. The budget
+  keeps what the head took, so the head of the next block in the one-block
+  run of K3 leaves as before, and the owner counts `budget - left - refund`.
+  A block that does not chain (`VMLAB_HV_JIT_CHAIN=0`) leaves a side exit
+  through the thunk, as a guard does.
+- **J14d. The precise state of H9 at a join.** An exit of a fault in a
+  joined part has the PC of its instruction from the entry, which can be
+  any place of the page, and the count of the instructions before it in the
+  whole block. K2 and K3 compare both.
+- **J14e. Switches and counts.** Superblocks are made while the JIT is on;
+  `VMLAB_HV_JIT_SUPER=0` turns them off. The JIT line of the debug log ends
+  with `superblocks: N joins, N side exits`, and the flat rows hold them.
+- **J14f. A defect found and fixed.** The count of one run of compiled code
+  is a `u32`, and a run of more instructions counted `u32::MAX` for them. A
+  flat image of more than 2^32 instructions on one run lost the rest: the
+  CoreMark image of 30,000 iterations is 7,362,447,048 instructions (the
+  interpreter), and the JIT counted 4,296,404,139 (also in the long images
+  of J9a5 and J10g). A run now takes at most `u32::MAX` instructions. The
+  bench rows (245 and 300 million instructions) were not affected.
+
+Proof, helios, 2026-11-28, *measured*. Before is `next` (`3336db1c`), after
+is `29986b7a` (the later commits of the card change no code that runs). Each
+side ran from a tree exported from its commit, with its own target
+directory. Other cards ran builds and boots at the same time (load average 7
+to 10 of 32 threads), and so did the merge bar of this card during the flat
+rows and the first boots. The rows are in `bench/history/aarch64.jsonl`
+with the note "card J14".
+
+**J14g. The flat rows against QEMU.** The bench rows (`--backend jit`, the
+images of 245 and 300 million instructions), cores 28 to 31, the median of
+3, before, after and QEMU in turn, two runs:
+
+| Workload | Before | After | QEMU 11.1.3 | After of QEMU |
+|---|---|---|---|---|
+| CoreMark mix, MIPS | 1,999.9 and 1,983.5 | 2,595.4 and 2,627.8 | 2,382.5 and 2,316.7 | 109 and 113 % |
+| Scalar loop, MIPS | 2,014.9 and 1,983.2 | 8,931.8 and 8,928.1 | 2,993.0 and 2,999.3 | 298 % |
+
+The long images (CoreMark of 30,000 iterations, the loop of 10^9), the
+three builds in turn, the median of 5 with the range, MIPS from the
+instruction counts of the interpreter:
+
+| Image | Before | After | After, `VMLAB_HV_JIT_SUPER=0` |
+|---|---|---|---|
+| CoreMark | 2,016.6 (1,867.4 to 2,058.6) | 2,832.8 (2,692.2 to 2,858.5) | 2,002.4 (1,905.1 to 2,046.2) |
+| Scalar loop | 2,005.4 (1,879.2 to 2,038.4) | 8,918.5 (7,036.3 to 9,037.8) | 1,994.9 (1,908.5 to 2,027.7) |
+
+- **J14g1. N5 holds.** CoreMark is 1.30 to 1.32 times faster on the bench
+  rows and 1.40 times on the long image, against the 1.2 to 1.4 of the
+  estimate, and at 109 to 113 % of QEMU. The scalar loop (three
+  instructions a turn) runs 21 turns in one block, 4.4 to 4.5 times faster.
+  With the switch off the after build runs as before, so the gain is the
+  superblocks.
+- **J14g2. CoreMark meets its part of T3 (O1 of Q4)**: at least 100 % of
+  QEMU.
+
+**J14h. The boots.** Debian 13 to agent ready, the boot suite, one VM at a
+time, before and after in turn, cores 20 to 23, one repeat each:
+
+| vCPUs | Before, s | After, s |
+|---|---|---|
+| 1 | 93.95, 61.85, 76.24: median 76.24 (237.2 MIPS) | 62.93, 56.18, 79.01: median 62.93 (285.5 MIPS) |
+| 4 | 73.84, 52.17, 39.11: median 52.17 (382.6 MIPS) | 54.73, 41.33, 42.15: median 42.15 (460.7 MIPS) |
+
+The last JIT line of vCPU 0 at 18.0e9 instructions, at one vCPU (two boots
+a side):
+
+| | Before | After |
+|---|---|---|
+| Exits through a linked jump or the jump cache | 2.47 and 2.48 billion | 1.30 to 1.31 billion |
+| Runs of compiled code entered | 129.6 and 132.4 million | 125.3 and 138.3 million |
+| Blocks translated | 480,073 and 482,988 | 411,377 and 423,423 |
+| Compiles, code | 0.97 and 0.98 million, 489 to 493 MB, 26 drops of a part | 1.18 to 1.24 million, 1.00 to 1.06 GB, 57 to 60 drops |
+| Compile time, translation time | 1.55 to 1.59 s, 1.80 to 1.97 s | 3.05 to 3.17 s, 2.76 to 2.99 s |
+| Joins, side exits | | 304,715 to 313,459, 282,920 to 290,943 |
+
+- **J14h1. The boot moves by less than its spread.** The medians are 1.21
+  times faster at one vCPU and 1.24 times at four, inside the spread of the
+  before side (32.1 s and 34.7 s). The exits between blocks fall by 47 %, and
+  what the boot pays for it is the code: twice the bytes, twice the drops of
+  a part of the region (H13c), and 1.5 s more of compiling and 1 s more of
+  translating. The basis of an explanation, not measured apart: a side
+  exit writes every register that the block changed before it, and a loop
+  of the kernel is compiled again for each of its entries.
+- **J14h2. K3** on a Debian 13 boot at one vCPU with the after build,
+  `VMLAB_HV_JIT_CHECK=1` and `VMLAB_HV_JIT_CHECK_RUNS=1000`: agent ready
+  after 144.4 s, no difference, 117.1 million checked runs (853.2 million
+  instructions) at the line of 18.0e9 instructions, with 292,521 joins and
+  271,394 side exits.
+- **J14h3. The interpreter share (H2b)** is zero for a missing form: no
+  block refused.
+
+**J14i. K2 and K1.**
+
+- **J14i1. K2 with blocks that join** (`jitdiff::run_joins`, the test
+  `superblocks_leave_what_the_interpreter_leaves`): the images of K2 with
+  about one instruction in five replaced by a direct branch to another
+  instruction of the image or to its end. The interpreter makes no
+  superblock, so each round compares superblocks with blocks. Seed
+  `0x3e0014`, 3,000 rounds: 21,420 joins and 10,532 side exits, no
+  difference. The same rounds under K3 (1,000): no difference. The chained
+  programs of J4 run with superblocks too (`tests/chain.rs`): the same
+  registers and counts as the interpreter, and the store into a joined
+  block drops its code.
+- **J14i2. K1 for the branch group** (`just tcg-a64-lockstep branch 100000
+  1`, `VMLAB_HV_JIT=1`): 668,709 instructions verified in 76,243 rounds, no
+  difference. The lockstep runs blocks of one instruction, so it makes no
+  superblock: it shows that the branch forms are the same as before.
+- **J14j. What is left.** The boot pays for its superblocks in code (J14h1).
+  A side exit that writes only the registers that the next block reads,
+  or joins only where a link of H5 was made at run time, would make less.
+  The boot rows of 1 and 4 vCPUs are far from QEMU (26.9 and 20.1 s, J9b).
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -2032,6 +2176,24 @@ python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 --g
 # lines whose unix_ns is inside the end time and the length of xz_9_32M in the bench log
 # J12b: the same on a build of commit f149cabd (the misses by cause)
 # J12d: as J9b, with --hv-bin of next and of the card, side by side, without QEMU
+```
+
+J14, the same firmware, one exported tree and one target directory a side:
+
+```sh
+# J14g: the flat rows, before, after and QEMU in turn
+python3 bench/run.py --backend jit --arch aarch64 --vcpus 1 --repeats 3 --cpus 28-31        # in each tree
+python3 bench/run.py --backend qemu --arch aarch64 --vcpus 1 --repeats 3 --guest flat-a64 --cpus 28-31
+# the long images: micro_a64.build_coremark(30000) and build_loop(1000000000), each build in turn,
+# and the after build with VMLAB_HV_JIT_SUPER=0; MIPS from the counts of VMLAB_HV_JIT=0
+VMLAB_HV_JIT=1 taskset -c 28-31 <side>/release/examples/a64_bench <image> 20000000000
+# J14h: the boots in turn, one VM at a time, then K3
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 --guest debian-13 \
+  --suite boot --keep --hv-bin <side>/release/vmlab-hv --cpus 20-23   # and --vcpus 4
+grep -o "superblocks: .*" bench/run/*/stderr.log
+# J14i: K2 with joins, K1 for the branch group
+cargo test --release -p vmlab-hv-tcg-aarch64 --test jit -- superblocks
+VMLAB_HV_JIT=1 just tcg-a64-lockstep branch 100000 1
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the

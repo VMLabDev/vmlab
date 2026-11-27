@@ -98,6 +98,9 @@ fn second_run(jit: bool) -> (u64, u64, u64) {
     let mut cpu = Cpu::new(FlatMemory::new(BASE, data), State::reset(BASE));
     cpu.set_jit(jit).expect("a code region");
     cpu.set_chaining(false).expect("a code region");
+    // The two runs translate the same blocks: superblocks, which only a
+    // CPU with the JIT makes (J14), would make other ones.
+    cpu.set_superblocks(false);
     cpu.state.set_x(1, BASE + DATA);
     assert!(matches!(cpu.run(1_000_000), Stop::Hypercall { .. }));
     let (translations, compiled) = (cpu.translations, cpu.jit_counts().compiled);

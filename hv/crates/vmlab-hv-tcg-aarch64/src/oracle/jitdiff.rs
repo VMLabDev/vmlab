@@ -23,6 +23,12 @@
 //! bits, many of them equal or one apart, so that every condition of a
 //! compare flips inside a round (U4).
 //!
+//! The rounds of `run_joins` are for superblocks (card J14): the images of
+//! `run` with direct branches to other instructions of the image put in, so
+//! that the blocks of the compiled side join at them and leave through
+//! their side exits, while the interpreter, which makes no superblock, runs
+//! the same code block by block.
+//!
 //! `ci::check` runs a bounded number of rounds with a fixed seed (the test
 //! `tests/jit.rs`); `just tcg-a64-jit-diff` runs as many as it is asked.
 //!
@@ -74,6 +80,10 @@ pub struct Report {
     /// Comparisons compiled as host flags, and lazy conditions inline.
     pub fused: u64,
     pub lazy: u64,
+    /// The joins of the superblocks that the compiled side made, and those
+    /// with a side exit (J14).
+    pub joins: u64,
+    pub side_exits: u64,
 }
 
 /// The first round where the two sides differ.
@@ -215,23 +225,80 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
 /// Run `rounds` rounds of the flags from `seed`: the integer and branch
 /// classes on registers at the edges.
 pub fn run_flags(seed: u64, rounds: u64) -> Result<Report, Difference> {
-    run_rounds(seed, rounds, Options::default(), true)
+    run_rounds(seed, rounds, Options::default(), Rounds::Flags)
 }
 
 /// Run `rounds` rounds from `seed`, the compiled side as `options` say.
 pub fn run_with(seed: u64, rounds: u64, options: Options) -> Result<Report, Difference> {
-    run_rounds(seed, rounds, options, false)
+    run_rounds(seed, rounds, options, Rounds::Plain)
 }
 
-fn run_rounds(seed: u64, rounds: u64, options: Options, flags: bool) -> Result<Report, Difference> {
+/// Run `rounds` rounds of superblocks from `seed` (J14): direct branches
+/// between the instructions of each image.
+pub fn run_joins(seed: u64, rounds: u64, options: Options) -> Result<Report, Difference> {
+    run_rounds(seed, rounds, options, Rounds::Joins)
+}
+
+/// What the images of a run of rounds hold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rounds {
+    Plain,
+    Flags,
+    Joins,
+}
+
+/// A direct branch from the instruction `from` of an image to its
+/// instruction `to`: `B`, `B.cond`, `CBZ`, `CBNZ`, `TBZ` or `TBNZ` on a
+/// random condition, register and bit.
+fn branch_between(rng: &mut super::stream::Rng, from: usize, to: usize) -> u32 {
+    let offset = to as i64 - from as i64;
+    let rt = rng.below(31) as u32;
+    match rng.below(6) {
+        0 => 0x1400_0000 | (offset as u32 & 0x3ff_ffff),
+        1 | 2 => 0x5400_0000 | ((offset as u32 & 0x7_ffff) << 5) | rng.below(16) as u32,
+        3 | 4 => {
+            let sf = rng.below(2) as u32;
+            let nonzero = rng.below(2) as u32;
+            sf << 31 | 0x3400_0000 | nonzero << 24 | (offset as u32 & 0x7_ffff) << 5 | rt
+        }
+        _ => {
+            let bit = rng.below(64) as u32;
+            let nonzero = rng.below(2) as u32;
+            (bit >> 5) << 31
+                | 0x3600_0000
+                | nonzero << 24
+                | (bit & 31) << 19
+                | (offset as u32 & 0x3fff) << 5
+                | rt
+        }
+    }
+}
+
+fn run_rounds(
+    seed: u64,
+    rounds: u64,
+    options: Options,
+    kind: Rounds,
+) -> Result<Report, Difference> {
+    let flags = kind == Rounds::Flags;
     let mut generator = Generator::new(seed);
     let formats = if flags { flag_formats() } else { formats() };
     let mut report = Report::default();
     for round in 0..rounds {
         let count = 1 + generator.rng.below(64) as usize;
-        let (words, _) = generator.image(IMAGE, count, |rng| {
+        let (mut words, _) = generator.image(IMAGE, count, |rng| {
             formats[rng.below(formats.len() as u64) as usize]
         });
+        if kind == Rounds::Joins {
+            // About one instruction in five branches to another of the
+            // image, before or after it, or to the HVC after its end.
+            for (from, word) in words.iter_mut().enumerate().take(count) {
+                if generator.rng.chance(1, 5) {
+                    let to = generator.rng.below(count as u64 + 1) as usize;
+                    *word = branch_between(&mut generator.rng, from, to);
+                }
+            }
+        }
         let difference = |what: String| Difference {
             seed,
             round,
@@ -341,6 +408,8 @@ fn run_rounds(seed: u64, rounds: u64, options: Options, flags: bool) -> Result<R
         report.tlb_misses += jit.tlb_misses;
         report.fused += jit.fused;
         report.lazy += jit.lazy;
+        report.joins += compiled.joins;
+        report.side_exits += compiled.side_exits;
     }
     Ok(report)
 }

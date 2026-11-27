@@ -131,6 +131,7 @@ impl Seat {
                 reads: crate::tlb::EMPTY_TABLE.as_ptr(),
                 writes: crate::tlb::EMPTY_TABLE.as_ptr(),
                 accesses: 0,
+                refund: 0,
             }),
         }
     }
@@ -163,6 +164,7 @@ impl Seat {
                 reads,
                 writes,
                 accesses,
+                refund,
             } = fresh;
             addr_of_mut!((*context).thunk).write(thunk);
             addr_of_mut!((*context).env).write(env);
@@ -174,6 +176,7 @@ impl Seat {
             addr_of_mut!((*context).reads).write(reads);
             addr_of_mut!((*context).writes).write(writes);
             addr_of_mut!((*context).accesses).write(accesses);
+            addr_of_mut!((*context).refund).write(refund);
             budget(context).store(fresh_budget, Ordering::Release);
         }
     }
@@ -260,6 +263,7 @@ mod tests {
             reads: crate::tlb::EMPTY_TABLE.as_ptr(),
             writes: crate::tlb::EMPTY_TABLE.as_ptr(),
             accesses: 0,
+            refund: 0,
         }
     }
 }
