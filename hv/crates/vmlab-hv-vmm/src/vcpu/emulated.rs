@@ -99,6 +99,15 @@ pub struct EmulatedVcpu {
     /// the CPU is set from it before each slice, so that it stands still
     /// while the machine is paused.
     counter: Option<(Counter, u64)>,
+    report_boot_instructions: bool,
+}
+
+impl Drop for EmulatedVcpu {
+    fn drop(&mut self) {
+        if self.report_boot_instructions {
+            eprintln!("boot instructions: {} {}", self.id, self.cpu.instructions);
+        }
+    }
 }
 
 /// The count of the system counter of a machine now.
@@ -134,6 +143,7 @@ impl EmulatedVcpu {
             hypercall: None,
             logged: 0,
             counter: None,
+            report_boot_instructions: std::env::var_os("VMLAB_HV_BOOT_INSTRUCTIONS").is_some(),
         }
     }
 
