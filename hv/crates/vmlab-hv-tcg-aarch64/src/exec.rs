@@ -854,9 +854,8 @@ const UNPRIVILEGED: u8 = 0x80;
 /// address (card S4). An inlined access with one of them set in its
 /// address misses the fast TLB, so a Device page faults in the Rust path.
 const DEVICE_MASK: u8 = 0x0f;
-const _: () = assert!(
-    UNPRIVILEGED == jit::emit::THUNK_ACCESS && DEVICE_MASK & !jit::emit::ALIGNMENT == 0
-);
+const _: () =
+    assert!(UNPRIVILEGED == jit::emit::THUNK_ACCESS && DEVICE_MASK & !jit::emit::ALIGNMENT == 0);
 
 /// Where a block can leave before its end.
 #[derive(Clone, Debug)]

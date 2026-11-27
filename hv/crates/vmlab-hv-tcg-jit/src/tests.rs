@@ -1262,7 +1262,14 @@ fn run_on_tables(
     // SAFETY: the entry was just compiled from this block, the slots and
     // the frame are as large as it names, and the caller's tables live
     // through the run.
-    let code = unsafe { jit.enter(&entry, &raw mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
+    let code = unsafe {
+        jit.enter(
+            &entry,
+            &raw mut context,
+            slots.as_mut_ptr(),
+            frame.as_mut_ptr(),
+        )
+    };
     (code, env.thunk_calls, env.misses, env.watched)
 }
 
