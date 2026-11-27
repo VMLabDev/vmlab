@@ -58,6 +58,7 @@ use crate::state::{Context, State, slot};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
+use std::sync::atomic::{AtomicU32, Ordering, compiler_fence};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
@@ -298,8 +299,12 @@ struct Side {
     /// The accesses since the caller last took them, when it asked for them.
     log: Option<Vec<Access>>,
     /// A filter in front of `code_set`: a bit for the low bits of each
-    /// physical page that holds translated code.
+    /// physical page that holds translated code. A bit is clear again when
+    /// no page of `code_set` has it (`code_counts`).
     code_pages: Vec<u64>,
+    /// For each bit of `code_pages`, the pages of `code_set` that have it,
+    /// up to `u8::MAX`, which stays.
+    code_counts: Vec<u8>,
     /// The physical pages that hold translated code.
     code_set: FastSet<u64>,
     /// Writes of this CPU to the memory since the caches were last checked.
@@ -320,6 +325,7 @@ impl Side {
             exclusive_high: 0,
             log: None,
             code_pages: vec![0; CODE_PAGE_BITS / 64],
+            code_counts: vec![0; CODE_PAGE_BITS],
             code_set: FastSet::default(),
             own_writes: 0,
             code_written: false,
@@ -335,9 +341,27 @@ impl Side {
 
     /// The page of the physical address holds translated code from now on.
     fn mark_code(&mut self, address: u64) {
-        let (word, bit) = Self::page_bit(address);
-        self.code_pages[word] |= bit;
-        self.code_set.insert(address >> 12);
+        if self.code_set.insert(address >> 12) {
+            let (word, bit) = Self::page_bit(address);
+            self.code_pages[word] |= bit;
+            let count = &mut self.code_counts[(address >> 12) as usize & (CODE_PAGE_BITS - 1)];
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// The page of the physical address holds no translated code that is
+    /// known to hold: a store of this CPU went into it.
+    fn unmark_code(&mut self, address: u64) {
+        if self.code_set.remove(&(address >> 12)) {
+            let count = &mut self.code_counts[(address >> 12) as usize & (CODE_PAGE_BITS - 1)];
+            if *count != u8::MAX {
+                *count -= 1;
+                if *count == 0 {
+                    let (word, bit) = Self::page_bit(address);
+                    self.code_pages[word] &= !bit;
+                }
+            }
+        }
     }
 
     /// Whether the page of the physical address can hold translated code.
@@ -363,9 +387,9 @@ impl Side {
         self.own_writes += 1 + u64::from(crossed);
         if code {
             self.code_written = true;
-            self.code_set.remove(&(spot.first >> 12));
+            self.unmark_code(spot.first);
             if crossed {
-                self.code_set.remove(&(spot.second >> 12));
+                self.unmark_code(spot.second);
             }
         }
         if let Some(log) = &mut self.log {
@@ -605,7 +629,7 @@ impl Side {
         self.own_writes += 1;
         if code {
             self.code_written = true;
-            self.code_set.remove(&(spot.first >> 12));
+            self.unmark_code(spot.first);
         }
         if let Some(log) = &mut self.log {
             for half in 0..ZERO_BLOCK / 16 {
@@ -681,22 +705,18 @@ impl Side {
         if !same {
             return Ok((false, false));
         }
-        let wrote = if bytes == reservation.bytes {
-            memory
-                .store_conditional(phys, part, reservation.generation)
-                .map_err(|error| Fault::memory(error, address))?
-        } else if memory.reservation_generation(reservation.phys, usize::from(reservation.bytes))
+        // The granules of the load are untouched, and the memory still holds
+        // what was read under the lock. A CPU writes RAM straight without
+        // the lock (card S3), so the write is one compare and exchange of
+        // the host against that value: a store of another CPU that lands
+        // after the read fails it. A store of the same value that lands
+        // there is taken as one made before the load, as QEMU's compare and
+        // exchange does.
+        let wrote = memory.reservation_generation(reservation.phys, usize::from(reservation.bytes))
             == reservation.generation
-        {
-            // A store of another size than its load: the granules of the
-            // load are untouched, and the lock is held.
-            memory
-                .write(phys, part)
+            && memory
+                .compare_and_store(phys, &now.to_le_bytes()[..usize::from(bytes)], part)
                 .map_err(|error| Fault::memory(error, address))?;
-            true
-        } else {
-            false
-        };
         if wrote {
             self.wrote(address, spot, bytes, value, code);
         }
@@ -1144,6 +1164,64 @@ fn bits_mask(bytes: u8) -> u128 {
     }
 }
 
+/// The watch word of the page of a TLB entry, for a page that a CPU may
+/// write straight.
+#[inline(always)]
+fn entry_watch(entry: &vmlab_hv_tcg::tlb::Entry) -> Option<&'static AtomicU32> {
+    // SAFETY: a non-zero `watch` is the address of the watch word that
+    // `Memory::host_page` handed out, which lives as long as the mapping of
+    // the entry: the entry is dropped before the memory names another.
+    (entry.watch != 0).then(|| unsafe { &*(entry.watch as *const AtomicU32) })
+}
+
+/// Read `N` bytes, 1 to 8, of guest RAM at the host address `at`, as a
+/// little-endian word. An access at its own alignment is one host access, so
+/// that another CPU never sees half of it (single-copy atomicity).
+///
+/// # Safety
+/// The `N` bytes at `at` are inside a live mapping of guest RAM.
+#[inline(always)]
+unsafe fn host_load<const N: usize>(at: usize) -> u64 {
+    // SAFETY: the caller's promise. Other threads (devices, CPUs) can write
+    // the same RAM, so an aligned access is volatile, as vm-memory's are.
+    unsafe {
+        if at.is_multiple_of(N) {
+            match N {
+                1 => u64::from(std::ptr::read_volatile(at as *const u8)),
+                2 => u64::from(u16::from_le(std::ptr::read_volatile(at as *const u16))),
+                4 => u64::from(u32::from_le(std::ptr::read_volatile(at as *const u32))),
+                _ => u64::from_le(std::ptr::read_volatile(at as *const u64)),
+            }
+        } else {
+            let mut bytes = [0u8; 8];
+            std::ptr::copy_nonoverlapping(at as *const u8, bytes.as_mut_ptr(), N);
+            u64::from_le_bytes(bytes)
+        }
+    }
+}
+
+/// Write the low `N` bytes, 1 to 8, of `value` into guest RAM at the host
+/// address `at`, as `host_load` reads.
+///
+/// # Safety
+/// The `N` bytes at `at` are inside a live, writable mapping of guest RAM.
+#[inline(always)]
+unsafe fn host_store<const N: usize>(at: usize, value: u64) {
+    // SAFETY: the caller's promise, as in `host_load`.
+    unsafe {
+        if at.is_multiple_of(N) {
+            match N {
+                1 => std::ptr::write_volatile(at as *mut u8, value as u8),
+                2 => std::ptr::write_volatile(at as *mut u16, (value as u16).to_le()),
+                4 => std::ptr::write_volatile(at as *mut u32, (value as u32).to_le()),
+                _ => std::ptr::write_volatile(at as *mut u64, value.to_le()),
+            }
+        } else {
+            std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), at as *mut u8, N);
+        }
+    }
+}
+
 /// A load of `N` bytes, 1 to 8, into one word.
 #[inline(always)]
 fn load<M: Memory, const N: usize>(
@@ -1155,18 +1233,27 @@ fn load<M: Memory, const N: usize>(
     // SAFETY: `compile` checked the words of every operation.
     let at = unsafe { block::word(frame, usize::from(op.a)) };
     let user = side.user || op.aux & UNPRIVILEGED != 0;
-    // The common case: the TLB holds the page with the permission, nothing
-    // keeps the accesses, and the memory holds the address. A read that
-    // fails has changed nothing, and the general path reads again to say
-    // why.
-    if side.log.is_none()
-        && let Some((phys, _)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Read, user))
-    {
-        let mut bytes = [0u8; 8];
-        if memory.read(phys, &mut bytes[..N]).is_ok() {
+    let need = mmu::needed(Kind::Read, user);
+    // The common case: the TLB holds the page with the permission and its
+    // host address, and nothing keeps the accesses.
+    if side.log.is_none() {
+        if let Some(entry) = side.mmu.hit_host(at, N as u64, need) {
+            // SAFETY: `hit_host` found the access inside the page, whose
+            // host mapping lives while the memory names it (`sync_memory`).
+            let value = unsafe { host_load::<N>(entry.host + (at & 0xfff) as usize) };
             // SAFETY: as above.
-            unsafe { block::set_word(frame, usize::from(op.dst), u64::from_le_bytes(bytes)) };
+            unsafe { block::set_word(frame, usize::from(op.dst), value) };
             return Ok(());
+        }
+        // A page that the memory serves itself. A read that fails has
+        // changed nothing, and the general path reads again to say why.
+        if let Some((phys, _)) = side.mmu.hit(at, N as u64, need) {
+            let mut bytes = [0u8; 8];
+            if memory.read(phys, &mut bytes[..N]).is_ok() {
+                // SAFETY: as above.
+                unsafe { block::set_word(frame, usize::from(op.dst), u64::from_le_bytes(bytes)) };
+                return Ok(());
+            }
         }
     }
     match side.load(memory, at, N as u8, false, user) {
@@ -1196,18 +1283,42 @@ fn store<M: Memory, const N: usize>(
     };
     let exit = op.imm as u32;
     let user = side.user || op.aux & UNPRIVILEGED != 0;
+    let need = mmu::needed(Kind::Write, user);
     // The common case: the TLB holds the page with the permission, the page
     // holds no translated code, there is no exclusive mark to carry over
-    // the store, and nothing keeps the accesses. A write that fails has
-    // changed nothing, and the general path writes again to say why.
-    if side.exclusive.is_none()
-        && side.log.is_none()
-        && let Some((phys, _)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Write, user))
-        && !side.maybe_code(phys)
-        && memory.write(phys, &value.to_le_bytes()[..N]).is_ok()
-    {
-        side.own_writes += 1;
-        return Ok(());
+    // the store, and nothing keeps the accesses.
+    if side.exclusive.is_none() && side.log.is_none() {
+        // RAM that the host reaches straight, which no CPU holds code of:
+        // the store needs no stamp (card S3).
+        if let Some(&entry) = side.mmu.hit_host(at, N as u64, need)
+            && let Some(watch) = entry_watch(&entry)
+            && !side.maybe_code(entry.phys)
+            && watch.load(Ordering::Relaxed) & 1 == 0
+        {
+            let offset = at & 0xfff;
+            // SAFETY: `hit_host` found the access inside the page, whose
+            // host mapping lives while the memory names it, and the page
+            // has a watch word, so it is writable.
+            unsafe { host_store::<N>(entry.host + offset as usize, value) };
+            // A CPU that started to translate code of the page while the
+            // store was made: the store moves its stamp (the argument is at
+            // `Memory::watch_code` of `GuestBus`).
+            compiler_fence(Ordering::SeqCst);
+            if watch.load(Ordering::Relaxed) & 1 != 0 {
+                memory.wrote_straight(entry.phys | offset, N);
+                side.own_writes += 1;
+            }
+            return Ok(());
+        }
+        // A page that the memory serves itself. A write that fails has
+        // changed nothing, and the general path writes again to say why.
+        if let Some((phys, _)) = side.mmu.hit(at, N as u64, need)
+            && !side.maybe_code(phys)
+            && memory.write(phys, &value.to_le_bytes()[..N]).is_ok()
+        {
+            side.own_writes += 1;
+            return Ok(());
+        }
     }
     let value = u128::from(value) & bits_mask(N as u8);
     side.store(memory, at, N as u8, value, user, single)
@@ -1618,6 +1729,8 @@ pub struct Cpu<M> {
     singles: Cache,
     /// The write generation of the memory at the last check of the caches.
     generation: u64,
+    /// `Memory::own_generation` at that check.
+    own_generation: u64,
     /// A block whose epoch is this one is known to hold the code that the
     /// memory holds.
     epoch: u64,
@@ -1634,6 +1747,7 @@ const UNKNOWN_ENTRIES: usize = 4096;
 impl<M: Memory> Cpu<M> {
     pub fn new(memory: M, state: State) -> Self {
         let generation = memory.generation();
+        let own_generation = memory.own_generation().unwrap_or(0);
         let side = Side::new(&state);
         Self {
             state,
@@ -1654,6 +1768,7 @@ impl<M: Memory> Cpu<M> {
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
+            own_generation,
             epoch: 1,
             side,
         }
@@ -1715,6 +1830,7 @@ impl<M: Memory> Cpu<M> {
         self.blocks = Cache::new();
         self.singles = Cache::new();
         self.generation = self.memory.generation();
+        self.own_generation = self.memory.own_generation().unwrap_or(0);
         self.epoch += 1;
         self.taken = None;
     }
@@ -2137,6 +2253,11 @@ impl<M: Memory> Cpu<M> {
     fn translate(&mut self, phys: u64, limit: u32) -> Result<Compiled, Refused> {
         let pc = self.state.pc();
         let context = self.state.context;
+        // The page is watched before its stamp is taken, and the stamp is
+        // taken before the code is read: a write that lands after the read
+        // moves a stamp that is newer than the one of the block.
+        let watch = self.memory.watch_code(phys);
+        let stamp = self.memory.code_stamp(phys, self.stamp_len(phys));
         let mut builder = Builder::new(context, pc);
         let mut at = pc;
         let mut count = 0;
@@ -2207,15 +2328,34 @@ impl<M: Memory> Cpu<M> {
         self.side.mark_code(phys);
         let mut compiled =
             compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
-        compiled.stamp = self.memory.code_stamp(phys, count.max(1) as usize * 4);
+        // A write that made the page unwatched while the code was read: the
+        // block holds no stamp, and runs until the next epoch.
+        compiled.stamp = stamp.filter(|_| watch.is_none_or(|word| self.memory.watch_holds(phys, word)));
         compiled.epoch = self.epoch;
         Ok(compiled)
+    }
+
+    /// The bytes that the code stamp of a block at `phys` covers: from there
+    /// to the end of its page, or of the RAM. A block is inside one page, so
+    /// the stamp covers every byte that it can hold, and it is the same
+    /// before the block is read and after.
+    fn stamp_len(&self, phys: u64) -> usize {
+        Self::stamp_len_of(&self.memory, phys)
+    }
+
+    fn stamp_len_of(memory: &M, phys: u64) -> usize {
+        let page = 0x1000 - (phys & 0xfff);
+        let ram = memory
+            .ram_bounds(phys)
+            .map_or(4, |(_, last)| last.saturating_sub(phys).saturating_add(1));
+        page.min(ram).max(1) as usize
     }
 
     /// Bring the caches up to date with the memory and with the system
     /// registers, at the start of `run` and `step`: the owner of the CPU can
     /// have changed either.
     fn check_generation(&mut self) {
+        self.side.mmu.sync_memory(&self.memory);
         self.side.mmu.sync(&self.state);
         self.settle();
     }
@@ -2229,7 +2369,17 @@ impl<M: Memory> Cpu<M> {
     /// count writes one by one starts an epoch here every time, which is
     /// slow and correct.
     fn settle(&mut self) {
-        let expected = self.generation.wrapping_add(self.side.own_writes);
+        // A memory that counts the moves of its own writes knows them better
+        // than the CPU: a store into a page without code moves nothing.
+        let own = match self.memory.own_generation() {
+            Some(count) => {
+                let moved = count.wrapping_sub(self.own_generation);
+                self.own_generation = count;
+                moved
+            }
+            None => self.side.own_writes,
+        };
+        let expected = self.generation.wrapping_add(own);
         let generation = self.memory.generation();
         if self.side.code_written || generation != expected {
             self.epoch += 1;
@@ -2258,9 +2408,9 @@ impl<M: Memory> Cpu<M> {
             return true;
         }
         // A write reached the memory since the block was last looked at.
-        let stamp = self
-            .memory
-            .code_stamp(block.phys, block.instructions.max(1) as usize * 4);
+        let phys = block.phys;
+        let len = Self::stamp_len_of(&self.memory, phys);
+        let stamp = self.memory.code_stamp(phys, len);
         if stamp.is_some() && stamp == block.stamp {
             block.epoch = self.epoch;
             true
