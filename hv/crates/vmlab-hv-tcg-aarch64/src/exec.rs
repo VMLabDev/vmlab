@@ -1412,13 +1412,9 @@ impl Compiled {
     /// Leave through `exit`, which `failed` asked for: the registers as they
     /// were before the instruction that could not complete.
     #[cold]
-    fn leave(
-        &self,
-        state: &mut State,
-        entry: u64,
-        exit: u32,
-        failed: Failed,
-    ) -> (u32, Option<Halt>) {
+    fn leave(&self, state: &mut State, exit: u32, failed: Failed) -> (u32, Option<Halt>) {
+        // No operation of a block writes the PC: it is the entry still.
+        let entry = state.pc();
         let leave = &self.leaves[exit as usize];
         for (register, place) in &leave.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
@@ -1449,7 +1445,6 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
-        let entry = state.pc();
         for (place, register) in &self.inputs {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
@@ -1484,9 +1479,13 @@ impl Compiled {
                 single,
             );
             if let Err((exit, failed)) = done {
-                return self.leave(state, entry, exit, failed);
+                return self.leave(state, exit, failed);
             }
         }
+        // No operation of a block writes the PC: it is the entry still. It
+        // is read here and not before the operations, which keeps a
+        // register free in their loop.
+        let entry = state.pc();
         for (register, place) in &self.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
         }
