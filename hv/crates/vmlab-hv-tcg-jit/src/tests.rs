@@ -347,16 +347,6 @@ struct Ran {
     logged: Vec<(u64, u8, u64, bool)>,
 }
 
-/// What a compiled run did beside its slots.
-struct Ran {
-    code: u64,
-    words: Vec<u64>,
-    thunk_calls: u64,
-    misses: u64,
-    watched: u64,
-    logged: Vec<(u64, u8, u64, bool)>,
-}
-
 fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u64, Vec<u64>, u64) {
     let mut ram = vec![0u8; PAGES * 4096];
     let ran = compiled_on(jit, block, slots, budget, &mut ram, None);
