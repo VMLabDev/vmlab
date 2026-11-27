@@ -9,6 +9,7 @@
 use vmlab_hv_tcg::{FlatMemory, Memory};
 use vmlab_hv_tcg_aarch64::exception::{Cause, Exception};
 use vmlab_hv_tcg_aarch64::oracle::asm::{self, op};
+use vmlab_hv_tcg_aarch64::oracle::jitdiff::Runner;
 use vmlab_hv_tcg_aarch64::sysreg;
 use vmlab_hv_tcg_aarch64::{Cpu, State, Stop};
 
@@ -740,6 +741,13 @@ fn the_cache_operations_do_nothing_and_el0_runs_some_with_uci() {
 
 #[test]
 fn code_that_is_written_through_another_address_runs_as_written() {
+    // K6 of 3e DESIGN.md: on every runner.
+    for runner in Runner::ALL {
+        code_that_is_written_through_another_address_runs_as_written_on(runner);
+    }
+}
+
+fn code_that_is_written_through_another_address_runs_as_written_on(runner: Runner) {
     // The page of the data is mapped twice: for writing at VA and for
     // running at VA + 2 pages. add x1, x1, #1 ; ret.
     const ADD_1: u32 = 0x9100_0421;
@@ -747,6 +755,7 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     const RUN: u64 = VA + 0x2000;
     // blr x2 ; str w3, [x0] ; blr x2 ; hvc
     let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(2), HVC]);
+    runner.apply(&mut machine.cpu);
     machine.map(VA, DATA | AF | NO_EXECUTE);
     machine.map(RUN, DATA | AF | READ_ONLY);
     machine
@@ -760,9 +769,10 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.taken, None);
     // One from the first call, two from the second.
-    assert_eq!(machine.cpu.state.x(1), 3);
+    assert_eq!(machine.cpu.state.x(1), 3, "{runner:?}");
     // The same when every instruction is stepped.
     let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(2), HVC]);
+    runner.apply(&mut machine.cpu);
     machine.map(VA, DATA | AF | NO_EXECUTE);
     machine.map(RUN, DATA | AF | READ_ONLY);
     machine
@@ -776,11 +786,17 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     for _ in 0..7 {
         machine.cpu.step().unwrap();
     }
-    assert_eq!(machine.cpu.state.x(1), 3);
+    assert_eq!(machine.cpu.state.x(1), 3, "{runner:?}");
 }
 
 #[test]
 fn an_address_that_maps_other_code_runs_the_other_code() {
+    for runner in Runner::ALL {
+        an_address_that_maps_other_code_runs_the_other_code_on(runner);
+    }
+}
+
+fn an_address_that_maps_other_code_runs_the_other_code_on(runner: Runner) {
     // The address RUN maps one page of code, then the other, with a TLBI
     // between. A block is kept under the physical address of its code too.
     const RUN: u64 = VA + 0x2000;
@@ -793,6 +809,7 @@ fn an_address_that_maps_other_code_runs_the_other_code() {
         HVC,
     ];
     let mut machine = Machine::new(&program);
+    runner.apply(&mut machine.cpu);
     let entry = machine.map(RUN, DATA | AF | READ_ONLY);
     // The tables are mapped at their own addresses, for EL1.
     for page in 0..TABLE_PAGES {
@@ -820,20 +837,21 @@ fn an_address_that_maps_other_code_runs_the_other_code() {
     assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.taken, None);
     // add x1, x1, #1 from the first page, add x1, x1, #5 from the second.
-    assert_eq!(machine.cpu.state.x(1), 6);
+    assert_eq!(machine.cpu.state.x(1), 6, "{runner:?}");
 }
 
 /// One page of code, mapped at two addresses and called at each. The block
 /// computes its PC-relative values from the PC it runs at, so one
 /// translation serves both addresses (card C13). With `copy`, the second
 /// address maps a copy of the page instead: other code, its own block.
-fn code_at_two_addresses(copy: bool) -> Machine {
+fn code_at_two_addresses(copy: bool, runner: Runner) -> Machine {
     const FIRST: u64 = VA + 0x2000;
     const SECOND: u64 = VA + 0x5000;
     // adr x4, . ; add x1, x1, #1 ; ret
     const CALLED: [u32; 3] = [0x1000_0004, 0x9100_0421, asm::RET];
     // blr x2 ; add x5, x4, #0 ; blr x6 ; hvc
     let mut machine = Machine::new(&[asm::blr(2), asm::add(5, 4, 0), asm::blr(6), HVC]);
+    runner.apply(&mut machine.cpu);
     machine.map(FIRST, DATA | AF | READ_ONLY);
     let second = if copy { OTHER } else { DATA };
     machine.map(SECOND, second | AF | READ_ONLY);
@@ -857,9 +875,12 @@ fn code_at_two_addresses(copy: bool) -> Machine {
 
 #[test]
 fn one_translation_serves_code_at_two_addresses() {
-    let shared = code_at_two_addresses(false).cpu.translations;
-    let copied = code_at_two_addresses(true).cpu.translations;
-    assert_eq!(shared + 1, copied);
+    // K6 of 3e DESIGN.md: on every runner.
+    for runner in Runner::ALL {
+        let shared = code_at_two_addresses(false, runner).cpu.translations;
+        let copied = code_at_two_addresses(true, runner).cpu.translations;
+        assert_eq!(shared + 1, copied, "{runner:?}");
+    }
 }
 
 #[test]
