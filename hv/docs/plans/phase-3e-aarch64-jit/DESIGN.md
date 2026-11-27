@@ -705,6 +705,53 @@ the flat images, `vmlab-hv` with `env.jit` for the boot).
   through the thunk, which puts the words that it reads into the frame and
   saves the caller-saved registers that hold values. J3 inlines them.
 
+### G4, measured by card J5
+
+Helios, 2026-11-27, one vCPU, cores 28 to 31, three repeats, *measured*.
+Both sides are one binary: `VMLAB_HV_JIT_FLAGS=0` turns the forms of H8 off
+and leaves the forms of J1. Other cards ran builds and boots at the same time
+(load average 5 to 25). The rows are in `bench/history/aarch64.jsonl` with
+the note "card J5".
+
+| Workload | J1 forms | Host flags (J5) |
+|---|---|---|
+| CoreMark mix, flat, MIPS (median) | 164.4 | 169.6 |
+| Scalar loop, flat, MIPS (median) | 158.3 | 154.4 |
+| Debian 13 boot MIPS to agent ready (median, two sets) | 132.7 and 109.0 | 127.0 |
+
+- **J5a.** What is built. H8a: a comparison (`Equal`, `NotEqual`, `Less`,
+  `LessEqual`, `IsZero`) whose one reader is the next operation, a `Select`
+  or a `Guard`, is a `cmp` and a `cmov` or a `jcc`. A signed order, which the
+  lifter writes as an unsigned order of two values with flipped sign bits,
+  is a `cmp` at 32 or 64 bits with a signed condition, and an `And` compared
+  with zero is a `test`. H8b needed no change: the lifter of #1142 writes the
+  record (the kind and two operands) as outputs of the block, a store each.
+  H8c: a call of `a64_condition` is inline for seven kinds of record (a
+  compare at 64 and 32 bits, a logical result at both, the explicit flags as
+  a mask of 16 bits, a sum without a carry in at both), from the map
+  `flags::host_forms`, and a call for the rest. HI and LS after a sum have
+  no host condition and call.
+- **J5b.** The gain is below G4 (1.2 to 1.7 times): CoreMark gains 3 %, and
+  the loop and the boot move by less than the noise. CoreMark has 545 fused
+  comparisons in 337 blocks and no lazy condition. The basis of an
+  explanation, not measured: a fused comparison saves a `setcc`, a `test`
+  and a register, about two host instructions of the 40 to 60 of a block,
+  and every block still leaves to the Rust loop. The spike measured G4 on
+  chained blocks, which J4 brings.
+- **J5c.** Not fused: the `And` and `Or` of comparisons that `CCMP` leaves,
+  a lazy condition whose reader is a `Select` (it is a `setcc` and a
+  `test`), and a comparison that is not just before its reader. In the
+  blocks of `CMP` with `B.cond`, `CSEL` and `CSET`, `TST` with `B.cond` and
+  `CMN` with `CSET`, the reader is always next.
+- **J5d.** One boot of the twelve went to emergency mode, with the host
+  flags on: `systemd-udevd` took more than 90 s to start, `/boot/efi` timed
+  out, and the vCPU ran 1e9 instructions in 66 s, so the guest was mostly
+  waiting. That set of three has no row. The other five boots with the host
+  flags on and all six without them reached agent ready. No serial log of
+  the twelve has a segfault, a trap or an oops. K1 and K2 found no
+  difference. This card does not show whether the JIT caused it. It is a
+  risk for T1 (J8).
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
