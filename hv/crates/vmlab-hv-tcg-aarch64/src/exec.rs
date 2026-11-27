@@ -1686,21 +1686,6 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
         env.stop = Some(host("an arithmetic operation outside its domain"));
         return THUNK_LEFT;
     }
-    if let Some(replay) = env.replay.as_deref_mut()
-        && let Some(done) = replay.access(op, frame, env.accesses)
-    {
-        return match done {
-            Ok(()) => 0,
-            Err(Some(failed)) => {
-                env.failed = Some(failed);
-                THUNK_LEFT
-            }
-            Err(None) => {
-                env.stop = Some(host("K3: the compiled block differs in its accesses"));
-                THUNK_LEFT
-            }
-        };
-    }
     // SAFETY: the state of the CPU, which compiled code does not touch
     // while it calls.
     let state = unsafe { &mut *env.state };
@@ -1718,6 +1703,44 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
         Ok(()) => 0,
         Err(failed) => {
             env.failed = Some(failed);
+            THUNK_LEFT
+        }
+    }
+}
+
+/// The thunk of a replay of K3: the loads and stores of the block are
+/// served from the replay, and every other operation runs as `thunk` runs
+/// it. A thunk of its own, so that the thunk of a plain run stays as it is.
+///
+/// # Safety
+/// As for `thunk`, and the `Env<M>` holds a replay.
+unsafe extern "sysv64" fn replay_thunk<M: Memory>(env: *mut std::ffi::c_void, index: u64) -> u64 {
+    // SAFETY: the caller's promise. The reference ends before `thunk` makes
+    // its own.
+    let done = unsafe {
+        let env = &mut *env.cast::<Env<M>>();
+        let op = &env.ops[index as usize];
+        let frame = std::slice::from_raw_parts_mut(env.frame, env.words);
+        let accesses = env.accesses;
+        match env.replay.as_deref_mut() {
+            Some(replay) => replay.access(op, frame, accesses),
+            None => None,
+        }
+    };
+    let Some(done) = done else {
+        // SAFETY: the caller's promise.
+        return unsafe { thunk::<M>(env, index) };
+    };
+    // SAFETY: as above.
+    let env = unsafe { &mut *env.cast::<Env<M>>() };
+    match done {
+        Ok(()) => 0,
+        Err(Some(failed)) => {
+            env.failed = Some(failed);
+            THUNK_LEFT
+        }
+        Err(None) => {
+            env.stop = Some(host("K3: the compiled block differs in its accesses"));
             THUNK_LEFT
         }
     }
@@ -2013,6 +2036,7 @@ impl Compiled {
     /// the block, and nothing ran. With `replay`, the loads and stores are
     /// served from it (K3).
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn run_code<M: Memory>(
         &mut self,
         entry: &jit::Entry,
@@ -2045,7 +2069,11 @@ impl Compiled {
         };
         let mut context = jit::Context {
             budget: budget.min(i64::MAX as u64) as i64,
-            thunk: thunk::<M>,
+            thunk: if env.replay.is_some() {
+                replay_thunk::<M> as jit::Thunk
+            } else {
+                thunk::<M> as jit::Thunk
+            },
             env: (&raw mut env).cast(),
         };
         // SAFETY: `entry` is current and was compiled from this block, whose
