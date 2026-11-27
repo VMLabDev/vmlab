@@ -475,8 +475,10 @@ mod tests {
         assert_eq!(ldr(2, 1, 272), 0xf940_8822);
         assert_eq!(ldr_q(5, 1, 512), 0x3dc0_8025);
         // The copy of the first bytes of RAM, and those bytes in the image.
-        assert!(code.windows(4).any(|four| four
-            == [ldr_next(0, 2), str_next(0, 3), subs_one(4, 4), b_ne(-3)]));
+        assert!(
+            code.windows(4)
+                .any(|four| four == [ldr_next(0, 2), str_next(0, 3), subs_one(4, 4), b_ne(-3)])
+        );
         assert_eq!(ldr_next(0, 2), 0xf840_8440);
         assert_eq!(str_next(0, 3), 0xf800_8460);
         assert_eq!(subs_one(4, 4), 0xf100_0484);
