@@ -121,14 +121,20 @@ fn a_compile_makes_no_heap_call_once_the_buffers_have_grown() {
     assert_eq!(none, 0);
     assert_eq!(translations, again);
     assert!(translations >= PIECES as u64 * 2, "{translations}");
-    assert_eq!(blocks, translations, "every block of the second run is compiled");
+    assert_eq!(
+        blocks, translations,
+        "every block of the second run is compiled"
+    );
     eprintln!(
         "{translations} blocks: {interpreted} heap calls without the JIT ({:.1} a block), \
          {compiled} with it ({:.1} a block)",
         interpreted as f64 / translations as f64,
         compiled as f64 / translations as f64,
     );
-    assert_eq!(compiled, interpreted, "the compiles of {blocks} blocks made heap calls");
+    assert_eq!(
+        compiled, interpreted,
+        "the compiles of {blocks} blocks made heap calls"
+    );
     assert!(
         interpreted < translations * 16,
         "a translation makes heap calls beside the lists of its block"

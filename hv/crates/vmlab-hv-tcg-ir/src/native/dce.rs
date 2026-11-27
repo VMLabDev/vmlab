@@ -51,7 +51,11 @@ pub fn prune_scalars<X: ExitScalars>(block: &mut BlockOf<X>) {
 /// `prune_scalars` with the memory of `buffers`: no heap call of its own
 /// once they have grown.
 pub fn prune_scalars_with<X: ExitScalars>(block: &mut BlockOf<X>, buffers: &mut PruneBuffers) {
-    let PruneBuffers { roots, live: alive, map } = buffers;
+    let PruneBuffers {
+        roots,
+        live: alive,
+        map,
+    } = buffers;
     roots.clear();
     for event in &block.events {
         match *event {

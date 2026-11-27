@@ -95,7 +95,11 @@ fn the_compiles_are_counted_by_cause() {
     assert!(counts.compiles_first >= 3, "{counts:?}");
     assert!(counts.compiles_invalidated >= 1, "{counts:?}");
     assert_eq!(
-        (counts.compiles_region, counts.compiles_evicted, counts.resets),
+        (
+            counts.compiles_region,
+            counts.compiles_evicted,
+            counts.resets
+        ),
         (0, 0, 0),
         "{counts:?}"
     );

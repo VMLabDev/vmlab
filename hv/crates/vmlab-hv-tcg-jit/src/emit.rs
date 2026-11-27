@@ -2525,7 +2525,11 @@ pub fn emit(
         &scratch.fused,
         &scratch.skip,
     );
-    let fused = scratch.fused.iter().filter(|fusion| fusion.is_some()).count() as u64;
+    let fused = scratch
+        .fused
+        .iter()
+        .filter(|fusion| fusion.is_some())
+        .count() as u64;
     let lazy = emitter.lazy;
     scratch.asm = emitter.asm;
     scratch.homes = emitter.initial;
@@ -2561,14 +2565,12 @@ impl Emitter<'_> {
         // and leaves when the budget is spent.
         let spent = self.asm.label();
         let count = i32::try_from(shape.instructions).map_err(|_| Refused::Size)?;
-        self
-            .asm
+        self.asm
             .alu_imm(Alu::Sub, Rm::Mem(R13, CONTEXT_BUDGET), count);
         self.asm.jcc(Cond::S, spent);
         self.asm.cold(true);
         self.asm.bind(spent);
-        self
-            .asm
+        self.asm
             .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_BUDGET), count);
         self.asm.mov_imm(RAX, BUDGET);
         self.asm.jmp_absolute(exit);
@@ -2581,8 +2583,7 @@ impl Emitter<'_> {
             .count();
         if inlined != 0 {
             let inlined = i32::try_from(inlined).map_err(|_| Refused::Size)?;
-            self
-                .asm
+            self.asm
                 .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_ACCESSES), inlined);
         }
         for (index, op) in shape.ops.iter().enumerate() {
