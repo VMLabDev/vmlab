@@ -526,6 +526,10 @@ pub struct Mmu {
     tlbs: [Tlb; REGIMES],
     controls: Controls,
     asid: u16,
+    /// Changes of what a virtual address translates to: every flush and
+    /// every new control. What keeps a translation beside the TLB (the jump
+    /// cache of the JIT, 3e DESIGN.md H6) is dropped when this moves.
+    changes: u64,
     /// What the memory named its host pages when the entries took theirs
     /// (`Memory::host_mapping`).
     mapping: Option<(u64, u64)>,
@@ -538,6 +542,7 @@ impl Mmu {
             tlbs: [Tlb::new(TLB_BITS)],
             controls,
             asid: controls.asid(),
+            changes: 0,
             mapping: None,
         }
     }
@@ -552,6 +557,11 @@ impl Mmu {
             self.flush();
             self.mapping = mapping;
         }
+    }
+
+    /// The count of changes of the translation (`changes`).
+    pub fn changes(&self) -> u64 {
+        self.changes
     }
 
     pub fn controls(&self) -> &Controls {
@@ -577,6 +587,7 @@ impl Mmu {
             return;
         }
         let new = Controls::of(state, Regime::El10);
+        self.changes += 1;
         let tables_only = Controls {
             ttbr: new.ttbr,
             ..self.controls
@@ -737,6 +748,7 @@ impl Mmu {
 
     /// Drop every entry of every regime.
     pub fn flush(&mut self) {
+        self.changes += 1;
         for tlb in &mut self.tlbs {
             tlb.flush();
         }
@@ -747,12 +759,14 @@ impl Mmu {
     /// the global entries and those of this ASID.
     pub fn flush_page(&mut self, regime: Regime, argument: u64, asid: Option<u16>) {
         let asid = asid.map(|asid| self.asid_of(asid));
+        self.changes += 1;
         self.tlbs[regime.index()].flush_page(argument, TLBI_PAGE_BITS, asid);
     }
 
     /// Drop the entries of an ASID that are not global.
     pub fn flush_asid(&mut self, regime: Regime, asid: u16) {
         let asid = self.asid_of(asid);
+        self.changes += 1;
         self.tlbs[regime.index()].flush_asid(asid);
     }
 

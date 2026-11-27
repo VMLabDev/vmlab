@@ -94,14 +94,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mips = instructions as f64 / seconds / 1e6;
     // With `VMLAB_HV_JIT=1` (3e DESIGN.md J1): the blocks and instructions
-    // that ran in the interpreter (H2b), and what the emitter made.
+    // that ran in the interpreter (H2b), and what the emitter made. J4: the
+    // exits of compiled blocks to the next block: through a linked jump, a
+    // hit of the jump cache, or to the loop (`unlinked`, `lookups`), and the
+    // runs that the loop entered.
     let jit = cpu.jit_counts();
     println!(
         "{{\"instructions\": {}, \"seconds\": {seconds:.9}, \"mips\": {mips:.6}, \
          \"translations\": {}, \"exit_code\": {code}, \
          \"jit\": {}, \"interpreted_blocks\": {}, \"interpreted_instructions\": {}, \
          \"compiled_blocks\": {}, \"refused_blocks\": {}, \"code_bytes\": {}, \
-         \"compile_ns\": {}, \
+         \"compile_ns\": {}, \"chaining\": {}, \"chained\": {}, \"jump_hits\": {}, \
+         \"unlinked\": {}, \"lookups\": {}, \"entered\": {}, \"links\": {}, \
+         \"unlinks\": {}, \"fills\": {}, \"clears\": {}, \
          \"x2\": {}, \"x3\": {}, \"x4\": {}, \"x5\": {}}}",
         instructions,
         cpu.translations,
@@ -112,6 +117,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         jit.refused,
         jit.bytes,
         jit.compile_ns,
+        cpu.chaining_enabled(),
+        jit.chained.saturating_sub(jit.unlinked),
+        jit.jump_hits,
+        jit.unlinked,
+        jit.lookups,
+        jit.compiled_runs,
+        jit.links,
+        jit.unlinks,
+        jit.fills,
+        jit.clears,
         cpu.state.x(2),
         cpu.state.x(3),
         cpu.state.x(4),

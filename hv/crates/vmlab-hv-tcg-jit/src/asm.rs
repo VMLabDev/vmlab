@@ -149,6 +149,13 @@ impl Asm {
         self.labels[label.0] = Some((self.in_cold, at));
     }
 
+    /// Where `label` is in the finished code, from its start: the cold
+    /// section follows the hot one. `None`: a label that is not bound.
+    pub fn position(&self, label: Label) -> Option<usize> {
+        let (cold, offset) = self.labels[label.0]?;
+        Some(offset + if cold { self.hot.len() } else { 0 })
+    }
+
     /// The bytes of both sections, for the size of the finished code.
     pub fn len(&self) -> usize {
         self.hot.len() + self.cold.len()
@@ -384,6 +391,11 @@ impl Asm {
         self.op(None, false, &[0xff], 4, Rm::Reg(target));
     }
 
+    /// `jmp qword [target]`, or `jmp target` with a register.
+    pub fn jmp_indirect(&mut self, target: Rm) {
+        self.op(None, false, &[0xff], 4, target);
+    }
+
     pub fn ret(&mut self) {
         self.byte(0xc3);
     }
@@ -589,6 +601,7 @@ mod tests {
             });
             add(format!("cmp {text}, 0"), &|a| a.alu_imm(Alu::Cmp, *mem, 0));
             add(format!("call {text}"), &|a| a.call_indirect(*mem));
+            add(format!("jmp {text}"), &|a| a.jmp_indirect(*mem));
         }
         for (cond, text) in [
             (Cond::B, "b"),
