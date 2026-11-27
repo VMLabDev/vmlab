@@ -9,7 +9,8 @@ mod modular;
 pub mod packed;
 pub mod regfile;
 pub mod schedule;
-use std::collections::HashMap;
+pub mod fasthash;
+use fasthash::FastMap as HashMap;
 
 pub type ScalarId = usize;
 pub type InputId = usize;

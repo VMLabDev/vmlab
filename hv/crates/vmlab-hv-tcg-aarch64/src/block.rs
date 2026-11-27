@@ -22,7 +22,7 @@
 //!
 //! Sources read: none. This file holds no instruction semantics.
 
-use std::collections::HashMap;
+use vmlab_hv_tcg_ir::native::fasthash::FastMap as HashMap;
 use vmlab_hv_tcg_ir::native::{
     Binary, Graph, Operation, ScalarId, ScalarType, Unary, evaluate_binary, evaluate_unary, mask,
 };
@@ -316,7 +316,7 @@ impl Lowering {
             frame: vec![0; words],
             ops: Vec::new(),
             generics: Vec::new(),
-            literals: HashMap::new(),
+            literals: HashMap::default(),
         })
     }
 

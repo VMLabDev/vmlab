@@ -59,6 +59,7 @@ use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
+use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
@@ -295,7 +296,7 @@ struct Side {
     /// physical page that holds translated code.
     code_pages: Vec<u64>,
     /// The physical pages that hold translated code.
-    code_set: std::collections::HashSet<u64>,
+    code_set: FastSet<u64>,
     /// Writes of this CPU to the memory since the caches were last checked.
     own_writes: u64,
     /// One of them went into a page that holds translated code.
@@ -314,7 +315,7 @@ impl Side {
             exclusive_high: 0,
             log: None,
             code_pages: vec![0; CODE_PAGE_BITS / 64],
-            code_set: std::collections::HashSet::new(),
+            code_set: FastSet::default(),
             own_writes: 0,
             code_written: false,
             mmu: Mmu::new(state),
@@ -1421,7 +1422,7 @@ impl Compiled {
 /// again (card C13).
 struct Cache {
     entries: Vec<Option<Box<Compiled>>>,
-    spare: std::collections::HashMap<(u64, Context), Box<Compiled>>,
+    spare: FastMap<(u64, Context), Box<Compiled>>,
 }
 
 impl Cache {
@@ -1430,7 +1431,7 @@ impl Cache {
         entries.resize_with(CACHE_ENTRIES, || None);
         Self {
             entries,
-            spare: std::collections::HashMap::new(),
+            spare: FastMap::default(),
         }
     }
 
