@@ -322,13 +322,13 @@ fn every_flush_of_the_tlb_empties_the_fast_tlb() {
         ("TLBI ASIDE1", asm::sys(0x043a, 3), 2 << 48, true),
         (
             "TTBR0_EL1 with another ASID",
-            asm::msr(op::TTBR0_EL1, 3),
+            asm::msr(asm::reg::TTBR0_EL1, 3),
             ROOT | 2 << 48,
             true,
         ),
         (
             "TTBR0_EL1 as it was",
-            asm::msr(op::TTBR0_EL1, 3),
+            asm::msr(asm::reg::TTBR0_EL1, 3),
             ROOT | 1 << 48,
             false,
         ),
@@ -336,14 +336,14 @@ fn every_flush_of_the_tlb_empties_the_fast_tlb() {
     let sctlr = State::reset(CODE).system.regs[sysreg::reg::SCTLR_EL1] | sysreg::sctlr::M;
     cases.push((
         "SCTLR_EL1 with A",
-        asm::msr(op::SCTLR_EL1, 3),
+        asm::msr(asm::reg::SCTLR_EL1, 3),
         sctlr | sysreg::sctlr::A,
         true,
     ));
     let tcr = 16 | 16 << 16 | 2 << 30 | 2 << 32 | 1 << 36;
     cases.push((
         "TCR_EL1 with 8 bits of ASID",
-        asm::msr(op::TCR_EL1, 3),
+        asm::msr(asm::reg::TCR_EL1, 3),
         tcr & !(1 << 36),
         true,
     ));
