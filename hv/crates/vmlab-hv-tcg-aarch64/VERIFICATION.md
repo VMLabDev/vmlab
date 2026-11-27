@@ -1480,3 +1480,112 @@ D13).
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn.
+
+## Card C13 (2026-11-27)
+
+The four templates to agent ready (DESIGN.md P4, M6). The card is not
+complete: four of the eight boots reach agent ready inside 600 s, and the
+boot lockstep (O4) of Debian did not run. What stops the rest is the speed
+of the interpreter, not an instruction or a device that a boot misses.
+
+### What the boots missed, and what changed
+
+- The virtio functions of `virt` are transitional (`1af4:1001` and so on),
+  as QEMU presents them: AAVMF bound no driver to a modern-only function.
+  An I/O BAR at port 0 decodes on `virt`, where AAVMF places the first one.
+- An Inner Shareable TLBI reaches every CPU of the machine (`shootdown.rs`).
+- The vmlab-hv binary ran every emulated vCPU in slices of 64 instructions,
+  because the flight recorder makes `log_enabled!(Trace)` always true. The
+  slices follow the stderr filter now. With long slices two faults showed:
+  the core read its interrupt lines once a slice, so AAVMF took an
+  acknowledged interrupt again and again until its stack overflowed, and a
+  timer that came due inside a slice was raised at its end, which failed the
+  busy-loop subtests of kvm-unit-tests `timer`. A machine CPU reads its lines
+  before every block, and leaves its loop within 64 blocks of its timer's
+  deadline.
+- The boots spent their time in three places (stack samples of the vCPU
+  thread of a Debian boot, `eu-stack` through a `PR_SET_PTRACER` wrapper):
+  - about 40 % in the RAM path of `GuestBus`: vm-memory's slice lookup for
+    each load and store. RAM is read and written through its mapping now,
+    with one host access for an aligned access of 2, 4 or 8 bytes, and the
+    bitmap of the region still told of each write;
+  - about 15 % in SipHash, in the interning of the graph of a translation:
+    the tables of a translation hash with a multiply-and-rotate hasher;
+  - translations of code translated before: between 120 s and 240 s of a
+    Debian boot, 4.8 million translations, 3.6 million of them at a PC whose
+    block the cache had dropped (it emptied its store when full), and 1.1
+    million of the same code at another virtual address (a library in two
+    programs). The store keeps two generations bounded by bytes, a block
+    computes its PC-relative values from the PC at its entry, and the cache
+    is indexed by the physical address of the code. To the same point of the
+    boot the translation time fell from 44.8 s to 7 s.
+- The loop reads the words of a block without bounds checks, which every
+  operation passes once when its block is made (`block::op_in_frame`).
+
+### The boots (S1)
+
+`bench/run.py --backend vmlab-hv --arch aarch64 --suite boot` on helios,
+the templates of `~/.local/share/vmlab/templates/aarch64`, AAVMF of
+`guest/fetch-firmware.sh`, 2 GiB, pinned to four cores, under the memory cap
+(`systemd-run --scope -p MemoryMax=24G`). One run each.
+
+| Template | 1 vCPU | 2 vCPUs |
+|---|---|---|
+| alpine-3.23 | agent ready in 358 s | agent ready in 356 s |
+| debian-13 | agent ready in 278 s and 302 s; one run of three in emergency mode | agent ready in 247 s |
+| fedora-44 | emergency mode | emergency mode |
+| ubuntu-24.04 | emergency mode | agent ready in 317 s |
+
+Each boot that fails falls into systemd's emergency mode: a device unit
+(`/boot/efi`, `/dev/ttyAMA0`, the root of the Fedora initrd) does not appear
+inside its 90 s job timeout, because udev's coldplug runs too slowly while
+the rest of early userspace runs beside it. The guests run nothing that the
+CPU does not have: the unknown-is-loud log names nothing, and no boot ends in
+an unimplemented instruction.
+
+The speed it takes: Fedora executes 30.7e9 instructions to agent ready on
+QEMU (M2). The interpreter runs a boot at about 45 to 60 million
+instructions a second, so Fedora needs more than 500 s with no idle time,
+and its device timeouts come first. Dynamic counts on the Debian boot: about
+23 operations a block and 4.2 a guest instruction, 11 register copies a
+block; `Add` is 27 % of the operations, `Slice` 13 %, `And` 10 %, `IsZero`
+9 %, `Xor` 6 %, most of it the NZCV of the flag-setting instructions, which
+every block that ends in a compare writes out. Lazy flags, block chaining or
+the JIT of 3e are what is left for a gain of the size that Fedora needs.
+
+### kvm-unit-tests
+
+`just tcg-a64-kvm-unit-tests` at commit `3353f252`: 11 tests, 9 give the
+same result lines as QEMU and 2 (`gicv2-mmio` and `gicv2-mmio-3p`, 4 vCPUs)
+pass the two `ITARGETSR` subtests that fail on QEMU, as in card C10. The 4
+vCPU tests `selftest-smp`, `gicv2-ipi`, `gicv2-active` and `psci` give the
+same results. `timer` gives the same results after the deadline exit above.
+
+### Tests
+
+- vmlab-hv-tcg-aarch64: `one_translation_serves_code_at_two_addresses`
+  (`tests/translate.rs`) maps one page of code at two addresses, calls an
+  `ADR` at each and counts one translation fewer than for a copy;
+  `a_machine_cpu_leaves_its_loop_when_its_timer_is_due` (`exec.rs`).
+- vmlab-hv-tcg-ir: the hasher spreads near keys over the buckets.
+
+### What this card does not do
+
+- Fedora at 1 and 2 vCPUs, Ubuntu at 1 vCPU and one Debian run at 1 vCPU
+  do not reach agent ready: the speed above.
+- O4 for Debian did not run: at the 0.59 million instructions a second of
+  card C10 the 18e9 instructions of the boot take about 8.5 hours.
+- The S1 test of the aarch64 guest asset (`s1_aarch64.rs`, card C14) did
+  not run: helios has no aarch64 guest asset.
+
+### Sources read for this card
+
+- The state of this crate and of vmlab-hv-vmm, and vm-memory's
+  `GuestRegionMmap` interface (`as_ptr`, the bitmap) for the RAM path.
+- The multiply-and-rotate hash from its description (the hasher of Firefox
+  and rustc); no code of it was read or copied.
+- The serial logs of the guests, and kvm-unit-tests as a running program.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.
