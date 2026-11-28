@@ -32,6 +32,9 @@ class MicroA64Tests(unittest.TestCase):
         self.assertEqual(run.main(["--backend", "qemu", "--arch", "aarch64",
                                    "--guest", "flat-a64", "--vcpus", "1",
                                    "--qemu-cpu", "max", "--dry-run"]), 0)
+        self.assertEqual(run.main(["--backend", "qemu", "--arch", "aarch64",
+                                   "--guest", "flat-a64", "--vcpus", "1",
+                                   "--qemu-cpu", "max,pauth=off", "--dry-run"]), 0)
         args = run.parse_args(["--qemu-cpu", "cortex-a53"])
         self.assertEqual(run.qemu_cpu(args, "aarch64"), "cortex-a53")
         self.assertEqual(run.qemu_cpu(args, "riscv64"), "max")
@@ -44,7 +47,8 @@ class MicroA64Tests(unittest.TestCase):
                      ["--backend", "qemu", "--arch", "all"],
                      ["--backend", "jit", "--arch", "aarch64", "--vcpus", "1"],
                      ["--backend", "qemu", "--arch", "riscv64", "--guest", "flat-rv64gc"],
-                     ["--backend", "qemu", "--arch", "aarch64", "--qemu-cpu", "max,pauth=off"]):
+                     ["--backend", "qemu", "--arch", "aarch64", "--qemu-cpu", "max pauth"],
+                     ["--backend", "qemu", "--arch", "aarch64", "--qemu-cpu", "max,pauth"]):
             with self.subTest(argv=argv), self.assertRaises(lib.BenchError):
                 run.main([*argv, *([] if "--qemu-cpu" in argv else ["--qemu-cpu", "max"]),
                           "--dry-run"])

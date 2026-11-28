@@ -78,7 +78,8 @@ def parse_args(argv):
                         "(no hv-avic), as a nested host such as WSL2 must")
     p.add_argument("--cpus", default=None, help="taskset window override (e.g. 16-19)")
     p.add_argument("--qemu-cpu", default=None,
-                   help="aarch64 qemu: the -cpu model (default max for a template, "
+                   help="aarch64 qemu: the -cpu model, with optional ,property=value "
+                        "pairs (default max for a template, "
                         "cortex-a53 for flat-a64); rows of another model are kept "
                         "apart from the default's")
     p.add_argument("--hv-bin", default=os.path.join(lib.REPO_DIR, "target/release/vmlab-hv"))
@@ -137,8 +138,9 @@ def check_qemu_cpu(args, arches):
         return
     if args.backend != "qemu" or arches != ["aarch64"]:
         raise lib.BenchError("--qemu-cpu needs --backend qemu --arch aarch64")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", args.qemu_cpu):
-        raise lib.BenchError(f"--qemu-cpu {args.qemu_cpu!r} is not a CPU model name")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*(,[a-z0-9-]+=[a-z0-9]+)*", args.qemu_cpu):
+        raise lib.BenchError(f"--qemu-cpu {args.qemu_cpu!r} is not a CPU model name"
+                             " with optional ,property=value pairs")
 
 
 def measures_boot_mips(args, arch):
