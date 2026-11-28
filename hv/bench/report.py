@@ -35,7 +35,7 @@ def groups(records, args):
             continue
         if args.backend != "all" and rec.get("backend") != args.backend:
             continue
-        key = (rec["backend"], rec["guest"], rec["vcpus"], rec["workload"])
+        key = (rec["backend"], rec["guest"], rec["vcpus"], rec["workload"], lib.qemu_cpu(rec))
         out.setdefault(key, []).append(rec)
     return out
 
@@ -54,13 +54,14 @@ def print_arch(arch, args):
     grouped = groups(records, args)
     print(f"=== {arch} ===")
     for key in sorted(grouped):
-        backend, guest, vcpus, workload = key
+        backend, guest, vcpus, workload, cpu = key
         entries = grouped[key]
         if args.limit:
             entries = entries[-args.limit :]
         first = entries[0]["median"]
         unit = entries[-1].get("unit", "s")
-        print(f"{backend:>9}  {guest}  vcpus={vcpus}  {workload}  (unit: {unit})")
+        cpu = f"  cpu={cpu}" if cpu else ""
+        print(f"{backend:>9}  {guest}  vcpus={vcpus}  {workload}{cpu}  (unit: {unit})")
         prev = None
         for rec in entries:
             moves = f"vs first {pct(rec['median'], first)}"
