@@ -134,6 +134,11 @@ impl SavedCpu {
             .chain(&self.slots[FLAG_SLOT + 4..]);
         let places = (0..FLAG_SLOT).chain(AFTER_FLAGS..slot::COUNT);
         for (index, saved) in places.zip(others) {
+            // A slot of one word has no high half: compiled code counts on
+            // it (`slot::NARROW`).
+            if slot::NARROW >> index & 1 == 1 && saved[1] != 0 {
+                return Err("the CPU state is outside what this CPU can be in".into());
+            }
             state.slots[index] = value(saved);
         }
         state.set_nzcv(

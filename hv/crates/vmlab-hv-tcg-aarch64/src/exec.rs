@@ -3750,6 +3750,7 @@ impl Compiled {
             }),
             memory: jit.memory(),
             sides: &self.sides,
+            narrow: crate::state::slot::NARROW,
         };
         match jit.compile(&shape) {
             Ok(entry) => {
