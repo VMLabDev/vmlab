@@ -5391,16 +5391,6 @@ impl<M: Memory> Cpu<M> {
         }
     }
 
-    fn invalidate(&mut self, invalidation: Invalidation) {
-        self.side.invalidate(invalidation);
-    }
-
-    /// Hand `invalidation` to the other CPUs, and return when every one of
-    /// them that runs has applied it (`shootdown.rs`).
-    fn broadcast(&mut self, invalidation: Invalidation) {
-        self.side.broadcast(Some(invalidation));
-    }
-
     #[inline(always)]
     fn read_lines(&mut self) {
         if let Some(lines) = &self.lines {
