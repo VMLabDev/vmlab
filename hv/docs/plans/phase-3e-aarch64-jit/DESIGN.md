@@ -2322,6 +2322,80 @@ to 8.6 s, and slower in two, by 10.1 and 12.0 s.
   GiB more than at 64 MiB, and at most 1 GiB. `REGION_BYTES` is 256 MiB
   (H13b).
 
+**T3-D3f. Superblocks for warm blocks only** (the lead's review proposal
+V5: form superblocks only for warm blocks before growing the region).
+Helios, 2026-11-28, *measured*, the same base and bench as above, the six
+variants below in turn, three rounds at one vCPU and then at four. The
+warm-only rule is a prototype for this measurement and is not merged: a
+block is translated without joins, counts its entries from the loop
+(`run_block_within`), and after `VMLAB_HV_JIT_SUPER_WARM` entries is
+translated again with joins, the jumps to its old code unlinked. The
+count is of entries from the loop because the loop is where a block is
+looked up; runs that arrive through a linked jump or the jump cache do not
+pass it. Superblocks off is `VMLAB_HV_JIT_SUPER=0` on the 64 MiB build.
+The rows are in `bench/history/aarch64.jsonl` with the note "card #1210
+T3-D3 review round 1". The counters, the median of three boots, summed
+over the vCPUs:
+
+| vCPUs | Variant | Code written, GB | Drops of a part | Compiles after a drop | First compiles | Made warm | Joins | Compile, s | Translation, s | Region in host memory, MiB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | J14, 64 MiB | 1.02 | 58 | 786,387 | 405,953 | | 307,867 | 3.20 | 2.96 | 64 |
+| 1 | Warm after 4, 64 MiB | 0.43 | 22 | 391,496 | 438,184 | 1,653 | 2,146 | 1.35 | 1.67 | 64 |
+| 1 | Warm after 32, 64 MiB | 0.48 | 25 | 474,927 | 454,522 | 479 | 675 | 1.57 | 1.92 | 64 |
+| 1 | Superblocks off, 64 MiB | 0.42 | 22 | 386,677 | 433,667 | | 0 | 1.34 | 1.67 | 64 |
+| 1 | J14, 256 MiB | 0.32 | 1 | 8,768 | 392,439 | | 299,532 | 1.15 | 2.83 | 256 |
+| 1 | Warm after 4, 256 MiB | 0.22 | 0 | 0 | 435,494 | 1,569 | 2,213 | 0.78 | 1.67 | 234 |
+| 4 | J14, 64 MiB | 1.07 | 51 | 452,948 | 752,727 | | 640,952 | 3.32 | 5.55 | 256 |
+| 4 | Warm after 4, 64 MiB | 0.65 | 25 | 325,211 | 893,580 | 8,859 | 11,300 | 2.14 | 3.94 | 256 |
+| 4 | Warm after 32, 64 MiB | 0.61 | 23 | 274,430 | 875,883 | 2,479 | 3,161 | 1.99 | 3.51 | 256 |
+| 4 | Superblocks off, 64 MiB | 0.62 | 23 | 294,547 | 894,337 | | 0 | 1.97 | 3.73 | 256 |
+| 4 | J14, 256 MiB | 0.63 | 0 | 0 | 752,247 | | 634,267 | 2.17 | 5.70 | 657 |
+| 4 | Warm after 4, 256 MiB | 0.48 | 0 | 0 | 899,802 | 8,615 | 11,224 | 1.67 | 3.91 | 494 |
+
+The boot to agent ready, s, each variant's three boots in round order:
+
+| vCPUs | J14, 64 MiB | Warm after 4, 64 MiB | Warm after 32, 64 MiB | Off, 64 MiB | J14, 256 MiB | Warm after 4, 256 MiB |
+|---|---|---|---|---|---|---|
+| 1 | 61.29, 65.48, 104.46 | 156.52, 136.28, 61.38 | 121.66, 86.59, 119.03 | 50.89, 96.40, 61.98 | 49.89, 128.81, 62.60 | 50.28, 60.22, 58.16 |
+| 4 | 39.06, 42.07, 40.29 | 41.34, 56.15, 118.85 | 85.09, 53.19, 54.71 | 56.39, 112.30, 40.61 | 141.33, 44.67, 36.58 | 121.69, 106.87, 40.52 |
+
+The load average at the start of a boot was 5.5 to 21.7, and other work
+kept 2.1 to 8.6 CPUs busy. All six boots over 80 s at four vCPUs and four
+of the eight at one used less than the VM's own CPU on its reserved cores
+(`reserved_busy_cpus` 1.44 to 1.93 at four, 0.45 to 0.70 at one, against
+2.0 to 3.6 and 0.80 to 1.17 in the other boots): the VM waited for the
+host, as in the I/O stall above.
+
+- **T3-D3g. Made warm from the loop, almost no block joins.** The rule
+  made 0.4 % of the blocks warm at one vCPU (1,653 of 438,184) and 1 % at
+  four. A hot block runs through linked jumps and the jump cache, so it
+  seldom comes back to the loop to be counted. Every counter of warm after
+  4 is within 10 % of superblocks off, and of warm after 32 within 25 %, so
+  this rule is about the same as superblocks off. A rule that finds the hot blocks needs a count of the
+  runs in compiled code, for example a counter in the block head, which
+  costs every run. That is a change of the code that J14 emits, outside
+  this card's size question. Not built here.
+- **T3-D3h. What superblocks cost in code, against what they save.** Off at
+  64 MiB, a boot writes 0.42 GB of code instead of 1.02 GB, drops a part 22
+  times instead of 58, and spends 1.34 s compiling and 1.67 s translating
+  instead of 3.20 s and 2.96 s. That is 3.1 s less host work at one vCPU.
+  J14 at 256 MiB spends 1.15 s and 2.83 s, so superblocks for every block
+  cost about 1 s of translation even when nothing is dropped. What they
+  save is outside these counters: J14h1 measured 47 % fewer exits between
+  blocks. The boot times above do not tell the variants apart. The spread
+  of one variant (50 to 129 s at one vCPU, 37 to 141 s at four) is many
+  times the 1 to 3 s of host work between them.
+- **T3-D3i. The region size stands.** The size and the superblock rule are
+  separate. With superblocks for every block, as `next` makes them, 64 MiB
+  drops a part 51 to 58 times in a boot and 256 MiB once at most (T3-D3a).
+  With superblocks off or warm-only, 64 MiB still drops a part 22 to 25
+  times and recompiles 0.27 to 0.47 million blocks, and 256 MiB drops none
+  while keeping 234 MiB of region at one vCPU and 494 MiB over four. So
+  256 MiB is the size under either rule. Whether superblocks should be made
+  only for warm blocks needs the count in compiled code of T3-D3g and a
+  quieter host than this one, which gave each variant boots up to 2.5
+  times apart.
+
 ### T3-D4, measured by card #1211
 
 Helios, 2026-11-28, *measured*, the release build, the boot suite
