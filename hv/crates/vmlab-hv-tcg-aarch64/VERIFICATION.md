@@ -2595,3 +2595,43 @@ The measured rows are in J13 of the design.
   the record that the decoder gives.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn. QEMU ran as the oracle of K1 and in the J9 rows only.
+
+## Card #1189 (2026-11-28)
+
+S1 for Fedora 44 at one vCPU again after J10, J11 and J12 (C13b-S1a). The
+numbers are in 3e DESIGN.md, "S1 for Fedora at one vCPU, measured by card
+#1189". This card changes no code.
+
+### What was run
+
+- `next` at `838c4ee9`, the release build of `vmlab-hv`, the JIT on by
+  default. Each boot: `bench/run.py --backend vmlab-hv --arch aarch64
+  --vcpus 1 --repeats 1 --guest fedora-44 --suite boot --cpus 20-23`, the
+  load average sampled every 10 s.
+- Set A, the host as it was (load 2.9 to 7.0): seven of seven boots at agent
+  ready in 122.6 to 174.6 s, median 132.3 s, no emergency mode, no timed-out
+  job, no failed dependency in a serial log (S1F1).
+- Set B, the load at 8 or more (mean 13.6 and 14.0, peaks 34 and 37 from
+  other cards' builds): both boots in emergency mode on systemd's 90 s device
+  timeout (S1F2). The set stopped after two boots because the host's VM cap
+  stayed full with other cards' VMs for more than half an hour.
+
+### The profile of the failing boots
+
+- `schedstat` of the `vcpu-0` thread every 5 s: 0.6 s and 1.3 s of run-queue
+  wait in 260 to 330 s of run time (S1F3).
+- The JIT counters at 17e9 instructions: entries into compiled code, blocks
+  compiled, drops of the region and fast-TLB misses of the failing boots are
+  in the range of the good ones within 12 % (S1F4).
+- The compile time a block, host work alone: 2.43 to 2.50 µs at a load of 3
+  to 5, 3.59 and 3.82 µs in the failing boots. The guest rate fell from 140
+  to 260 MIPS to 65 to 116 MIPS between 30 and 62 s, and to 44 to 75 MIPS
+  in the late phase. CPUs 20 to 23 are the SMT siblings of CPUs 4 to 7 (S1F5).
+- So the remaining cause is a host core that runs the same work up to 1.5
+  times slower under load, not one of the three costs of C13b-P1 (S1F6).
+
+### Sources read for this card
+
+- This crate's and the bench's state (`run.py`, `lib.py`), C13b in the 3e
+  design and in this file. No QEMU source, no Arm ASL, XML or pseudocode, no
+  Unicorn (X1 to X3). QEMU did not run.

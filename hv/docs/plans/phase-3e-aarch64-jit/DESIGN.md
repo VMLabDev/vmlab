@@ -2009,6 +2009,79 @@ a side):
   or joins only where a link of H5 was made at run time, would make less.
   The boot rows of 1 and 4 vCPUs are far from QEMU (26.9 and 20.1 s, J9b).
 
+### S1 for Fedora at one vCPU, measured by card #1189
+
+The follow-up of C13b-S1a. Helios, 2026-11-28, *measured*, `next` at
+`838c4ee9` (J10 to J14 merged, the JIT on by default), the release build.
+Each boot is one run of `bench/run.py --backend vmlab-hv --arch aarch64
+--vcpus 1 --repeats 1 --guest fedora-44 --suite boot --cpus 20-23`, the
+host's load average sampled every 10 s. Set A ran as the host was, the
+merge bar of this card beside boots 1 and 2. Set B ran with the load held at
+8 or more: a controller added `dd` memory-streaming workers on CPUs 0 to 15
+when the load fell under 8, but the builds and VMs of other cards held it
+above that for most of the set, so the workers were idle there.
+
+| Set, boot | Agent ready, s | Load average (1 min), min, mean, max | Boot MIPS |
+|---|---|---|---|
+| A1 | 158.95 | 6.35, 6.59, 7.00 | 191.7 |
+| A2 | 174.60 | 4.91, 5.57, 5.96 | 173.9 |
+| A3 | 132.31 | 4.33, 5.13, 7.00 | 228.4 |
+| A4 | 136.47 | 4.04, 4.11, 4.33 | 221.7 |
+| A5 | 125.46 | 3.36, 3.83, 4.23 | 240.5 |
+| A6 | 122.56 | 3.01, 3.08, 3.33 | 245.2 |
+| A7 | 122.67 | 2.94, 3.03, 3.09 | 242.6 |
+| B1 | emergency mode | 6.91, 13.58, 33.68 | |
+| B2 | emergency mode | 7.39, 14.02, 36.67 | |
+
+- **S1F1. S1 holds at a load of 3 to 7.** Seven of seven boots reached agent
+  ready in 122.6 to 174.6 s, median 132.3 s, with no line of emergency mode,
+  a timed-out job or a failed dependency in their serial logs. J8 had 148 to
+  169 s at a load of 2 to 10 and C13b's good boots 149.6 to 172.5 s. The
+  boots at a load of 3 to 4 (A5 to A7, 122.6 to 125.5 s) are the gain of J10
+  to J14.
+- **S1F2. S1 does not hold at C13b's load and above.** Both boots of set B
+  went to emergency mode on systemd's 90 s device timeout (`dev-zram0`,
+  `dev-ttyAMA0` and a disk by UUID, then `/home`, `/boot`, `/boot/efi`,
+  `/var` and `local-fs.target`), as the three failures of C13b-S1. Their mean
+  load was 13.6 and 14.0, and other cards' builds took it to 34 and 37.
+  Set B was stopped after two boots: the VM cap of the host (four project VM
+  processes) stayed full with other cards' VMs for more than half an hour.
+- **S1F3. The vCPU had a CPU all the time.** A sampler of `schedstat` of the
+  `vcpu-0` thread of B1 and B2 every 5 s: the thread waited 0.6 s and 1.3 s
+  in a run queue over 260 to 330 s of run time. The failure is not a vCPU
+  thread that the host scheduler held off its CPU.
+- **S1F4. The emulator did the same work.** Up to 17e9 guest instructions
+  every boot entered compiled code 159.7 to 166.6 million times, compiled
+  0.60 to 0.69 million blocks in 27 to 30 drops of the region and missed the
+  fast TLB 200 to 206 million times in 3.92 to 3.97 billion accesses. No
+  count of the failing boots is out of the range of the good ones by more
+  than 12 %. So C13b-P1's three costs are not larger in a failing boot.
+- **S1F5. The host core ran that work slower.** The time of a compile is
+  host work alone, and it rose with the load: 2.43 to 2.50 µs a block at a
+  load of 3 to 5 (A3 to A7), 2.68 and 2.77 µs at 5.6 and 6.6 (A1, A2), 3.59
+  and 3.82 µs in B1 and B2, 1.5 times A7. The instruction rate of the guest
+  fell the same way: B1 and B2 ran the phase from 30 to 62 s after the
+  release at 65 to 116 MIPS against 140 to 260 MIPS in set A, and the late
+  phase at 44 to 75 MIPS against 92 to 205. They reached 17e9 instructions
+  at 95 s and 108 s against 53 to 64 s. CPUs 20 to 23, where the bench pins
+  the VM, are the SMT siblings of CPUs 4 to 7 (cores 4 to 7), which the
+  bench leaves to the rest of the host: in B2 the sampler saw CPUs 4 to 7 up
+  to 47 % busy. The basis of an explanation, not measured apart: the
+  sibling threads and the memory traffic of other work slow the core, and
+  the boost clock of the host falls with the number of busy cores.
+- **S1F6. What remains.** At a load of 14 a Fedora boot at one vCPU needs
+  about 1.5 to 2 times the host time of a quiet one, and that is past the
+  margin the 90 s device timeout leaves it. No single cost of C13b-P1 is
+  the cause. The remaining fix is speed on every path, about 1.5 to 2 times
+  at one vCPU, or a pin of the bench that keeps the SMT siblings of the VM's
+  cores free, which would make the measure steady but would not change what
+  a user's loaded host does.
+- **S1F7. A defect of the boot loop of this card**, not of the bench: the
+  outer `timeout` ended `bench/run.py` but not its `vmlab-hv`, so B1's VM
+  stayed in emergency mode on CPUs 20 to 23 beside B2 for its first 12
+  minutes. It used 2 to 5 % of a core there (`schedstat`). A reaper ended
+  such VMs from then on.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
