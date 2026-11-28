@@ -4015,6 +4015,10 @@ pub struct JitCounts {
     pub tlb_misses: u64,
     pub tlb_fills: u64,
     pub tlb_flushes: u64,
+    /// The searches of the write tables for a page that gets code, and the
+    /// time of those and of the flushes (3e DESIGN.md J12).
+    pub tlb_scans: u64,
+    pub tlb_flush_ns: u64,
     /// What this CPU and the others of its machine told each other (J7).
     pub machine: MachineCounts,
 }
@@ -4795,6 +4799,8 @@ impl<M: Memory> Cpu<M> {
         if let Some(fast) = self.side.mmu.fast() {
             counts.tlb_fills = fast.fills;
             counts.tlb_flushes = fast.flushes;
+            counts.tlb_scans = fast.scans;
+            counts.tlb_flush_ns = fast.flush_ns;
         }
         counts.machine = self.side.machine;
         counts.translations = self.translations;

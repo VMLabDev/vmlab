@@ -24,8 +24,18 @@
 //! below the size of the access, and compares that with the tag. So an
 //! access that is not aligned to its size misses, and such an access is
 //! the only one that can cross its page.
+//!
+//! A flush, and the search of the write entries of a page that gets code,
+//! visit the places filled since the last flush while there are at most
+//! `TRACKED`, and sweep the tables only past that: their cost follows what
+//! the TLB holds and not its size. A boot flushes about a million times
+//! (card J12: a sweep of the whole tables each time took 2.9 s of a boot at
+//! 4,096 entries and 55 s at 65,536).
 
-/// The entries of one table.
+/// The entries of one table: 1 MiB of guest pages, the four tables 32 KiB.
+/// From the curve of card J12 (3e DESIGN.md J12a, J12d): more entries miss
+/// less in a boot (2.6 % of its inlined accesses at 1,024 against 3.1 %)
+/// but not in `xz`, which ran 1 to 3 % slower at 1,024.
 pub const ENTRIES: usize = 256;
 /// Log2 of the bytes of one entry.
 pub const ENTRY_BITS: u32 = 5;
@@ -36,6 +46,12 @@ pub const EMPTY: u64 = u64::MAX;
 /// The most mappings larger than a page that the TLB keeps apart. With
 /// more, every invalidation by address drops everything.
 const LARGE: usize = 64;
+
+/// The most places that the TLB remembers as filled since the last flush
+/// of everything. Up to that many, a flush and the search for the write
+/// entries of a page visit those places and not the tables, so that their
+/// cost follows what the TLB holds and not its size (3e DESIGN.md J12).
+const TRACKED: usize = ENTRIES / 4;
 
 /// One entry, as compiled code reads it.
 #[repr(C)]
@@ -66,11 +82,19 @@ pub(crate) const TAG: i32 = 0;
 pub(crate) const ADDEND: i32 = 8;
 pub(crate) const WATCH: i32 = 16;
 
-/// The four tables: `tables[level][write]`. Level 0 serves a block of the
-/// lower level of the guest (EL0 of aarch64), level 1 the upper one.
+/// Two entries, so that an entry never crosses a cache line of the host.
 #[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([Entry; 2]);
+
+const EMPTY_LINE: Line = Line([NOTHING; 2]);
+
+/// The four tables, one after the other: table `2 * level + write`. Level
+/// 0 serves a block of the lower level of the guest (EL0 of aarch64), level
+/// 1 the upper one. On the heap: at a larger `ENTRIES` the tables are more
+/// than a stack holds.
 pub struct FastTlb {
-    tables: [[[Entry; ENTRIES]; 2]; 2],
+    lines: Box<[Line]>,
     /// Entries that hold something, so that a flush of an empty TLB costs
     /// nothing.
     used: usize,
@@ -78,19 +102,32 @@ pub struct FastTlb {
     /// the last flush of everything, as a page of the mapping and the bits
     /// of a page number inside it. `None`: more than `LARGE`.
     large: Option<Vec<(u64, u32)>>,
+    /// The places filled since the last flush of everything, as indices
+    /// of the tables taken one after the other, while there are at most
+    /// `TRACKED`. A place can be in it twice, or be empty again. `None`:
+    /// more, and every entry may hold something.
+    filled: Option<Vec<u32>>,
     /// Fills and the flushes of everything, for the counts of the owner.
     pub fills: u64,
     pub flushes: u64,
+    /// The searches of the write tables for a page that gets code
+    /// (`drop_writes` on a TLB that holds something), and the time that
+    /// the flushes and those searches took, for the cost of a size.
+    pub scans: u64,
+    pub flush_ns: u64,
 }
 
 impl FastTlb {
     pub fn new() -> Box<Self> {
         Box::new(Self {
-            tables: [[[NOTHING; ENTRIES]; 2]; 2],
+            lines: vec![EMPTY_LINE; 2 * ENTRIES].into_boxed_slice(),
             used: 0,
             large: Some(Vec::new()),
+            filled: Some(Vec::with_capacity(TRACKED)),
             fills: 0,
             flushes: 0,
+            scans: 0,
+            flush_ns: 0,
         })
     }
 
@@ -99,16 +136,36 @@ impl FastTlb {
         (va >> 12) as usize & (ENTRIES - 1)
     }
 
+    /// The entry at `at` of the tables, table after table.
+    #[inline(always)]
+    fn entry(&self, at: usize) -> &Entry {
+        &self.lines[at / 2].0[at % 2]
+    }
+
+    #[inline(always)]
+    fn entry_mut(&mut self, at: usize) -> &mut Entry {
+        &mut self.lines[at / 2].0[at % 2]
+    }
+
+    /// The place of the entry `index` of the table of `level` for reads or
+    /// for writes.
+    #[inline(always)]
+    fn place(level: usize, write: bool, index: usize) -> usize {
+        ((level & 1) * 2 + usize::from(write)) * ENTRIES + index
+    }
+
     /// The table of `level` for reads or for writes, as compiled code takes
     /// it.
     pub fn table(&self, level: usize, write: bool) -> *const Entry {
-        self.tables[level & 1][usize::from(write)].as_ptr()
+        let lines = self.lines.as_ptr().cast::<Entry>();
+        // In the allocation: a place is less than its length in entries.
+        lines.wrapping_add(Self::place(level, write, 0))
     }
 
     /// The entry that an access of `bytes` bytes at `va` hits, as the
     /// inlined lookup finds it.
     pub fn lookup(&self, level: usize, write: bool, va: u64, bytes: u8) -> Option<&Entry> {
-        let entry = &self.tables[level & 1][usize::from(write)][Self::index(va)];
+        let entry = self.entry(Self::place(level, write, Self::index(va)));
         (va & (!0xfff | (u64::from(bytes.max(1)) - 1)) == entry.tag).then_some(entry)
     }
 
@@ -128,10 +185,18 @@ impl FastTlb {
         span: u8,
     ) {
         let tag = va & !0xfff;
-        let place = &mut self.tables[level & 1][usize::from(write)][Self::index(va)];
-        if place.tag == EMPTY {
+        let at = Self::place(level, write, Self::index(va));
+        if self.entry(at).tag == EMPTY {
             self.used += 1;
+            if let Some(filled) = &mut self.filled {
+                if filled.len() < TRACKED {
+                    filled.push(at as u32);
+                } else {
+                    self.filled = None;
+                }
+            }
         }
+        let place = self.entry_mut(at);
         *place = Entry {
             tag,
             addend: (host as u64).wrapping_sub(tag),
@@ -157,13 +222,23 @@ impl FastTlb {
     /// Drop every entry.
     pub fn flush(&mut self) {
         if self.used != 0 {
-            for level in &mut self.tables {
-                for table in level {
-                    table.fill(NOTHING);
+            let start = std::time::Instant::now();
+            match &mut self.filled {
+                Some(filled) => {
+                    for &at in filled.iter() {
+                        let at = at as usize;
+                        self.lines[at / 2].0[at % 2] = NOTHING;
+                    }
+                    filled.clear();
+                }
+                None => {
+                    self.lines.fill(EMPTY_LINE);
+                    self.filled = Some(Vec::with_capacity(TRACKED));
                 }
             }
             self.used = 0;
             self.flushes += 1;
+            self.flush_ns += start.elapsed().as_nanos() as u64;
         }
         self.large = Some(Vec::new());
     }
@@ -186,12 +261,11 @@ impl FastTlb {
             return;
         }
         let index = page as usize & (ENTRIES - 1);
-        for level in &mut self.tables {
-            for table in level {
-                if table[index].tag != EMPTY {
-                    table[index] = NOTHING;
-                    self.used -= 1;
-                }
+        for table in 0..4 {
+            let entry = self.entry_mut(table * ENTRIES + index);
+            if entry.tag != EMPTY {
+                *entry = NOTHING;
+                self.used -= 1;
             }
         }
     }
@@ -202,15 +276,44 @@ impl FastTlb {
         if self.used == 0 {
             return;
         }
+        let start = std::time::Instant::now();
         let page = phys & !0xfff;
-        for level in &mut self.tables {
-            for entry in level[1].iter_mut() {
-                if entry.tag != EMPTY && entry.phys == page {
-                    *entry = NOTHING;
-                    self.used -= 1;
+        let mut dropped = 0;
+        let mut clear = |entry: &mut Entry| {
+            if entry.tag != EMPTY && entry.phys == page {
+                *entry = NOTHING;
+                dropped += 1;
+            }
+        };
+        match &self.filled {
+            // A write table is an odd one.
+            Some(filled) => {
+                for &at in filled
+                    .iter()
+                    .filter(|&&at| (at as usize / ENTRIES) & 1 == 1)
+                {
+                    let at = at as usize;
+                    clear(&mut self.lines[at / 2].0[at % 2]);
+                }
+            }
+            None => {
+                for level in 0..2 {
+                    let from = Self::place(level, true, 0) / 2;
+                    for line in &mut self.lines[from..from + ENTRIES / 2] {
+                        line.0.iter_mut().for_each(&mut clear);
+                    }
                 }
             }
         }
+        self.used -= dropped;
+        self.scans += 1;
+        self.flush_ns += start.elapsed().as_nanos() as u64;
+    }
+
+    /// Whether the TLB remembers the places that it filled.
+    #[cfg(test)]
+    fn tracking(&self) -> bool {
+        self.filled.is_some()
     }
 
     /// The entries that hold something.
@@ -250,8 +353,58 @@ mod tests {
         // The other level, the other kind, and another page with its place.
         assert!(tlb.lookup(0, false, 0x1234_5000, 8).is_none());
         assert!(tlb.lookup(1, true, 0x1234_5000, 8).is_none());
-        assert!(tlb.lookup(1, false, 0x1244_5000, 8).is_none());
+        let rival = 0x1234_5000 + ((ENTRIES as u64) << 12);
+        assert!(tlb.lookup(1, false, rival, 8).is_none());
         assert_eq!(tlb.len(), 1);
+    }
+
+    #[test]
+    fn the_tables_follow_each_other_and_no_entry_crosses_a_cache_line() {
+        let tlb = FastTlb::new();
+        let first = tlb.table(0, false) as usize;
+        assert_eq!(first % 64, 0);
+        let size = ENTRIES * std::mem::size_of::<Entry>();
+        assert_eq!(tlb.table(0, true) as usize, first + size);
+        assert_eq!(tlb.table(1, false) as usize, first + 2 * size);
+        assert_eq!(tlb.table(1, true) as usize, first + 3 * size);
+        // The last entry of the last table is in the TLB.
+        let mut tlb = FastTlb::new();
+        let va = ((ENTRIES as u64 - 1) << 12) | 0x10;
+        tlb.fill(1, true, va, 0x7000_0000, 0x55, 0x9000, 12);
+        let entry = tlb.lookup(1, true, va, 8).expect("a hit") as *const Entry as usize;
+        assert_eq!(entry, tlb.table(1, true) as usize + size - 32);
+    }
+
+    #[test]
+    fn flushes_and_searches_find_every_entry_with_few_or_many_filled() {
+        // Few: the places are remembered. Many: past `TRACKED`, the tables
+        // are swept. Each with a place filled twice and one dropped between.
+        for pages in [3u64, TRACKED as u64 + 5] {
+            let mut tlb = FastTlb::new();
+            for page in 0..pages {
+                let write = page % 2 == 1;
+                tlb.fill(1, write, page << 12, 0x1000_0000, 0x55, 0x9000, 12);
+            }
+            tlb.fill(0, true, 0x1000, 0x2000_0000, 0x56, 0xa000, 12);
+            tlb.flush_page(0, u64::MAX);
+            tlb.fill(1, false, 0, 0x1000_0000, 0, 0x9000, 12);
+            assert_eq!(tlb.tracking(), pages < TRACKED as u64);
+            // Every write entry of the page 0x9000 goes, and only those.
+            tlb.drop_writes(0x9000);
+            let writes = pages / 2;
+            assert_eq!(tlb.len() as u64, pages - writes + 1);
+            assert!(tlb.lookup(0, true, 0x1000, 8).is_some());
+            assert!((0..pages).all(|page| tlb.lookup(1, true, page << 12, 1).is_none()));
+            tlb.flush();
+            assert!(tlb.is_empty());
+            for (table, write) in [(0, false), (0, true), (1, false), (1, true)] {
+                let first = tlb.table(table, write);
+                // SAFETY: the table has `ENTRIES` entries from `first`.
+                let entries = unsafe { std::slice::from_raw_parts(first, ENTRIES) };
+                assert!(entries.iter().all(|entry| *entry == NOTHING));
+            }
+            assert!(tlb.tracking());
+        }
     }
 
     #[test]

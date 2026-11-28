@@ -1052,7 +1052,10 @@ JIT_REPORT = re.compile(
     r"entered; (?P<links>\d+) links, (?P<unlinks>\d+) unlinks, (?P<fills>\d+) fills"
     r"(?:, (?P<clears>\d+) clears of the jump cache)?)?"
     # The fast TLB of card J3, when the line has it.
-    r"(?:; fast TLB: (?P<tlb_accesses>\d+) accesses, (?P<tlb_misses>\d+) misses)?"
+    r"(?:; fast TLB: (?P<tlb_accesses>\d+) accesses, (?P<tlb_misses>\d+) misses"
+    # The flushes of card J12 and what they cost, when the line has them.
+    r"(?:, (?P<tlb_flushes>\d+) flushes, (?P<tlb_scans>\d+) scans, (?P<tlb_flush_ms>\d+) ms "
+    r"flushing)?)?"
     # What the CPUs of a machine told each other (card J7), when the line has it.
     r"(?:; machine: (?P<exclusive_loads>\d+) exclusive loads, (?P<exclusive_stores>\d+) "
     r"exclusive stores, (?P<code_mails>\d+) code mails, (?P<code_pages>\d+) code pages, "

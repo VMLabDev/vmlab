@@ -103,7 +103,8 @@ impl vmlab_hv_vmm::DeviceFactory for DeviceSet {
         // orchestration (D14): the block device runs on a SharedDisk
         // forwarding to the same handle the registry keeps.
         let image = vmlab_hv_vmm::factory::open_image(disk)?;
-        let block = Block::new(disk.id.clone(), Box::new(SharedDisk(image.clone())));
+        let block = Block::new(disk.id.clone(), Box::new(SharedDisk(image.clone())))
+            .with_serial(&disk_serial(disk));
         let block = if msi.transitional {
             block
                 .with_num_queues(msi.msix_vectors.saturating_sub(1))
@@ -243,6 +244,41 @@ fn parse_mac(mac: &str) -> Result<[u8; 6], DeviceUnavailable> {
     Ok(bytes)
 }
 
+/// The serial a virtio-blk disk reports (GitHub #1026).
+///
+/// vmlab's QEMU backend set no `serial=`, so QEMU answered `GET_ID` with an
+/// empty string, and the Windows driver (viostor's `ReportDeviceIdentifier`)
+/// then made the disk's EUI-64 from its PCI bus and slot, one nibble a byte:
+/// the disk at 00:02.0 was `0000000000000002`, the one at 00:03.0
+/// `0000000000000003`. A placed disk reports that string as its serial, so a
+/// lab that selects a disk by it moves between the backends unchanged, and
+/// Linux gets `/dev/disk/by-id/virtio-<serial>` as well. The slot number is
+/// Windows' `PCI_SLOT_NUMBER`: the device in bits 0 to 4, the function in 5
+/// to 7. A disk the VMM places itself (a container's) reports its id, unique
+/// within a machine and the same at each start.
+pub fn disk_serial(disk: &Disk) -> String {
+    match disk.pci {
+        Some(pci) => {
+            let slot = u16::from(pci.device & 0x1f) | (u16::from(pci.function & 0x7) << 5);
+            let bus = u16::from(pci.bus);
+            [
+                bus >> 12,
+                bus >> 8,
+                bus >> 4,
+                bus,
+                slot >> 12,
+                slot >> 8,
+                slot >> 4,
+                slot,
+            ]
+            .iter()
+            .map(|nibble| format!("{:02X}", nibble & 0xf))
+            .collect()
+        }
+        None => disk.id.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +287,76 @@ mod tests {
     struct Msi;
     impl vmlab_hv_devices::MsiSink for Msi {
         fn signal(&self, _: vmlab_hv_devices::MsiMessage) {}
+    }
+
+    fn disk_at(id: &str, pci: Option<(u8, u8, u8)>) -> Disk {
+        Disk {
+            channel: None,
+            unit: None,
+            pci: pci.map(
+                |(bus, device, function)| vmlab_hv_proto::machine::PciAddress {
+                    bus,
+                    device,
+                    function,
+                },
+            ),
+            bus: Default::default(),
+            port: None,
+            cdrom: false,
+            id: id.into(),
+            path: None,
+            format: vmlab_hv_proto::machine::DiskFormat::Qcow2,
+            read_only: false,
+            vmstate: false,
+        }
+    }
+
+    /// The boot disk at 00:02.0 and the data disks after it report what a
+    /// Windows guest saw for them on QEMU (GitHub #1026).
+    #[test]
+    fn a_placed_disk_reports_the_qemu_form_of_its_slot() {
+        let serials: Vec<String> = (2..=5)
+            .map(|slot| disk_serial(&disk_at(&format!("disk{}", slot - 2), Some((0, slot, 0)))))
+            .collect();
+        assert_eq!(
+            serials,
+            [
+                "0000000000000002",
+                "0000000000000003",
+                "0000000000000004",
+                "0000000000000005"
+            ]
+        );
+        assert!(serials.iter().all(|s| s.len() <= 20));
+    }
+
+    /// Every nibble of the bus and of the slot number is one byte, as
+    /// viostor writes the EUI-64; the function sits in bits 5 to 7.
+    #[test]
+    fn the_serial_spells_each_nibble_of_bus_and_slot() {
+        assert_eq!(
+            disk_serial(&disk_at("d", Some((0, 0x1f, 0)))),
+            "000000000000010F"
+        );
+        assert_eq!(
+            disk_serial(&disk_at("d", Some((0, 2, 1)))),
+            "0000000000000202"
+        );
+        assert_eq!(
+            disk_serial(&disk_at("d", Some((0x12, 2, 0)))),
+            "0000010200000002"
+        );
+    }
+
+    /// A disk the VMM places reports its id: one per disk, and the same at
+    /// every start.
+    #[test]
+    fn an_unplaced_disk_reports_its_id() {
+        assert_eq!(disk_serial(&disk_at("rootfs", None)), "rootfs");
+        assert_ne!(
+            disk_serial(&disk_at("rootfs", None)),
+            disk_serial(&disk_at("scratch", None))
+        );
     }
 
     #[test]
