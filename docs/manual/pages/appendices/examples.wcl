@@ -64,7 +64,7 @@ SH
   p <<DOC
     One Alpine Linux guest on an aarch64 machine, on a NAT'd segment with a
     host [forward](guide_networking) to its SSH port. On an x86 host there is
-    no KVM for aarch64, so the VM runs under TCG emulation and boots in
+    no KVM for aarch64, so the VM runs on vmlab-hv's emulator and boots in
     minutes; the [TCG warning](apx_troubleshooting) is expected here. The
     provision script waits for the [agent](guide_architecture) and logs the
     guest's `uname -m`, which should print `aarch64`.
@@ -72,8 +72,7 @@ SH
   p <<DOC
     It needs `aarch64/alpine-3.23` in the store. It is published, so pull
     it; its definition lives in the separate `vmlab-templates` repository if
-    you need to build it. The host needs `qemu-system-aarch64` and the
-    aarch64 UEFI firmware.
+    you need to build it. vmlab's bundled aarch64 UEFI firmware boots it.
   DOC
   code sh { source = <<'SH'
 vmlab template pull ghcr.io/vmlabdev/vmlab-templates/alpine-3.23 --arch aarch64

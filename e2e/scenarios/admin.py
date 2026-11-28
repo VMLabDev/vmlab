@@ -1,10 +1,13 @@
 """Host-wide administration: the `vmlab lab` verbs against a running lab, the
-supervisor's own lifecycle, and an emulated (non-x86) guest on QEMU.
+supervisor's own lifecycle, and an emulated aarch64 guest.
 An x86_64 scratch VM on vmlab-hv exercises the lab verbs; the aarch64 guest
-has a lab of its own, which automatic selection puts on QEMU on every run,
-since QEMU runs no x86 guest (PRD §22).
+has a lab of its own, which automatic selection puts on vmlab-hv's emulator
+on a vmlab run, and a QEMU run pins to QEMU, since QEMU runs no x86 guest
+and that guest is all it has (PRD §22).
 """
 
+import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -144,14 +147,34 @@ def down_isolation(h, attempts=1):
     return True
 
 
-def emulated_on_qemu(h):
-    """`arch.emulated`: the aarch64 guest of `admin-lab`, which QEMU runs
-    under TCG on this x86_64 host, in a lab of its own."""
+def emulated_aarch64(h):
+    """`arch.emulated`: the aarch64 guest of `admin-lab`, in a lab of its own.
+    A vmlab run leaves it to automatic selection, which puts it on vmlab-hv's
+    emulated `virt` machine (PRD §22, phase 3d): headless, so the screen verbs
+    say it has no display. A QEMU run pins it to QEMU under TCG, the
+    troubleshooting route, which draws a screen."""
     with h.lab("admin-lab") as lab:
 
-        def emulated():
-            # Inside the check, so a guest that does not come up fails this
-            # feature and not the rest of the scenario.
+        def on_vmlab_hv():
+            h.vmlab("up", cwd=lab, timeout=300)
+            pid = machine_pid(LAB, "arm01")
+            assert pid, "no vmlab-hv process for arm01"
+            assert pathlib.Path(argv_of(int(pid))[0]).name == "vmlab-hv", argv_of(int(pid))
+            assert not [p for p in pids(QEMU_NAME) if alive(p)], "arm01 also has a QEMU process"
+            desc = json.loads(machine_json(LAB, "arm01").read_text())
+            assert (desc["arch"], desc["accel"], desc.get("machine")) == ("aarch64", "tcg", "virt"), desc
+            boot = desc["boot"]
+            # vmlab's own AAVMF: the image carries no qemu-efi-aarch64.
+            assert boot["firmware"] == "aavmf", boot
+            assert boot["code"] == "/usr/share/vmlab/guest/firmware/aarch64/AAVMF_CODE.fd", boot
+            assert "display" not in desc, desc
+            h.wait_until(lambda: "UEFI" in h.vmlab("logs", "arm01", "-n", "200", cwd=lab, check=False).out,
+                         timeout=180, what="the aarch64 firmware on the serial console")
+            shot = h.vmlab("vm", "screenshot", "arm01", str(WORK / "arm01.png"), cwd=lab, check=False)
+            assert shot.code != 0 and "has no display" in shot.text, shot.text
+            return True
+
+        def on_qemu():
             h.vmlab("up", cwd=lab, timeout=300)
             qemu = [p for p in pids(QEMU_NAME) if alive(p)]
             assert qemu, "no QEMU process for arm01"
@@ -172,14 +195,28 @@ def emulated_on_qemu(h):
             assert data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 1000, f"{len(data)} bytes"
             return True
 
-        h.check("arch.emulated", emulated,
-                "qemu-system-aarch64 -accel tcg; the bundled AAVMF reached its UEFI shell on serial; vm screenshot wrote a PNG")
+        # Inside the check, so a guest that does not come up fails this
+        # feature and not the rest of the scenario.
+        if h.hypervisor == "qemu":
+            h.check("arch.emulated", on_qemu,
+                    "qemu-system-aarch64 -accel tcg; the bundled AAVMF reached its UEFI shell on serial; "
+                    "vm screenshot wrote a PNG")
+        else:
+            h.check("arch.emulated", on_vmlab_hv,
+                    "vmlab-hv's emulated virt machine on the bundled AAVMF reached UEFI on serial; "
+                    "no QEMU; vm screenshot refused: no display")
         # Both labs are `e2e-admin`: this one goes before the next comes up.
         h.destroy(lab)
 
 
+def machine_json(lab: str, vm: str) -> pathlib.Path:
+    """The machine description vmlab wrote for a vmlab-hv machine."""
+    run = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    return run / "vmlab" / "labs" / lab / "vms" / vm / "machine.json"
+
+
 def run(h):
-    emulated_on_qemu(h)
+    emulated_aarch64(h)
     if h.hypervisor == "qemu":
         # QEMU runs no x86 guest: the aarch64 guest is all a QEMU run has.
         return

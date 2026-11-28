@@ -1,6 +1,8 @@
 // Minimal arm64 (aarch64) lab: one Alpine guest on a NAT'd segment, with a
-// host port-forward to its SSH port. The guest emulates aarch64 under TCG
-// on x86 hosts (no KVM), so boot is slow — give it a couple of minutes.
+// host port-forward to its SSH port. vmlab-hv emulates aarch64 on x86 hosts
+// (no KVM), so boot is slow — give it a couple of minutes. Its `virt`
+// machine has no display yet: read the serial console with `vmlab logs`, and
+// reach the guest with SSH, `vmlab shell` or `vmlab exec`.
 //
 // Build the template first (from the vmlab-templates repo):
 //
@@ -15,8 +17,6 @@
 import <vmlab.wcl>
 
 lab "alpine-arm64" {
-
-  gui = true        // open a VNC viewer on `up` (virtio-gpu framebuffer)
 
   segment "lan" {
     subnet = "10.80.0.0/24"
