@@ -68,8 +68,8 @@ use crate::tlb::{ADDEND, ENTRIES, ENTRY_BITS, TAG, WATCH};
 use crate::{
     BUDGET, CHAIN, CONTEXT_ACCESSES, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV,
     CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_REFUND,
-    CONTEXT_THUNK, CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS,
-    SITES, VERIFY, WATCHED,
+    CONTEXT_THUNK, CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP,
+    LOWEST_CODE, MISS, SITES, TERMINAL, VERIFY, WATCHED,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Kind as GenericKind, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::{Binary, ScalarType, Unary};
@@ -293,6 +293,11 @@ pub struct Chain {
     /// leaves (card J10): the owner can give the code of the target, and
     /// the run goes on. Not with `verify`.
     pub serve: bool,
+    /// The block ends before an instruction that its owner runs
+    /// (`NextPc::Fixed`): its end calls the thunk with `TERMINAL`, which
+    /// can run that instruction and give the code of the next block (card
+    /// T3-D2). Without it, such a block leaves with `DONE`.
+    pub terminal: bool,
 }
 
 /// What the block makes of the PC of the state at its end.
@@ -2304,6 +2309,20 @@ impl Emitter<'_> {
         }
         self.asm.store(slot, RAX);
         self.asm.store_imm(Rm::Mem(R15, pc + 8), 0);
+        if let (NextPc::Fixed(_), Some(chain)) = (next.kind, self.shape.chain)
+            && chain.terminal
+        {
+            // Card T3-D2: the owner runs the instruction at the PC without
+            // a return to its loop where it can. Every output is written,
+            // and no host register but those of the context holds
+            // anything, so the call keeps none. 0 and the exit codes leave
+            // as they are, and anything else is the code of the next block.
+            Self::call_thunk(&mut self.asm, TERMINAL, &[]);
+            self.asm.alu_imm(Alu::Cmp, Rm::Reg(RAX), LOWEST_CODE as i32);
+            self.asm.jcc_absolute(Cond::B, self.exit);
+            self.asm.jmp_reg(RAX);
+            return;
+        }
         let chain = match self.shape.chain {
             Some(chain)
                 if (chain.sites || chain.jumps) && !matches!(next.kind, NextPc::Fixed(_)) =>

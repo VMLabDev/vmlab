@@ -77,6 +77,12 @@ impl Windows {
         })
     }
 
+    /// The instructions from `instructions` to the next window, while one
+    /// is left to write.
+    pub(crate) fn left(&self, instructions: u64) -> Option<u64> {
+        (self.left > 0).then(|| self.next.saturating_sub(instructions))
+    }
+
     /// Whether the CPU, at `instructions`, writes its next window now.
     pub(crate) fn due(&self, instructions: u64) -> bool {
         self.left > 0 && instructions >= self.next

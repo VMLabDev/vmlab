@@ -1318,7 +1318,11 @@ JIT_REPORT = re.compile(
     r"nothing to chain to, (?P<returns_budget>\d+) at the budget, (?P<returns_kicked>\d+) "
     r"kicked; (?P<jump_spaces>\d+) changes of the address space kept the jump cache)?"
     # The superblocks of card J14, when the line has them.
-    r"(?:; superblocks: (?P<joins>\d+) joins, (?P<side_exits>\d+) side exits)?")
+    r"(?:; superblocks: (?P<joins>\d+) joins, (?P<side_exits>\d+) side exits)?"
+    # The last instructions of blocks that the thunk ran (card T3-D2), when the
+    # line has them. The counts by kind follow in the line, for a reader of the log.
+    r"(?:; terminals: (?P<terminal_served>\d+) served in code, (?P<returns_trapped>\d+) served "
+    r"then left)?")
 
 
 def last_jit_report(run_dir):
