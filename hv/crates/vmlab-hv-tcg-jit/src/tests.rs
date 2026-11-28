@@ -311,7 +311,7 @@ unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64, _block: *mut c_voi
             };
             let host = env.ram as usize + page * 4096;
             env.tlb
-                .fill(1, store, va, host, watch, page as u64 * 4096, 12);
+                .fill(1, store, va, host, watch, page as u64 * 4096, 12, false);
         }
         return 0;
     }
@@ -2042,7 +2042,7 @@ fn access_rounds(seed: u64, fold: bool) {
             for page in 0..PAGES {
                 let host = got_ram.as_ptr() as usize + page * 4096;
                 let va = RAM + page as u64 * 4096;
-                tlb.fill(1, false, va, host, 0, page as u64 * 4096, 12);
+                tlb.fill(1, false, va, host, 0, page as u64 * 4096, 12, false);
             }
         }
         let ran = compiled_on(&mut jit, &block, &mut got, 100, &mut got_ram, Some(tlb));
@@ -2208,9 +2208,9 @@ fn a_hit_asks_nothing_and_a_miss_runs_the_access_in_the_thunk() {
     let mut tlb = FastTlb::new();
     let watch = AtomicU32::new(0);
     let host = ram.as_ptr() as usize;
-    tlb.fill(1, false, RAM, host, 0, 0, 12);
+    tlb.fill(1, false, RAM, host, 0, 0, 12, false);
     let watch_at = &watch as *const AtomicU32 as usize;
-    tlb.fill(1, true, RAM + 0x1000, host + 0x1000, watch_at, 0x1000, 12);
+    tlb.fill(1, true, RAM + 0x1000, host + 0x1000, watch_at, 0x1000, 12, false);
     ram[0x1004..0x1008].fill(0);
     let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
     let run = |jit: &mut Jit, block: &Block, ram: &mut [u8], writes| {
@@ -2256,7 +2256,7 @@ fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
     let frame = vec![0, RAM + 16, 0];
     let mut ram = vec![0u8; PAGES * 4096];
     let mut tlb = FastTlb::new();
-    tlb.fill(1, false, RAM, ram.as_ptr() as usize, 0, 0, 12);
+    tlb.fill(1, false, RAM, ram.as_ptr() as usize, 0, 0, 12, false);
     let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
     for (op, memory) in [
         (
@@ -2312,9 +2312,9 @@ fn a_store_into_a_watched_page_tells_the_thunk_after_its_write() {
     for odd in [false, true] {
         let watch = AtomicU32::new(2 + u32::from(odd));
         let mut tlb = FastTlb::new();
-        tlb.fill(1, false, RAM, host, 0, 0, 12);
+        tlb.fill(1, false, RAM, host, 0, 0, 12, false);
         let watch_at = &watch as *const AtomicU32 as usize;
-        tlb.fill(1, true, page, host + offset, watch_at, offset as u64, 12);
+        tlb.fill(1, true, page, host + offset, watch_at, offset as u64, 12, false);
         let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
         ram[offset + 4..offset + 8].fill(0);
         let ran = run_on_tables(&mut jit, &block, &ops, &mut ram, reads, writes);

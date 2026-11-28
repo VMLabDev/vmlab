@@ -28,6 +28,11 @@
 //! another place. The alignment that a memory asks of an address is not
 //! checked here: an owner fills no entry for a page whose memory asks it.
 //!
+//! An entry also knows, outside what compiled code reads, whether its
+//! mapping holds for every address space (a global mapping of aarch64).
+//! A change of address space drops only the others (`drop_local`, card
+//! V6): the kernel's entries stay across a process switch.
+//!
 //! A flush, and the search of the write entries of a page that gets code,
 //! visit the places filled since the last flush while there are at most
 //! `TRACKED`, and sweep the tables only past that: their cost follows what
@@ -110,9 +115,15 @@ pub struct FastTlb {
     /// `TRACKED`. A place can be in it twice, or be empty again. `None`:
     /// more, and every entry may hold something.
     filled: Option<Vec<u32>>,
+    /// One bit a place, table after table: the entry there was filled
+    /// from a mapping that holds for every address space.
+    global: [u64; 4 * ENTRIES / 64],
     /// Fills and the flushes of everything, for the counts of the owner.
     pub fills: u64,
     pub flushes: u64,
+    /// The drops of the entries that are not global (`drop_local`) on a
+    /// TLB that held something.
+    pub local_drops: u64,
     /// The searches of the write tables for a page that gets code
     /// (`drop_writes` on a TLB that holds something), and the time that
     /// the flushes and those searches took, for the cost of a size.
@@ -127,8 +138,10 @@ impl FastTlb {
             used: 0,
             large: Some(Vec::new()),
             filled: Some(Vec::with_capacity(TRACKED)),
+            global: [0; 4 * ENTRIES / 64],
             fills: 0,
             flushes: 0,
+            local_drops: 0,
             scans: 0,
             flush_ns: 0,
         })
@@ -176,8 +189,8 @@ impl FastTlb {
 
     /// Keep the page of `va` for `level`: its host page at `host`, its
     /// watch word at `watch` (0 for a read entry), its physical address
-    /// `phys`, from a mapping of `1 << span` bytes. The caller checked
-    /// what H7a asks.
+    /// `phys`, from a mapping of `1 << span` bytes that holds for every
+    /// address space when `global`. The caller checked what H7a asks.
     #[allow(clippy::too_many_arguments)]
     pub fn fill(
         &mut self,
@@ -188,6 +201,7 @@ impl FastTlb {
         watch: usize,
         phys: u64,
         span: u8,
+        global: bool,
     ) {
         let tag = va & !0xfff;
         let at = Self::place(level, write, Self::index(va));
@@ -208,6 +222,12 @@ impl FastTlb {
             watch: watch as u64,
             phys: phys & !0xfff,
         };
+        let bit = 1u64 << (at % 64);
+        if global {
+            self.global[at / 64] |= bit;
+        } else {
+            self.global[at / 64] &= !bit;
+        }
         self.fills += 1;
         let within = u32::from(span).saturating_sub(12);
         if within != 0
@@ -246,6 +266,62 @@ impl FastTlb {
             self.flush_ns += start.elapsed().as_nanos() as u64;
         }
         self.large = Some(Vec::new());
+    }
+
+    /// Drop every entry that is not global: the address space changed, and
+    /// the entries of the one before are not those of the new one (card
+    /// V6). The global entries stay, as they stay in the TLB of the CPU.
+    /// The places that it visits are those of `flush`. A sweep remembers
+    /// the places that stay when they are few, so that the next drop
+    /// visits only those.
+    pub fn drop_local(&mut self) {
+        if self.used == 0 {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let mut used = self.used;
+        let global = &self.global;
+        let is_global = |at: usize| global[at / 64] >> (at % 64) & 1 != 0;
+        let lines = &mut self.lines;
+        match &mut self.filled {
+            Some(filled) => filled.retain(|&at| {
+                let at = at as usize;
+                let entry = &mut lines[at / 2].0[at % 2];
+                if entry.tag == EMPTY {
+                    return false;
+                }
+                if is_global(at) {
+                    return true;
+                }
+                *entry = NOTHING;
+                used -= 1;
+                false
+            }),
+            None => {
+                let mut kept = Vec::with_capacity(TRACKED);
+                let mut few = true;
+                for at in 0..4 * ENTRIES {
+                    let entry = &mut lines[at / 2].0[at % 2];
+                    if entry.tag == EMPTY {
+                        continue;
+                    }
+                    if !is_global(at) {
+                        *entry = NOTHING;
+                        used -= 1;
+                    } else if few && kept.len() < TRACKED {
+                        kept.push(at as u32);
+                    } else {
+                        few = false;
+                    }
+                }
+                if few {
+                    self.filled = Some(kept);
+                }
+            }
+        }
+        self.used = used;
+        self.local_drops += 1;
+        self.flush_ns += start.elapsed().as_nanos() as u64;
     }
 
     /// Drop what an invalidation of the virtual page number `page` names,
@@ -338,7 +414,7 @@ mod tests {
     #[test]
     fn a_hit_needs_every_byte_of_the_access_in_the_page() {
         let mut tlb = FastTlb::new();
-        tlb.fill(1, false, 0x1234_5678, 0x7000_0000, 0, 0x8000_5000, 12);
+        tlb.fill(1, false, 0x1234_5678, 0x7000_0000, 0, 0x8000_5000, 12, false);
         let entry = *tlb.lookup(1, false, 0x1234_5000, 8).expect("a hit");
         assert_eq!(entry.tag, 0x1234_5000);
         assert_eq!(0x1234_5678u64.wrapping_add(entry.addend), 0x7000_0678);
@@ -357,14 +433,14 @@ mod tests {
         assert!(tlb.lookup(1, false, 0x1234_5ff7, 8).is_some());
         assert!(tlb.lookup(1, false, 0x1234_5fe9, 16).is_some());
         assert!(tlb.lookup(1, false, 0x1234_5fff, 1).is_some());
-        tlb.fill(1, false, 0x1234_6000, 0x7000_1000, 0, 0x8000_6000, 12);
+        tlb.fill(1, false, 0x1234_6000, 0x7000_1000, 0, 0x8000_6000, 12, false);
         for (va, bytes) in [(0x1234_5fff, 2), (0x1234_5ffc, 8), (0x1234_5ff8, 16)] {
             assert!(tlb.lookup(1, false, va, bytes).is_none(), "{va:#x}");
         }
         // The last page of the address space and the first: an access that
         // wraps around misses.
-        tlb.fill(1, false, u64::MAX, 0x7000_2000, 0, 0x8000_7000, 12);
-        tlb.fill(1, false, 0, 0x7000_3000, 0, 0x8000_8000, 12);
+        tlb.fill(1, false, u64::MAX, 0x7000_2000, 0, 0x8000_7000, 12, false);
+        tlb.fill(1, false, 0, 0x7000_3000, 0, 0x8000_8000, 12, false);
         assert!(tlb.lookup(1, false, u64::MAX - 7, 8).is_some());
         assert!(tlb.lookup(1, false, u64::MAX - 3, 8).is_none());
         for va in [u64::MAX, u64::MAX - 0xfff, 0x1234_6000, 0] {
@@ -390,7 +466,7 @@ mod tests {
         // The last entry of the last table is in the TLB.
         let mut tlb = FastTlb::new();
         let va = ((ENTRIES as u64 - 1) << 12) | 0x10;
-        tlb.fill(1, true, va, 0x7000_0000, 0x55, 0x9000, 12);
+        tlb.fill(1, true, va, 0x7000_0000, 0x55, 0x9000, 12, false);
         let entry = tlb.lookup(1, true, va, 8).expect("a hit") as *const Entry as usize;
         assert_eq!(entry, tlb.table(1, true) as usize + size - 32);
     }
@@ -403,11 +479,11 @@ mod tests {
             let mut tlb = FastTlb::new();
             for page in 0..pages {
                 let write = page % 2 == 1;
-                tlb.fill(1, write, page << 12, 0x1000_0000, 0x55, 0x9000, 12);
+                tlb.fill(1, write, page << 12, 0x1000_0000, 0x55, 0x9000, 12, false);
             }
-            tlb.fill(0, true, 0x1000, 0x2000_0000, 0x56, 0xa000, 12);
+            tlb.fill(0, true, 0x1000, 0x2000_0000, 0x56, 0xa000, 12, false);
             tlb.flush_page(0, u64::MAX);
-            tlb.fill(1, false, 0, 0x1000_0000, 0, 0x9000, 12);
+            tlb.fill(1, false, 0, 0x1000_0000, 0, 0x9000, 12, false);
             assert_eq!(tlb.tracking(), pages < TRACKED as u64);
             // Every write entry of the page 0x9000 goes, and only those.
             tlb.drop_writes(0x9000);
@@ -444,8 +520,8 @@ mod tests {
         let mut tlb = FastTlb::new();
         for level in 0..2 {
             for write in [false, true] {
-                tlb.fill(level, write, 0x5000, 0x10_0000, 0, 0x9000, 12);
-                tlb.fill(level, write, 0x6000, 0x20_0000, 0, 0xa000, 12);
+                tlb.fill(level, write, 0x5000, 0x10_0000, 0, 0x9000, 12, false);
+                tlb.fill(level, write, 0x6000, 0x20_0000, 0, 0xa000, 12, false);
             }
         }
         assert_eq!(tlb.len(), 8);
@@ -455,29 +531,72 @@ mod tests {
         assert!(tlb.lookup(1, true, 0x6000, 1).is_some());
         // A page of a 2 MiB mapping: the invalidation of another page of
         // that mapping drops everything.
-        tlb.fill(1, false, 0x20_0000, 0x40_0000, 0, 0x20_0000, 21);
+        tlb.fill(1, false, 0x20_0000, 0x40_0000, 0, 0x20_0000, 21, false);
         tlb.flush_page(0x201, u64::MAX);
         assert!(tlb.is_empty());
         // The large mappings are forgotten with a flush of everything.
-        tlb.fill(1, false, 0x6000, 0x20_0000, 0, 0xa000, 12);
+        tlb.fill(1, false, 0x6000, 0x20_0000, 0, 0xa000, 12, false);
         tlb.flush_page(0x201, u64::MAX);
         assert_eq!(tlb.len(), 1);
         // More larger mappings than it keeps apart: every invalidation
         // drops everything.
         for mapping in 0..(LARGE as u64 + 1) {
-            tlb.fill(0, false, 0x4000_0000 + (mapping << 21), 0x1000, 0, 0, 21);
+            tlb.fill(0, false, 0x4000_0000 + (mapping << 21), 0x1000, 0, 0, 21, false);
         }
         tlb.flush_page(0x7_0000, u64::MAX);
         assert!(tlb.is_empty());
     }
 
     #[test]
+    fn a_change_of_address_space_keeps_the_global_entries_only() {
+        // Few: the places are remembered. Many: past `TRACKED`, the tables
+        // are swept, and the places that stay are remembered again.
+        for pages in [6u64, 3 * TRACKED as u64] {
+            let mut tlb = FastTlb::new();
+            for page in 0..pages {
+                let (level, write) = ((page % 2) as usize, page % 3 == 0);
+                let global = page % 4 == 0;
+                tlb.fill(level, write, page << 12, 0x1000_0000, 0x55, 0x9000, 12, global);
+            }
+            // A global entry replaced by one that is not, and the reverse.
+            tlb.fill(0, true, 0, 0x1000_0000, 0x55, 0x9000, 12, false);
+            tlb.fill(1, false, 1 << 12, 0x1000_0000, 0, 0x9000, 12, true);
+            assert_eq!(tlb.tracking(), pages < TRACKED as u64);
+            tlb.drop_local();
+            for page in 0..pages {
+                let (level, write) = ((page % 2) as usize, page % 3 == 0);
+                let kept = page != 0 && page % 4 == 0 || page == 1;
+                assert_eq!(
+                    tlb.lookup(level, write, page << 12, 8).is_some(),
+                    kept,
+                    "page {page}"
+                );
+            }
+            let kept = (1..pages).filter(|page| page % 4 == 0).count() + 1;
+            assert_eq!(tlb.len(), kept);
+            assert_eq!(tlb.tracking(), kept <= TRACKED);
+            assert_eq!(tlb.local_drops, 1);
+            // The next drop finds them again, and a flush drops them.
+            tlb.drop_local();
+            assert_eq!(tlb.len(), kept);
+            tlb.flush();
+            assert!(tlb.is_empty());
+            for (level, write) in [(0, false), (0, true), (1, false), (1, true)] {
+                let first = tlb.table(level, write);
+                // SAFETY: the table has `ENTRIES` entries from `first`.
+                let entries = unsafe { std::slice::from_raw_parts(first, ENTRIES) };
+                assert!(entries.iter().all(|entry| *entry == NOTHING));
+            }
+        }
+    }
+
+    #[test]
     fn a_page_that_gets_code_loses_its_write_entries_only() {
         let mut tlb = FastTlb::new();
-        tlb.fill(1, false, 0x5000, 0x10_0000, 0, 0x9000, 12);
-        tlb.fill(1, true, 0x5000, 0x10_0000, 0x77, 0x9000, 12);
-        tlb.fill(0, true, 0x8000, 0x10_0000, 0x77, 0x9000, 12);
-        tlb.fill(0, true, 0x6000, 0x20_0000, 0x78, 0xa000, 12);
+        tlb.fill(1, false, 0x5000, 0x10_0000, 0, 0x9000, 12, false);
+        tlb.fill(1, true, 0x5000, 0x10_0000, 0x77, 0x9000, 12, false);
+        tlb.fill(0, true, 0x8000, 0x10_0000, 0x77, 0x9000, 12, false);
+        tlb.fill(0, true, 0x6000, 0x20_0000, 0x78, 0xa000, 12, false);
         tlb.drop_writes(0x9abc);
         assert!(tlb.lookup(1, false, 0x5000, 8).is_some());
         assert!(tlb.lookup(1, true, 0x5000, 8).is_none());

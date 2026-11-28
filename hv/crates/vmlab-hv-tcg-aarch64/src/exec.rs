@@ -640,7 +640,16 @@ impl Side {
         let level = usize::from(!self.user);
         let watch = if write { entry.watch } else { 0 };
         if let Some(fast) = self.mmu.fast_mut() {
-            fast.fill(level, write, va, entry.host, watch, entry.phys, entry.span);
+            fast.fill(
+                level,
+                write,
+                va,
+                entry.host,
+                watch,
+                entry.phys,
+                entry.span,
+                entry.global,
+            );
         }
     }
 

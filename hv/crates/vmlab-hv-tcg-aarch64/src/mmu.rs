@@ -656,8 +656,11 @@ impl Mmu {
         if !tables_only {
             self.flush();
         } else if let Some(fast) = &mut self.fast {
-            // A fast entry has no ASID, and no TLBI tells it of new tables.
-            fast.flush();
+            // A fast entry has no ASID: it holds the global entries and those
+            // of the ASID of now, and the others go (card V6). The global
+            // ones stay, as they stay in the TLB. A new base under the same
+            // ASID drops the others too, more than the TLB drops.
+            fast.drop_local();
         }
     }
 
@@ -837,8 +840,12 @@ impl Mmu {
         let asid = self.asid_of(asid);
         self.changes += 1;
         self.tlbs[regime.index()].flush_asid(asid);
-        if let Some(fast) = &mut self.fast {
-            fast.flush();
+        // The fast TLB holds no entry of another ASID that is not global
+        // (`sync`): only a TLBI of the ASID of now drops something there.
+        if asid == self.asid
+            && let Some(fast) = &mut self.fast
+        {
+            fast.drop_local();
         }
     }
 
@@ -1497,6 +1504,57 @@ mod tests {
         state.system.regs[reg::TTBR0_EL1] = ttbr0 | 3 << 48;
         mmu.sync(&state);
         assert_eq!(mmu.jump_changes(), jumps + 5);
+    }
+
+    /// Card V6: a new address space keeps the global entries of the fast
+    /// TLB, and a TLBI by ASID drops from it only what that ASID names.
+    #[test]
+    fn a_new_address_space_keeps_the_global_entries_of_the_fast_tlb() {
+        let va = 0x7f_0000_3000u64;
+        let kernel = 0xffff_0000_0010_0000u64;
+        let (_, mut state, _) = mapped(va, 0x4008_0000 | TABLE | AF | NOT_GLOBAL);
+        let mut mmu = Mmu::new(&state);
+        mmu.set_fast(true);
+        let ttbr0 = state.system.regs[reg::TTBR0_EL1] & 0xffff_ffff_ffff;
+        let fill = |mmu: &mut Mmu| {
+            let fast = mmu.fast_mut().unwrap();
+            fast.fill(0, false, va, 0x10_0000, 0, 0x4008_0000, 12, false);
+            fast.fill(1, true, va, 0x10_0000, 0x77, 0x4008_0000, 12, false);
+            fast.fill(1, false, kernel, 0x20_0000, 0, 0x4010_0000, 12, true);
+        };
+        let held = |mmu: &Mmu| {
+            let fast = mmu.fast().unwrap();
+            (
+                fast.lookup(0, false, va, 8).is_some(),
+                fast.lookup(1, true, va, 8).is_some(),
+                fast.lookup(1, false, kernel, 8).is_some(),
+            )
+        };
+        fill(&mut mmu);
+        // A process switch: another base and another ASID.
+        state.system.regs[reg::TTBR0_EL1] = (ttbr0 + 0x1000) | 8 << 48;
+        mmu.sync(&state);
+        assert_eq!(held(&mmu), (false, false, true));
+        // A new base under the same ASID drops the same.
+        fill(&mut mmu);
+        state.system.regs[reg::TTBR0_EL1] = ttbr0 | 8 << 48;
+        mmu.sync(&state);
+        assert_eq!(held(&mmu), (false, false, true));
+        // A TLBI of another ASID drops nothing, one of the ASID of now
+        // what is not global.
+        fill(&mut mmu);
+        mmu.flush_asid(Regime::El10, 7);
+        assert_eq!(held(&mmu), (true, true, true));
+        mmu.flush_asid(Regime::El10, 0x108);
+        assert_eq!(held(&mmu), (false, false, true));
+        // A TLBI of the page of a global entry drops it.
+        mmu.flush_page(Regime::El10, kernel >> 12 & TLBI_PAGE_BITS, None);
+        assert_eq!(held(&mmu), (false, false, false));
+        // A change of a control register drops everything.
+        fill(&mut mmu);
+        state.system.regs[reg::MAIR_EL1] = 0x44;
+        mmu.sync(&state);
+        assert!(mmu.fast().unwrap().is_empty());
     }
 
     #[test]
