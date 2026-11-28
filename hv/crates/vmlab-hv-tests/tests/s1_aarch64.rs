@@ -30,7 +30,13 @@ fn exec(guest: &vmlab_hv_tests::Guest, agent: &mut AgentClient, script: &str) ->
     let output = agent
         .exec(&[BUSYBOX, "sh", "-c", script], Duration::from_secs(120))
         .unwrap_or_else(|e| panic!("{script}: {e}\n{}", guest.diagnostics("exec")));
-    assert_eq!(output.exit_code, 0, "{output:?}");
+    assert_eq!(
+        output.exit_code,
+        0,
+        "{script}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     output.stdout
 }
 
@@ -176,7 +182,11 @@ fn an_emulated_aarch64_guest_mounts_a_share_and_runs_a_program_from_it() {
     exec(
         &guest,
         &mut agent,
-        &format!("{BUSYBOX} mkdir -p /mnt/work && {BUSYBOX} mount -t virtiofs work /mnt/work"),
+        &format!(
+            "{BUSYBOX} mkdir -p /mnt/work && {BUSYBOX} mount -t virtiofs work /mnt/work || \
+             {{ {BUSYBOX} dmesg | {BUSYBOX} tail -40; {BUSYBOX} grep . \
+             /sys/bus/pci/devices/*/device /sys/bus/virtio/devices/*/device; exit 1; }}"
+        ),
     );
     assert_eq!(
         exec(
