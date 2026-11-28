@@ -1335,7 +1335,9 @@ The bench runs QEMU with `-cpu max` and vmlab-hv with its own set, the ID
 registers of a `cortex-a53` (3d) with AES, SHA-1, SHA-256 and CRC32 and
 without LSE. So the guest can choose other code on the two sides (the
 atomics of the kernel, the string functions of glibc). The same Debian
-image and the same commands run on both.
+image and the same commands run on both. P6 (card #1219) measures QEMU
+with `-cpu cortex-a53` beside `-cpu max`: the CPU model explains none of
+the gap, because QEMU is faster with `cortex-a53`.
 
 **J9a. W1 again, on the JIT.** The sampler of W1 with three changes
 (`measure/ipraw.c`): it samples only the vCPU threads (`IPCOMM=vcpu-`), it
@@ -2437,6 +2439,82 @@ the median of 3, s:
   for a device on a loaded host: seconds a boot in T3-D4c, where a broadcast
   waited as long as the slowest device access of another CPU.
 
+### P6, measured by card #1219
+
+Helios, 2026-11-28, *measured*. QEMU 11.1.3 TCG with three CPU models
+(`bench/run.py --qemu-cpu`): `max` (vmlab's argv, the baseline of every
+row above), `cortex-a53` (an Armv8.0 CPU, the model whose ID registers
+vmlab-hv presents, 3d), and `max,pauth=off` (`max` without pointer
+authentication, to split the difference). Debian 13 template
+13.20261001.0, AAVMF 2026.08+ds-2 (`guest/fetch-firmware.sh`), the pin of
+card #1205 (whole cores, their SMT siblings reserved). The models ran in
+turn: round 1 (commit `f052f7b4`) is the full suite in the order max, a53,
+a53, max at each vCPU count; round 2 (`f9e3c2a5`) is the boot suite in the
+order max, a53, max without PAuth, max without PAuth, a53, max, and the flat
+images in turn at 10 repeats. Each VM run had 3 repeats. Round 1 ran at a
+load average of 5 to 20 of 32 threads (14 to 20 in its first run), and
+round 2 at 4 to 10. The
+rows hold the load of each repeat (0.5 to 2.2 busy CPUs on the reserved
+cores, 2.1 to 9.8 on the others). The rows are in `bench/history/aarch64.jsonl`
+with the note "card #1219 P6". No QEMU source was read (X1). The guest's
+view, from its kernel log: `max` gives the kernel PAN, LSE, BTI, address
+and generic authentication (the IMP DEF algorithm) and 34 other "CPU
+features" lines. `max,pauth=off` gives the same list without the two
+authentication lines. `cortex-a53` gives CRC32, 32-bit EL0 and EL1, and
+erratum 845719.
+
+The medians of all repeats of both rounds, with the range. The vmlab-hv
+column is the newest row of the same suite, not run beside these: N10c
+"after" for the D2 suite, J14's row (`ebdbfd08`) for the flat images.
+"Of QEMU" is QEMU's time over ours, or our MIPS over QEMU's.
+
+| Row | vCPUs | Repeats a model | QEMU `max` | QEMU `cortex-a53` | QEMU `max,pauth=off` | `max` over `cortex-a53` | vmlab-hv | Of QEMU `max` | Of QEMU `cortex-a53` |
+|---|---|---|---|---|---|---|---|---|---|
+| Boot to agent ready, s | 1 | 12, 6 without PAuth | 28.29 (26.48 to 76.25) | 24.23 (21.67 to 56.29) | 23.64 (22.12 to 24.79) | 1.17 times | 68.25 | 41 % | 36 % |
+| Boot to agent ready, s | 4 | 12, 6 without PAuth | 17.97 (17.41 to 23.11) | 16.22 (16.17 to 22.01) | 16.68 (16.16 to 37.96) | 1.11 times | 47.13 | 38 % | 34 % |
+| `sha256_256M`, s | 1 | 6 | 2.14 (2.10 to 2.19) | 2.04 (2.00 to 2.45) | | 1.05 times | 3.15 | 68 % | 65 % |
+| `sha256_256M`, s | 4 | 6 | 2.08 (2.05 to 2.14) | 2.05 (1.97 to 2.13) | | 1.02 times | 2.10 | 99 % | 97 % |
+| `xz_9_32M`, s | 1 | 6 | 2.82 (2.78 to 2.87) | 2.73 (2.64 to 2.93) | | 1.03 times | 3.29 | 86 % | 83 % |
+| `xz_9_32M`, s | 4 | 6 | 2.80 (2.73 to 2.86) | 2.76 (2.64 to 2.83) | | 1.02 times | 3.26 | 86 % | 84 % |
+| CoreMark mix, flat, MIPS | 1 | 26, 20 without PAuth | 2,424.5 (2,299 to 2,552) | 2,584.5 (2,345 to 2,830) | 2,460.0 (2,346 to 2,598) | 1.07 times | 2,641.1 | 109 % | 102 % |
+| Scalar loop, flat, MIPS | 1 | 26, 20 without PAuth | 3,031.5 (2,770 to 3,221) | 3,198.0 (2,948 to 3,379) | 3,013.0 (2,856 to 3,173) | 1.05 times | 9,096.2 | 300 % | 284 % |
+
+- **P6a. The CPU model explains none of the gap.** The card assumed that
+  `-cpu max` lets the guest choose faster code on QEMU. The measurement is
+  the opposite: QEMU runs every row faster with `cortex-a53`. Compared like
+  for like, the gap is larger: the boot at one vCPU is 44.0 s behind
+  instead of 40.0 s (36 % of QEMU instead of 41 %), at four vCPUs 30.9 s
+  instead of 29.2 s (34 % instead of 38 %). `sha256` and `xz` lose 1 to 3
+  points, and CoreMark goes from 109 % to 102 %.
+- **P6b. On the boot, the difference is pointer authentication.** Without
+  PAuth, `max` boots in 23.64 s at one vCPU and 16.68 s at four, within 3 %
+  of `cortex-a53`, with PAN, LSE, BTI and the rest of `max` still on. So
+  the 4.1 s and 1.7 s go with PAuth. The basis of an explanation, not
+  measured: they are the cost of the guest's `PAC*` and `AUT*`
+  instructions in QEMU's emulation. Our ID registers offer no PAuth, so our
+  guest does not run them.
+- **P6c. The flat images run the same code on every model** (`-march=armv8-a`,
+  no PAuth, no LSE), and QEMU is still 5 to 7 % faster with `cortex-a53`.
+  `max,pauth=off` is as slow as `max` there. What in QEMU costs that time
+  is not known (X1: no source read).
+- **P6d. For V8 (PAN and LSE).** This measurement does not say what PAN and
+  LSE would gain or cost on vmlab-hv. It says that on QEMU a guest with
+  PAN, LSE and the rest of `max`, without PAuth, boots within 3 % of a
+  `cortex-a53` guest. So the QEMU rows give no reason to expect a gain from
+  offering them, and the decision needs a measurement on our side (N7 is
+  the profile at four vCPUs).
+- **P6e. A guest-side stall in some boots, on more than one model.** 4 of
+  the 60 boots took 37.96 to 76.25 s (two `max`, one `cortex-a53`, one
+  `max,pauth=off`). In those the guest's own clock advances 16.4 to 42.8 s
+  between the flush of `systemd-journald` and the first AppArmor profile.
+  In the other 56 boots those two lines are 1.3 to 7.2 s apart. So the
+  guest waits there, and the medians above are not moved by it. Round 1's
+  first `max` run at one vCPU had two such boots, at the highest load.
+- **P6f. The baseline does not change.** The rows above against QEMU keep
+  `max`. `bench-check` and `bench-report` keep each model apart, and a
+  vmlab-hv row's `qemu_baseline` comes from `max` (or `cortex-a53` for the
+  flat images, as before).
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -2629,6 +2707,19 @@ grep -o "superblocks: .*" bench/run/*/stderr.log
 # J14i: K2 with joins, K1 for the branch group
 cargo test --release -p vmlab-hv-tcg-aarch64 --test jit -- superblocks
 VMLAB_HV_JIT=1 just tcg-a64-lockstep branch 100000 1
+```
+
+P6 (card #1219), the models in turn, the pin of #1205 (no `--cpus` for the
+VM rows), with the firmware of `guest/fetch-firmware.sh aarch64`:
+
+```sh
+export VMLAB_HV_FIRMWARE_DIR_AARCH64=$PWD/../guest/dist/firmware/aarch64
+python3 bench/run.py --backend qemu --arch aarch64 --vcpus 1 --repeats 3 --qemu-cpu max    # then cortex-a53, ...
+python3 bench/run.py --backend qemu --arch aarch64 --vcpus 4 --repeats 3 --suite boot --qemu-cpu max,pauth=off
+python3 bench/run.py --backend qemu --arch aarch64 --guest flat-a64 --vcpus 1 --repeats 10 \
+  --cpus "$(python3 -c 'import sys; sys.path.insert(0, "bench"); import lib; print(lib.reserve_cores(1)[0])')" \
+  --qemu-cpu cortex-a53
+# the guest's features: grep "CPU features" in serial.log of a run kept with --keep
 ```
 
 T3-D1 (card #1208), the same firmware, one tree and one target directory a side:
