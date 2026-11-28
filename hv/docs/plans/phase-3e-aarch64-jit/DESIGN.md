@@ -3313,6 +3313,60 @@ The QEMU baselines are those of the history (card #1208): boot 41.6 and
 20.18 s, `sha256` 2.12 and 2.11 s, `xz` 2.89 and 2.81 s.
 
 
+### P1-D, measured by card #1220: guest memory accesses without a reference count
+
+Helios, 2026-11-28, *measured*, the release build of `vmlab-hv`, the full
+suite (`--suite full`, Debian 13 template 13.20261001.0: boot, `sha256`,
+`xz`), 3 repeats a run, the pin of card #1205, the firmware of card #1217.
+Before is `bbfcffda` (`next`). After is `94a64d28`, whose code is that of
+the card. Three rounds, each a run of each side at 1 and at 4 vCPUs: the
+order before, after in rounds 1 and 2, after, before in round 3. The rows
+are in `bench/history/aarch64.jsonl` with the note "card #1220 P5", each
+with its host load. Other cards ran builds and VMs at the same time: a load
+average of 6.1 to 15.0 at the starts, 0.6 to 3.9 busy CPUs on the reserved
+cores and 4.0 to 10.6 on the others; 3 of the 12 runs chose their cores
+`loaded`. No QEMU source was read (X1).
+
+- **P1-Da. What was built.** `Shared` serves the per-access paths itself
+  (`ram`, `is_rom`, `touches_ram`, `read`, `write`,
+  `reservation_generation`, `device_read`, `device_write`). `GuestBus::split`
+  borrows `&Shared` beside a `Tally`, the mutable borrows of its own counts
+  (`own`, `ended`, `device`), so `write`, `write_device`, `load_reserved`,
+  `store_conditional`, `watch_code` and `compare_and_store` take no
+  reference on the `Arc` and drop none. `transaction_lock` still clones the
+  inner `Arc` of the lock: it is the return type of the `Memory` trait, and
+  only the exclusive paths call it. Sources read: `guest_bus.rs` and the
+  callers of `Memory` in `exec.rs` and in `vmlab-hv-tcg`.
+- **P1-Db. Tests.** No behaviour changed and no test was added. The
+  existing tests, those of `guest_bus.rs` and `emulated_tests.rs` among
+  them, pass in `just ci::check` (5,272 passed, 0 failed).
+- **P1-Dc. The verdict.** The card estimated 1 to 3 % at four vCPUs, and
+  P1a a boot 1.02 to 1.05 times and `sha256` 1.05 to 1.2 times. Measured,
+  the median of the 9 samples of each side: the boot 0.96 times at one vCPU
+  and 0.98 times at four, `sha256` 1.08 and 1.01 times, `xz` 1.04 and 1.01
+  times. Each difference is smaller than the spread of the runs of one side
+  at this load (boot samples 36 to 72 s at one vCPU and 28 to 43 s at four,
+  in both sides), so this host at this load shows no gain and no loss. The
+  profile of P1 was not taken again. No bar applies (Q4).
+
+The rows, the median of 3 (the samples in brackets), s, and the load
+average (1 min) at the start of the run:
+
+| Row | Round | Before | After | Load before, after |
+|---|---|---|---|---|
+| Boot to agent ready, 1 vCPU | 1 | 50.95 (56.40, 37.19, 50.95) | 40.34 (72.21, 36.29, 40.34) | 10.8, 13.7 |
+| Boot to agent ready, 1 vCPU | 2 | 38.47 (40.18, 38.26, 38.47) | 42.07 (42.07, 42.94, 41.73) | 6.9, 6.1 |
+| Boot to agent ready, 1 vCPU | 3 | 40.63 (40.76, 40.63, 39.12) | 40.24 (40.24, 42.45, 37.76) | 9.3, 15.0 |
+| `sha256`, 1 vCPU, rounds 1 to 3 | | 2.16, 2.15, 2.30 | 2.25, 2.00, 1.96 | |
+| `xz`, 1 vCPU, rounds 1 to 3 | | 2.39, 2.22, 2.36 | 2.30, 2.24, 2.23 | |
+| Boot MIPS, 1 vCPU, rounds 1 to 3 | | 353.5, 466.2, 441.6 | 453.1, 427.1, 453.3 | |
+| Boot to agent ready, 4 vCPUs | 1 | 29.17 (28.87, 29.17, 30.53) | 28.42 (29.55, 28.42, 28.27) | 10.0, 9.6 |
+| Boot to agent ready, 4 vCPUs | 2 | 29.21 (29.05, 29.21, 42.63) | 40.14 (40.14, 28.57, 40.37) | 7.0, 11.7 |
+| Boot to agent ready, 4 vCPUs | 3 | 29.54 (29.54, 28.26, 29.57) | 32.22 (32.22, 41.21, 29.76) | 9.9, 11.1 |
+| `sha256`, 4 vCPUs, rounds 1 to 3 | | 1.82, 1.81, 1.79 | 1.79, 1.85, 1.83 | |
+| `xz`, 4 vCPUs, rounds 1 to 3 | | 2.32, 2.31, 2.31 | 2.30, 2.28, 2.27 | |
+| Boot MIPS, 4 vCPUs, rounds 1 to 3 | | 662.7, 664.8, 654.5 | 678.4, 500.5, 621.5 | |
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
