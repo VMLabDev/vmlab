@@ -4726,6 +4726,44 @@ async fn a_container_without_kvm_is_refused_before_launch_on_either_hypervisor()
     }
 }
 
+/// An aarch64 VM vmlab-hv refuses has no QEMU fallback (§22.5): new or
+/// existing on QEMU it selects vmlab-hv, and its start refuses it before
+/// anything is spawned, naming each device the `virt` machine lacks.
+#[tokio::test]
+async fn an_aarch64_vm_vmlab_hv_refuses_fails_its_start_naming_the_device() {
+    use crate::config::hypervisor::{HypervisorDefaults, HypervisorKind, SelectionSource};
+    let dirs = Dirs::new();
+    let (arm, hv) = vm(
+        &dirs,
+        r#"vm "arm" { template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 1GiB usb = true tpm = true }"#,
+        on_vmlab_hv(Script::healthy()),
+    );
+    for existing in [None, Some(HypervisorKind::Qemu)] {
+        let picked = HypervisorDefaults::default().select(
+            crate::config::model::MachineCfg::Vm(&arm.cfg),
+            &kvm_host(),
+            Some(&arm.template().resolved),
+            existing,
+        );
+        assert_eq!(
+            (picked.kind, picked.fallback_reason),
+            (HypervisorKind::Vmlab, None)
+        );
+    }
+    let arm = arm.with_selection_source(SelectionSource::QemuMigration);
+    let said = |e: anyhow::Error| {
+        let message = format!("{e:#}");
+        for word in ["`usb = true`", "a TPM", "`virt`", "vm \"arm\""] {
+            assert!(message.contains(word), "{word}: {message}");
+        }
+    };
+    said(arm.check_host_config().unwrap_err());
+    let (cbs, _observed) = callbacks();
+    said(start_vm(&arm, cbs).await.unwrap_err());
+    assert_eq!(hv.starts(), 0);
+    assert_eq!(arm.state().await, PowerState::Stopped);
+}
+
 #[tokio::test]
 async fn apple_smc_without_a_host_key_is_refused_before_launch() {
     let dirs = Dirs::new();
