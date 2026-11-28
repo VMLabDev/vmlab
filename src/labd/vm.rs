@@ -709,10 +709,6 @@ impl VmInstance {
         self.template().first_boot.is_some() && !self.dirs.firstboot_sentinel().exists()
     }
 
-    /// One of the running machine's capabilities (ADR-0020). Absent both
-    /// when the VM is stopped and when its hypervisor does not report it —
-    /// an in-memory adapter reports none — and either way the answer is that
-    /// it is not running, as it always has been.
     /// Whether this VM is vmlab-hv's emulated aarch64 `virt` machine (§22,
     /// phase 3d), which has no display, input devices or virtio-fs yet.
     fn headless_virt(&self) -> bool {
@@ -720,6 +716,10 @@ impl VmInstance {
             && crate::config::hypervisor::emulated_guest(&self.template().resolved.arch)
     }
 
+    /// One of the running machine's capabilities (ADR-0020). Absent both
+    /// when the VM is stopped and when its hypervisor does not report it —
+    /// an in-memory adapter reports none — and either way the answer is that
+    /// it is not running, as it always has been.
     async fn capability<T>(&self, pick: impl FnOnce(&dyn Control) -> Option<T>) -> Result<T> {
         self.control
             .lock()
@@ -2573,6 +2573,16 @@ impl super::machine::Machine for VmInstance {
         if self.cfg.cdrom.is_none() {
             return Err(super::machine::no_install_cdrom(&self.cfg.name));
         }
+        // `virt` has no CD-ROM drive: the install medium is a read-only
+        // virtio disk on either hypervisor, which nothing can eject.
+        if self.headless_virt() {
+            bail!(
+                "vm \"{}\": the install CD-ROM of an aarch64 VM is a read-only virtio disk, \
+                 which cannot be ejected (PRD §22.5); remove `cdrom` from the vm block and \
+                 restart it instead",
+                self.cfg.name
+            );
+        }
         self.capability(|c| c.media())
             .await?
             .eject_install_cdrom()
@@ -2748,6 +2758,9 @@ impl super::machine::Machine for VmInstance {
         let mut warnings: Vec<String> = qemu::secure_boot_store_unprotected(&t.resolved)
             .into_iter()
             .collect();
+        if self.headless_virt() {
+            warnings.extend(crate::config::hypervisor::virt_display_dropped(&t.resolved));
+        }
         let kvm = qemu::kvm_usable(&t.resolved.arch);
         let Ok(plan) = qemu::plan_accel(&t.resolved, kvm) else {
             return warnings;

@@ -4857,3 +4857,45 @@ async fn the_stop_ladder_powers_down_over_vmlab_hv() {
     assert_eq!(observed.exit().await.reason, StopReason::Requested);
     assert_eq!(vm.state().await, PowerState::Stopped);
 }
+
+/// Phase 3d (§22.5): an aarch64 VM on vmlab-hv is the headless `virt`
+/// machine. It reports no display, so every screen verb says so; it answers
+/// for its own virtio-fs with none, so the share plan puts its shares on
+/// SMB; it takes no TAP queues; and `up` says what the dropped display device
+/// takes away. An x86 VM on vmlab-hv keeps all of them.
+#[test]
+fn an_aarch64_vm_on_vmlab_hv_is_headless_and_shares_over_smb() {
+    let dirs = Dirs::new();
+    let (arm, _hv) = vm(
+        &dirs,
+        r#"vm "arm" { template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 1GiB }"#,
+        on_vmlab_hv(Script::healthy()),
+    );
+    let m: Arc<dyn Machine> = arm.clone();
+    assert!(m.clone().display().is_none());
+    assert!(m.virtiofs_in_process());
+    assert!(m.virtiofsd().is_none());
+    assert_eq!(
+        super::share_plan::HostVirtiofsd::of(m.virtiofsd().as_ref()),
+        super::share_plan::HostVirtiofsd::Absent
+    );
+    assert!(!m.takes_tap_fds());
+    let warnings = m.launch_warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("runs headless") && w.contains("virtio-gpu-pci")),
+        "{warnings:?}"
+    );
+
+    let other = Dirs::new();
+    let (pc, _hv) = vm(
+        &other,
+        r#"vm "pc" { template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 1GiB }"#,
+        on_vmlab_hv(Script::healthy()),
+    );
+    let m: Arc<dyn Machine> = pc;
+    assert!(m.clone().display().is_some());
+    assert!(m.takes_tap_fds());
+    assert!(m.launch_warnings().iter().all(|w| !w.contains("runs headless")));
+}

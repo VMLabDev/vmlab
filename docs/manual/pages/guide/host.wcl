@@ -522,7 +522,10 @@ virtio disks. Online and offline snapshots work.
 The machine has no display, input devices or USB yet. The guest runs
 headless: read its serial console with `vmlab logs`, and reach it with
 `vmlab exec` and `vmlab shell`. `vm screenshot`, the other screen and input
-verbs, and `vmlab record` say the machine has no display. Shares go over SMB,
+verbs, and `vmlab record` say the machine has no display. `vmlab up` warns
+about it for a VM whose profile names a display device, because the same VM
+had a screen on QEMU. The install CD-ROM is a read-only virtio disk, which
+cannot be ejected. Shares go over SMB,
 because the machine has no virtio-fs, and NICs take the stream socket, not
 the kernel fast path.
 

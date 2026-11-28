@@ -3135,7 +3135,11 @@ setting, and not as a product path. riscv64 stays on QEMU until phase 3b.
   guest runs headless on its serial console (`vmlab logs`), and is reached
   with `vmlab exec` and `vmlab shell`. `vm screenshot`, `vm type` and the
   other screen and input verbs, `vmlab record` and `--record` say the machine
-  has no display, and `machine.capabilities` reports none.
+  has no display, and `machine.capabilities` reports none. Because a VM that
+  ran on QEMU had a screen, `up` and `vm start` warn, for a VM whose hardware
+  names a display device, that it runs headless, what that takes away, and
+  that `hypervisor = "qemu"` keeps a screen. The install CD-ROM is a read-only
+  virtio disk on either hypervisor, and an eject of it is refused by name.
 - **Refusals.** vmlab-hv refuses, for an aarch64 VM: a host that is not
   x86_64; `accel = "kvm"`; `qemu_args`; a machine other than `virt`; firmware
   other than UEFI; more than eight vCPUs or less than 64 MiB; a `gpu {}`

@@ -415,6 +415,24 @@ fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
     }
 }
 
+/// The line `up` and `vm start` print for an aarch64 VM on vmlab-hv whose
+/// profile, template or block names a display device: the emulated `virt`
+/// machine leaves it out rather than refusing it (§22.5), so the VM loses
+/// the screen it had on QEMU. `None` for any other VM.
+pub fn virt_display_dropped(h: &ResolvedVm) -> Option<String> {
+    let device = h.display_device.as_deref()?;
+    emulated_guest(&h.arch).then(|| {
+        format!(
+            "vm \"{}\": runs headless on vmlab-hv's emulated aarch64 `virt` machine, which \
+             has no display yet (PRD §22.5) — its display device `{device}` is left out, so \
+             screenshots, keyboard and mouse input, `vmlab record`, `vmlab console` and \
+             `gui = true` do not work; read its serial console with `vmlab logs`, or set \
+             hypervisor = \"qemu\" to keep a screen",
+            h.name
+        )
+    })
+}
+
 /// The resolved launch's hardware refusals, including attachments not carried
 /// by [`ResolvedVm`]. The adapter checks these before it spawns, using the
 /// same delivery gates as configuration validation and the lab daemon.
@@ -1470,6 +1488,29 @@ mod tests {
                 .kind,
             HypervisorKind::Qemu
         );
+    }
+
+    /// An aarch64 VM whose profile names a display device is told it runs
+    /// headless; an x86 VM, and an aarch64 one with no display device, are not.
+    #[test]
+    fn a_dropped_virt_display_is_said() {
+        let file = lab(r#"lab "l" {
+  vm "arm" { template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 1GiB }
+  vm "pc" { template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 1GiB }
+}"#);
+        let resolved = |name: &str| {
+            let crate::config::model::MachineCfg::Vm(vm) = file.lab.machine(name).unwrap() else {
+                unreachable!()
+            };
+            crate::qemu::resolve_vm(vm, None, &crate::profiles::ProfileSet::shipped().unwrap())
+                .unwrap()
+        };
+        let mut arm = resolved("arm");
+        let said = virt_display_dropped(&arm).expect("said");
+        assert!(said.contains("virtio-gpu-pci") && said.contains("hypervisor = \"qemu\""), "{said}");
+        assert_eq!(virt_display_dropped(&resolved("pc")), None);
+        arm.display_device = None;
+        assert_eq!(virt_display_dropped(&arm), None);
     }
 
     /// The emulated `virt` machine runs a modern aarch64 Linux VM headless
