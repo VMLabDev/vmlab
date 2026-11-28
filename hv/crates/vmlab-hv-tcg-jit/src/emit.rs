@@ -1607,7 +1607,8 @@ impl Emitter<'_> {
         // first: an access that crosses into the next page misses.
         self.asm.mov(RDX, Rm::Reg(RAX));
         if bytes > 1 {
-            self.asm.alu_imm(Alu::Add, Rm::Reg(RDX), i32::from(bytes) - 1);
+            self.asm
+                .alu_imm(Alu::Add, Rm::Reg(RDX), i32::from(bytes) - 1);
         }
         self.asm.alu_imm(Alu::And, Rm::Reg(RDX), !0xfff);
         self.asm.alu(Alu::Cmp, RDX, Rm::Mem(RCX, TAG));
