@@ -18,8 +18,9 @@ use crate::qemu::ResolvedVm;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HypervisorKind {
-    /// QEMU, driven over QMP: aarch64 and riscv64 guests. It runs no x86
-    /// guest (PRD §22).
+    /// QEMU, driven over QMP: riscv64 guests, and an aarch64 guest that
+    /// vmlab-hv refuses or a setting puts here to troubleshoot. It runs no
+    /// x86 guest (PRD §22).
     #[default]
     Qemu,
     /// `vmlab-hv`, driven over its own control protocol.
@@ -52,8 +53,8 @@ impl std::fmt::Display for HypervisorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HypervisorDefaults {
     pub container: Option<HypervisorKind>,
-    /// `None` selects vmlab-hv for every x86 VM, and for a VM of another
-    /// architecture QEMU.
+    /// `None` selects vmlab-hv for every x86 VM and for an aarch64 VM it can
+    /// run, and QEMU for any other.
     pub vm: Option<HypervisorKind>,
 }
 
@@ -66,7 +67,8 @@ pub enum SelectionSource {
     HostDefault,
     /// The identity persisted with the machine's disks.
     Existing,
-    /// An existing x86 QEMU machine moving to vmlab-hv at its next start.
+    /// An existing QEMU machine moving to vmlab-hv at its next start: every
+    /// x86 one, and an aarch64 one vmlab-hv refuses nothing.
     QemuMigration,
     /// Automatic selection: vmlab-hv for an x86 guest, else vmlab-hv unless
     /// [`vmlab_refusals`] names a reason.
@@ -82,9 +84,10 @@ pub struct HypervisorSelection {
 
 impl HypervisorDefaults {
     /// Explicit settings win over persisted identity. Only automatic
-    /// selection of a guest that is not x86 falls back to QEMU; an x86 guest
-    /// always selects vmlab-hv unless a setting names QEMU, which
-    /// [`qemu_x86_refusals`] then refuses.
+    /// selection of a guest that is not x86 falls back to QEMU — an aarch64
+    /// guest when [`vmlab_refusals`] names a reason, a riscv64 guest always;
+    /// an x86 guest always selects vmlab-hv unless a setting names QEMU,
+    /// which [`qemu_x86_refusals`] then refuses.
     pub fn select(
         &self,
         machine: MachineCfg<'_>,
@@ -97,15 +100,35 @@ impl HypervisorDefaults {
             MachineCfg::Container(c) => (c.hypervisor, self.container),
         };
         let explicit = own.or(default);
-        if explicit.is_none()
-            && existing == Some(HypervisorKind::Qemu)
-            && x86_guest(&guest_arch(machine, host, hardware))
-        {
-            return HypervisorSelection {
-                kind: HypervisorKind::Vmlab,
-                source: SelectionSource::QemuMigration,
-                fallback_reason: None,
+        let arch = guest_arch(machine, host, hardware);
+        if explicit.is_none() && existing == Some(HypervisorKind::Qemu) {
+            // An x86 machine moves unconditionally: QEMU runs none. An
+            // aarch64 one moves when vmlab-hv runs everything it asks for,
+            // and otherwise stays on QEMU, saying why (PRD §22).
+            let emulated = matches!(machine, MachineCfg::Vm(_)) && emulated_guest(&arch);
+            let why = if emulated {
+                vmlab_refusals(machine, host, hardware)
+            } else {
+                Vec::new()
             };
+            if x86_guest(&arch) || (emulated && why.is_empty()) {
+                return HypervisorSelection {
+                    kind: HypervisorKind::Vmlab,
+                    source: SelectionSource::QemuMigration,
+                    fallback_reason: None,
+                };
+            }
+            if !why.is_empty() {
+                return HypervisorSelection {
+                    kind: HypervisorKind::Qemu,
+                    source: SelectionSource::Existing,
+                    fallback_reason: Some(format!(
+                        "{}: keeping existing QEMU machine: {}",
+                        machine.name(),
+                        why.join("; ")
+                    )),
+                };
+            }
         }
         if let Some(kind) = explicit.or(existing) {
             return HypervisorSelection {
@@ -122,7 +145,7 @@ impl HypervisorDefaults {
         // An x86 guest has no fallback: vmlab-hv is its only hypervisor, so
         // what vmlab-hv refuses is an error, said by validation and again by
         // the daemon. Another architecture falls back to QEMU.
-        let why = if x86_guest(&guest_arch(machine, host, hardware)) {
+        let why = if x86_guest(&arch) {
             Vec::new()
         } else {
             vmlab_refusals(machine, host, hardware)
@@ -158,8 +181,21 @@ impl HostFacts {
     }
 }
 
-/// The one architecture `vmlab-hv` runs today.
-const VMLAB_ARCH: &str = "x86_64";
+/// The host architecture `vmlab-hv` runs on: x86_64, where it runs x86
+/// guests under KVM and aarch64 guests on its emulator (phase 3d).
+const VMLAB_HOST_ARCH: &str = "x86_64";
+
+/// The vCPUs the emulated `virt` machine's GICv2 takes at most.
+const VIRT_MAX_VCPUS: u32 = 8;
+
+/// The least memory vmlab-hv builds a `virt` machine with.
+const VIRT_MIN_MEMORY: u64 = 64 << 20;
+
+/// Whether vmlab-hv runs a guest of `arch` on its own emulator rather than
+/// under KVM: aarch64, since phase 3d (PRD §22).
+pub fn emulated_guest(arch: &str) -> bool {
+    crate::qemu::qemu_arch(arch) == "aarch64"
+}
 
 // Flip each flag only once `hv/` delivers that sub-phase (its acceptance and
 // hwref tests pass in-tree), one edit per sub-phase.
@@ -223,12 +259,22 @@ fn vm_refusals(
 ) -> Vec<String> {
     let name = &vm.name;
     let mut why = Vec::new();
-    if host.arch != VMLAB_ARCH {
+    let arch = hardware
+        .map(|h| crate::qemu::qemu_arch(&h.arch).to_string())
+        .or_else(|| crate::qemu::resolve::vm_arch(vm).map(|a| crate::qemu::qemu_arch(&a).into()));
+    let emulated = arch.as_deref().is_some_and(emulated_guest);
+    if host.arch != VMLAB_HOST_ARCH {
         why.push(
             if x86_guest(&guest_arch(MachineCfg::Vm(vm), host, hardware)) {
                 format!(
                     "vm \"{name}\": KVM on an x86_64 host is required — x86 guests run on \
                  vmlab-hv only, and this host is {} (PRD §22)",
+                    host.arch
+                )
+            } else if emulated {
+                format!(
+                    "vm \"{name}\": vmlab-hv emulates an aarch64 guest on an x86_64 host only, \
+                     and this host is {} (PRD §22) — use hypervisor = \"qemu\"",
                     host.arch
                 )
             } else {
@@ -237,22 +283,35 @@ fn vm_refusals(
         );
     }
     if !vm.qemu_args.is_empty() {
-        why.push(qemu_args_refusal(name));
+        why.push(if emulated {
+            format!(
+                "vm \"{name}\": `qemu_args` is QEMU's own argv, and vmlab-hv has none (PRD §22, \
+                 HV-D16) — remove it and declare the hardware with the vm block's own keys, \
+                 or set hypervisor = \"qemu\" to troubleshoot on QEMU"
+            )
+        } else {
+            qemu_args_refusal(name)
+        });
     }
-    if vm.accel == Some(AccelMode::Tcg) {
+    if emulated {
+        if vm.accel == Some(AccelMode::Kvm) {
+            why.push(format!(
+                "vm \"{name}\": accel = \"kvm\" — vmlab-hv runs an aarch64 guest on its own \
+                 emulator, not under KVM (PRD §22); remove `accel`"
+            ));
+        }
+    } else if vm.accel == Some(AccelMode::Tcg) {
         why.push(format!(
             "vm \"{name}\": accel = \"tcg\" — x86 guests run on vmlab-hv under KVM only, \
              and it has no emulation until phase 3 (PRD §22); remove `accel`"
         ));
     }
-    let arch = hardware
-        .map(|h| crate::qemu::qemu_arch(&h.arch).to_string())
-        .or_else(|| crate::qemu::resolve::vm_arch(vm).map(|a| crate::qemu::qemu_arch(&a).into()));
     if let Some(arch) = &arch
-        && arch != VMLAB_ARCH
+        && arch != VMLAB_HOST_ARCH
+        && !emulated
     {
         why.push(arch_refusal("vm", name, arch));
-    } else if !host.kvm && vm.accel != Some(AccelMode::Tcg) {
+    } else if !emulated && !host.kvm && vm.accel != Some(AccelMode::Tcg) {
         why.push(kvm_required("vm", name));
     }
     let has_floppy = vm.floppy.is_some()
@@ -260,6 +319,18 @@ fn vm_refusals(
             .media
             .iter()
             .any(|m| m.kind == crate::config::model::MediaKind::Floppy);
+    if emulated {
+        if has_floppy {
+            why.push(format!(
+                "vm \"{name}\": a floppy drive is x86 hardware, and vmlab-hv's aarch64 `virt` \
+                 machine has none (PRD §22); attach the files on a CD-ROM"
+            ));
+        }
+        if let Some(h) = hardware {
+            virt_hardware_refusals(name, h, &mut why);
+        }
+        return why;
+    }
     why.extend(vm_hardware_refusals(
         name,
         hardware,
@@ -270,6 +341,70 @@ fn vm_refusals(
     why
 }
 
+/// What an aarch64 guest's resolved hardware asks for that vmlab-hv's
+/// emulated `virt` machine (phase 3d) does not present: a GICv2 machine of
+/// one to eight vCPUs on AAVMF, with virtio-blk disks and CD-ROMs, virtio-net
+/// NICs and the agent's virtio-serial port. It has no display, input, USB,
+/// TPM, sound or virtio-fs yet. A display device the profile names is left
+/// out rather than refused: the guest runs headless, on its serial console.
+fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
+    use crate::profiles::AgentTransport;
+    let mut refuse = |what: &str, fix: &str| {
+        why.push(format!(
+            "vm \"{name}\": {what} — vmlab-hv's emulated aarch64 `virt` machine does not \
+             present it yet (PRD §22); {fix}"
+        ));
+    };
+    if h.machine != "virt" {
+        refuse(&format!("machine = \"{}\"", h.machine), "use the `virt` machine");
+    }
+    if h.firmware != Some(crate::profiles::FirmwareKind::Ovmf) {
+        refuse("a firmware other than UEFI (AAVMF)", "use UEFI firmware");
+    }
+    if !(1..=VIRT_MAX_VCPUS).contains(&h.cpus) {
+        refuse(
+            &format!("{} vCPUs (its GICv2 takes 1 to {VIRT_MAX_VCPUS})", h.cpus),
+            &format!("set cpus to at most {VIRT_MAX_VCPUS}"),
+        );
+    }
+    if h.memory < VIRT_MIN_MEMORY {
+        refuse(
+            &format!("{} MiB of memory", h.memory >> 20),
+            "give it at least 64MiB",
+        );
+    }
+    if h.gpu.is_some() {
+        refuse("a `gpu {}` block", "remove it");
+    }
+    if h.usb {
+        refuse("`usb = true` (an xHCI for passthrough)", "set `usb = false`");
+    }
+    if h.tpm {
+        refuse("a TPM", "set `tpm = false`");
+    }
+    if h.audio {
+        refuse("a sound card (`audio`)", "remove `audio`");
+    }
+    if h.cpu_model.is_some() {
+        refuse("a `cpu_model`", "remove it; the emulated CPU is Armv8.0-A");
+    }
+    if !h.nic_model.starts_with("virtio-net") {
+        refuse(
+            &format!("nic_model `{}`", h.nic_model),
+            "use a virtio-net NIC",
+        );
+    }
+    if h.agent_transport == AgentTransport::IsaSerial {
+        refuse(
+            "agent_transport = \"isa-serial\"",
+            "use agent_transport = \"virtio-serial\"",
+        );
+    }
+    if h.apple_smc {
+        refuse("an Apple SMC", "remove `apple_smc`");
+    }
+}
+
 /// The resolved launch's hardware refusals, including attachments not carried
 /// by [`ResolvedVm`]. The adapter checks these before it spawns, using the
 /// same delivery gates as configuration validation and the lab daemon.
@@ -278,6 +413,18 @@ pub(crate) fn vmlab_vm_launch_refusals(
     has_nics: bool,
     has_floppy: bool,
 ) -> Vec<String> {
+    if emulated_guest(&hardware.arch) {
+        let mut why = Vec::new();
+        if has_floppy {
+            why.push(format!(
+                "vm \"{}\": a floppy drive is x86 hardware, and vmlab-hv's aarch64 `virt` \
+                 machine has none (PRD §22); attach the files on a CD-ROM",
+                hardware.name
+            ));
+        }
+        virt_hardware_refusals(&hardware.name, hardware, &mut why);
+        return why;
+    }
     vm_hardware_refusals(
         &hardware.name,
         Some(hardware),
@@ -465,7 +612,7 @@ pub fn qemu_refusals(vm: &Vm) -> Vec<String> {
 
 /// Whether `arch` is an x86 guest, which runs on vmlab-hv only.
 pub fn x86_guest(arch: &str) -> bool {
-    crate::qemu::qemu_arch(arch) == VMLAB_ARCH
+    crate::qemu::qemu_arch(arch) == VMLAB_HOST_ARCH
 }
 
 /// The architecture `machine` runs: a VM's resolved or declared one, else
@@ -551,7 +698,7 @@ fn container_refusals(c: &Container, host: &HostFacts) -> Vec<String> {
     let name = &c.name;
     let mut why = Vec::new();
     // A container runs the host's own architecture.
-    if host.arch != VMLAB_ARCH {
+    if host.arch != VMLAB_HOST_ARCH {
         why.push(arch_refusal("container", name, &host.arch));
     } else if !host.kvm {
         why.push(kvm_required("container", name));
@@ -581,8 +728,8 @@ fn kvm_required(kind: &str, name: &str) -> String {
 
 fn arch_refusal(kind: &str, name: &str, arch: &str) -> String {
     format!(
-        "{kind} \"{name}\": hypervisor = \"vmlab\" runs x86_64 only so far, and this is \
-         {arch} (PRD §22) — use hypervisor = \"qemu\""
+        "{kind} \"{name}\": hypervisor = \"vmlab\" runs x86_64 and aarch64 guests only so far, \
+         and this is {arch} (PRD §22) — use hypervisor = \"qemu\""
     )
 }
 
@@ -1175,13 +1322,14 @@ mod tests {
     fn qemu_args_tcg_and_another_arch_are_refused() {
         let file = lab(r#"lab "l" {
   vm "busy" {
-    template = "aarch64/t"
+    template = "x86_64/t"
     accel = "tcg"
     qemu_args = ["-device", "foo"]
   }
+  vm "rv" { template = "riscv64/t" }
 }"#);
         let busy = vmlab_refusals(file.lab.machine("busy").unwrap(), &kvm_host(), None);
-        assert_eq!(busy.len(), 3, "{busy:?}");
+        assert_eq!(busy.len(), 2, "{busy:?}");
         assert!(
             busy.iter()
                 .any(|w| w.contains("`qemu_args`") && w.contains("HV-D16")),
@@ -1192,7 +1340,144 @@ mod tests {
                 .any(|w| w.contains("accel = \"tcg\"") && w.contains("phase 3")),
             "{busy:?}"
         );
-        assert!(busy.iter().any(|w| w.contains("aarch64")), "{busy:?}");
+        let rv = vmlab_refusals(file.lab.machine("rv").unwrap(), &kvm_host(), None);
+        assert_eq!(rv.len(), 1, "{rv:?}");
+        assert!(rv[0].contains("riscv64"), "{rv:?}");
+    }
+
+    /// Phase 3d: an aarch64 VM runs on vmlab-hv's emulator, which needs no
+    /// KVM and takes `accel = "tcg"`; `accel = "kvm"` and `qemu_args` are
+    /// refused, naming QEMU as the troubleshooting route for the latter.
+    #[test]
+    fn an_aarch64_vm_runs_emulated_on_vmlab_hv() {
+        let file = lab(r#"lab "l" {
+  vm "plain" { template = "aarch64/t" }
+  vm "tcg" { template = "aarch64/t" accel = "tcg" }
+  vm "kvm" { template = "aarch64/t" accel = "kvm" }
+  vm "args" { template = "aarch64/t" qemu_args = ["-no-hpet"] }
+}"#);
+        let no_kvm = HostFacts {
+            kvm: false,
+            ..kvm_host()
+        };
+        for host in [kvm_host(), no_kvm] {
+            for name in ["plain", "tcg"] {
+                let why = vmlab_refusals(file.lab.machine(name).unwrap(), &host, None);
+                assert!(why.is_empty(), "{name}: {why:?}");
+            }
+        }
+        let kvm = vmlab_refusals(file.lab.machine("kvm").unwrap(), &kvm_host(), None);
+        assert!(
+            kvm.len() == 1 && kvm[0].contains("accel = \"kvm\"") && kvm[0].contains("emulator"),
+            "{kvm:?}"
+        );
+        let args = vmlab_refusals(file.lab.machine("args").unwrap(), &kvm_host(), None);
+        assert!(
+            args.len() == 1 && args[0].contains("`qemu_args`") && args[0].contains("hypervisor = \"qemu\""),
+            "{args:?}"
+        );
+        let arm_host = HostFacts {
+            arch: "aarch64".into(),
+            kvm: true,
+        };
+        let why = vmlab_refusals(file.lab.machine("plain").unwrap(), &arm_host, None);
+        assert!(why.len() == 1 && why[0].contains("x86_64 host only"), "{why:?}");
+    }
+
+    /// Automatic selection puts an aarch64 VM on vmlab-hv, and on QEMU only
+    /// with the reason vmlab-hv refused it; an existing QEMU aarch64 VM moves
+    /// at its next start unless vmlab-hv refuses it, when it stays, saying
+    /// why; an explicit setting still wins.
+    #[test]
+    fn automatic_selection_puts_aarch64_on_vmlab_hv_and_migrates_existing_qemu() {
+        let file = lab(r#"lab "l" {
+  vm "arm" { template = "aarch64/t" }
+  vm "args" { template = "aarch64/t" qemu_args = ["-no-hpet"] }
+  vm "pinned" { template = "aarch64/t" hypervisor = "qemu" }
+}"#);
+        let none = HypervisorDefaults::default();
+        let arm = file.lab.machine("arm").unwrap();
+        let picked = none.select(arm, &kvm_host(), None, None);
+        assert_eq!(
+            (picked.kind, picked.source, picked.fallback_reason),
+            (HypervisorKind::Vmlab, SelectionSource::Automatic, None)
+        );
+        let moved = none.select(arm, &kvm_host(), None, Some(HypervisorKind::Qemu));
+        assert_eq!(
+            (moved.kind, moved.source),
+            (HypervisorKind::Vmlab, SelectionSource::QemuMigration)
+        );
+        let args = file.lab.machine("args").unwrap();
+        let fallback = none.select(args, &kvm_host(), None, None);
+        assert_eq!(fallback.kind, HypervisorKind::Qemu);
+        assert!(
+            fallback
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|w| w.contains("`qemu_args`")),
+            "{fallback:?}"
+        );
+        let kept = none.select(args, &kvm_host(), None, Some(HypervisorKind::Qemu));
+        assert_eq!(
+            (kept.kind, kept.source),
+            (HypervisorKind::Qemu, SelectionSource::Existing)
+        );
+        assert!(
+            kept.fallback_reason
+                .as_deref()
+                .is_some_and(|w| w.contains("keeping existing QEMU") && w.contains("`qemu_args`")),
+            "{kept:?}"
+        );
+        let pinned = file.lab.machine("pinned").unwrap();
+        for existing in [None, Some(HypervisorKind::Qemu), Some(HypervisorKind::Vmlab)] {
+            let picked = none.select(pinned, &kvm_host(), None, existing);
+            assert_eq!(
+                (picked.kind, picked.source),
+                (HypervisorKind::Qemu, SelectionSource::Machine)
+            );
+            assert!(qemu_x86_refusals(pinned, &picked, &kvm_host(), None).is_empty());
+        }
+        let by_host = HypervisorDefaults {
+            vm: Some(HypervisorKind::Qemu),
+            container: None,
+        };
+        assert_eq!(
+            by_host
+                .select(arm, &kvm_host(), None, Some(HypervisorKind::Qemu))
+                .kind,
+            HypervisorKind::Qemu
+        );
+    }
+
+    /// The emulated `virt` machine runs a modern aarch64 Linux VM headless
+    /// (its virtio GPU is left out) and refuses, by name, the hardware it
+    /// does not present yet.
+    #[test]
+    fn an_aarch64_vm_is_refused_only_what_virt_lacks() {
+        let base = r#"template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 10GiB"#;
+        for body in [
+            base.to_string(),
+            format!("{base} cpus = 8 secure_boot = true"),
+            format!(r#"{base} accel = "tcg""#),
+            format!(r#"{base} display = "virtio-gpu""#),
+        ] {
+            let why = refused(&body);
+            assert!(why.is_empty(), "{body}: {why:?}");
+        }
+        for (extra, word) in [
+            ("cpus = 9", "GICv2"),
+            ("usb = true", "usb = true"),
+            ("tpm = true", "TPM"),
+            ("audio = true", "sound card"),
+            (r#"cpu_model = "cortex-a72""#, "cpu_model"),
+            (r#"gpu { mode = "virgl" }"#, "gpu {}"),
+        ] {
+            let why = refused(&format!("{base} {extra}"));
+            assert!(
+                why.len() == 1 && why[0].contains(word) && why[0].contains("`virt`"),
+                "{extra}: {why:?}"
+            );
+        }
     }
 
     /// Without its hardware — a template validation cannot see — a VM is
@@ -1364,6 +1649,12 @@ mod tests {
         let rv = file.lab.machine("rv").unwrap();
         assert_eq!(
             none.select(rv, &kvm_host(), None, None).kind,
+            HypervisorKind::Qemu
+        );
+        // riscv64 stays on QEMU however it was run before (§22).
+        assert_eq!(
+            none.select(rv, &kvm_host(), None, Some(HypervisorKind::Qemu))
+                .kind,
             HypervisorKind::Qemu
         );
     }

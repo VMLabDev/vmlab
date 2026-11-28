@@ -334,6 +334,16 @@ pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<String> {
 /// is launched directly; a TCP-only viewer runs in a detached bridge so it
 /// survives the CLI exiting. Prints how to attach when no viewer is found.
 pub fn open_for(lab: &str, vm: &str, hypervisor: HypervisorKind) -> Result<()> {
+    let run = crate::paths::machine_runtime_dir(lab, crate::paths::MachineKind::Vm, vm);
+    // A machine with no display has neither socket: vmlab-hv's emulated
+    // aarch64 `virt` machine runs headless (PRD §22).
+    if hypervisor == HypervisorKind::Vmlab
+        && !run.join("display.sock").exists()
+        && !run.join("vnc.sock").exists()
+    {
+        println!("gui: {vm} has no display; read its serial console with `vmlab logs {vm}`");
+        return Ok(());
+    }
     let viewer = match detect_for(hypervisor, false) {
         ConsoleViewer::Native(viewer) => return viewer.launch(lab, vm),
         ConsoleViewer::Vnc(viewer) => viewer,

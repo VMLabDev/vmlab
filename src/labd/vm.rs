@@ -713,6 +713,13 @@ impl VmInstance {
     /// when the VM is stopped and when its hypervisor does not report it —
     /// an in-memory adapter reports none — and either way the answer is that
     /// it is not running, as it always has been.
+    /// Whether this VM is vmlab-hv's emulated aarch64 `virt` machine (§22,
+    /// phase 3d), which has no display, input devices or virtio-fs yet.
+    fn headless_virt(&self) -> bool {
+        self.hypervisor() == HypervisorKind::Vmlab
+            && crate::config::hypervisor::emulated_guest(&self.template().resolved.arch)
+    }
+
     async fn capability<T>(&self, pick: impl FnOnce(&dyn Control) -> Option<T>) -> Result<T> {
         self.control
             .lock()
@@ -906,7 +913,9 @@ impl VmInstance {
         let sources = qemu::firmware::Sources::installed(firmware_dir);
         let pairing = qemu::firmware::Pairing::of(t.resolved.secure_boot, &t.resolved.key_store);
         let context = || format!("{}: UEFI firmware", self.cfg.name);
-        let vmlab = self.hypervisor() == HypervisorKind::Vmlab;
+        // vmlab-hv's x86 flash takes one OVMF layout; its aarch64 `virt`
+        // takes AAVMF's 64 MiB banks, as QEMU's does.
+        let vmlab = self.hypervisor() == HypervisorKind::Vmlab && arch == "x86_64";
         let store = self.dirs.ovmf_vars();
         if let Ok(m) = std::fs::metadata(&store) {
             if vmlab && m.len() != OVMF_VARS_SIZE {
@@ -1472,8 +1481,9 @@ impl VmInstance {
                     bail!("{}", why.join("\n"));
                 }
                 // The refusals above vouch for the arch; the host fact is
-                // the one they read.
-                host.kvm
+                // the one they read. An aarch64 guest runs on vmlab-hv's
+                // emulator, which KVM has no part in (phase 3d).
+                host.kvm && !crate::config::hypervisor::emulated_guest(&t.resolved.arch)
             } else {
                 qemu::kvm_usable(&t.resolved.arch)
             };
@@ -2354,11 +2364,14 @@ impl super::machine::Machine for VmInstance {
     }
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
+        if self.headless_virt() {
+            return None;
+        }
         self.emulator().virtiofsd()
     }
 
     fn virtiofs_in_process(&self) -> bool {
-        self.emulator().virtiofs_in_process()
+        self.headless_virt() || self.emulator().virtiofs_in_process()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {
@@ -2422,9 +2435,12 @@ impl super::machine::Machine for VmInstance {
     /// stream on vmlab-hv too (describe.rs), so it takes no TAP either.
     fn takes_tap_fds(&self) -> bool {
         let resolved = &self.template().resolved;
+        // vmlab-hv's emulated aarch64 machine takes the stream only: a vhost
+        // backend writes guest RAM past its translated-code tracking.
         self.hypervisor() != HypervisorKind::Vmlab
             || (resolved.nic_model.starts_with("virtio-net")
-                && !crate::config::hypervisor::is_macos(resolved))
+                && !crate::config::hypervisor::is_macos(resolved)
+                && !crate::config::hypervisor::emulated_guest(&resolved.arch))
     }
 
     fn net_framing(&self) -> crate::net::framing::FramingMode {
@@ -2886,7 +2902,13 @@ impl super::machine::Machine for VmInstance {
         self.usb.lock().await.clone()
     }
 
+    /// None on vmlab-hv's emulated aarch64 `virt` machine, which runs
+    /// headless on its serial console (§22, phase 3d): every screen, input
+    /// and recording verb says the machine has no display.
     fn display(self: Arc<Self>) -> Option<super::display::Display> {
+        if self.headless_virt() {
+            return None;
+        }
         Some(super::display::Display::new(self))
     }
 

@@ -335,9 +335,13 @@ pub(crate) fn vm(
     roms: &HostRoms,
 ) -> Result<MachineDescription> {
     let name = &resolved.name;
+    if crate::config::hypervisor::emulated_guest(&resolved.arch) {
+        return virt(lab, resolved, paths, accel);
+    }
     if crate::qemu::qemu_arch(&resolved.arch) != "x86_64" {
         bail!(
-            "vm \"{name}\": vmlab-hv runs x86_64 only so far, and this is {} (PRD §22)",
+            "vm \"{name}\": vmlab-hv runs x86_64 and aarch64 guests only so far, and this is {} \
+             (PRD §22)",
             resolved.arch
         );
     }
@@ -827,6 +831,170 @@ pub(crate) fn vm(
     })
 }
 
+/// The machine description for an aarch64 VM: vmlab-hv's emulated `virt`
+/// machine on AAVMF (§22, phase 3d). Its template was built under QEMU's
+/// `virt`, so each PCI function takes the slot QEMU's argv gave it
+/// ([`crate::qemu::build_args`]): the agent's virtio-serial controller, the
+/// disks, the CD-ROMs as read-only virtio-blk, then the NICs. The display
+/// device and the xHCI QEMU adds after them are left out — the machine has
+/// neither yet, so the guest runs headless on its PL011 serial console — and
+/// so is every function after them. What [`vmlab_refusals`] refuses is
+/// refused again here, as the last word before a spawn.
+///
+/// [`vmlab_refusals`]: crate::config::hypervisor::vmlab_refusals
+fn virt(
+    lab: &str,
+    resolved: &ResolvedVm,
+    paths: &VmPaths,
+    accel: crate::qemu::Accel,
+) -> Result<MachineDescription> {
+    let name = &resolved.name;
+    if accel != crate::qemu::Accel::Tcg {
+        bail!(
+            "vm \"{name}\": vmlab-hv runs an aarch64 guest on its emulator, not under KVM \
+             (PRD §22)"
+        );
+    }
+    let why = crate::config::hypervisor::vmlab_vm_launch_refusals(
+        resolved,
+        !paths.nics.is_empty(),
+        paths.floppy.is_some(),
+    );
+    if !why.is_empty() {
+        bail!("{}", why.join("\n"));
+    }
+    let (Some(code), Some(vars)) = (&paths.firmware_code, &paths.ovmf_vars) else {
+        bail!("vm \"{name}\": AAVMF needs its CODE image and the VM's own VARS file");
+    };
+    let Some(serial_log) = &paths.serial_log else {
+        bail!("vm \"{name}\": vmlab-hv needs a serial log path");
+    };
+    if paths.tpm_sock.is_some() || !paths.hypervisor_shares.is_empty() {
+        bail!(
+            "vm \"{name}\": vmlab-hv's aarch64 `virt` machine has no TPM and no virtio-fs yet \
+             (PRD §22)"
+        );
+    }
+    let mut slots = Slots(1);
+    let agent = resolved.agent_transport == AgentTransport::VirtioSerial;
+    let console_pci = agent.then(|| slots.next());
+    let ports = if agent {
+        vec![SerialPort {
+            transport: SerialTransport::Virtio,
+            name: vmlab_agent_proto::PORT_NAME.into(),
+            socket: paths.agent_sock.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+    // `disk0`, `disk1`…, then `cd0`…: the node names QMP snapshots address
+    // under QEMU, so a snapshot's disks are named alike on either.
+    let mut disks = Vec::new();
+    let all_disks = std::iter::once(paths.primary_disk.as_path())
+        .chain(paths.extra_disks.iter().map(|(_, p)| p.as_path()));
+    for (i, path) in all_disks.enumerate() {
+        let id = format!("disk{i}");
+        disks.push(Disk {
+            channel: None,
+            unit: None,
+            pci: Some(slots.next()),
+            bus: DiskBus::Virtio,
+            port: None,
+            cdrom: false,
+            vmstate: id == VM_VMSTATE_DISK,
+            id,
+            path: Some(path.to_path_buf()),
+            format: DiskFormat::Qcow2,
+            read_only: false,
+        });
+    }
+    for (i, iso) in paths.cdroms.iter().enumerate() {
+        disks.push(Disk {
+            channel: None,
+            unit: None,
+            pci: Some(slots.next()),
+            bus: DiskBus::Virtio,
+            port: None,
+            cdrom: false,
+            id: format!("cd{i}"),
+            path: Some(iso.clone()),
+            format: DiskFormat::Raw,
+            read_only: true,
+            vmstate: false,
+        });
+    }
+    let mut nics = Vec::new();
+    for nic in &paths.nics {
+        // An emulated machine's NIC takes the stream: a vhost backend would
+        // write guest RAM past the emulator's translated-code tracking.
+        let NicBackend::Stream { sock } = &nic.backend else {
+            bail!("vm \"{name}\": vmlab-hv attaches an emulated machine's NIC by stream socket only, not a TAP");
+        };
+        nics.push(Nic {
+            model: NicModel::Virtio,
+            rom: None,
+            pci: Some(slots.next()),
+            mac: nic.mac.to_string(),
+            mtu: nic.mtu.filter(|m| *m != 1500),
+            attachment: NicAttachment::StreamVnet {
+                socket: sock.clone(),
+                queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
+            },
+        });
+    }
+    if slots.0 > 32 {
+        bail!("vm \"{name}\": more PCI devices than `virt`'s bus 0 has slots for under vmlab-hv");
+    }
+    Ok(MachineDescription {
+        virtual_display: None,
+        fw_cfg: Vec::new(),
+        exit_on_reset: false,
+        machine: Machine::Virt,
+        cpu_model: None,
+        invtsc: false,
+        tsc_khz: None,
+        vmware_cpuid_freq: false,
+        msr_policy: MsrPolicy::Fault,
+        applesmc: None,
+        usb_keyboard: false,
+        smbios_type2: false,
+        pit_ticks: PitTicks::Replay,
+        // QEMU's `-cpu max` under TCG ignores `nested`, and so does this.
+        cpu: CpuPolicy::Host,
+        hyperv: Vec::new(),
+        display: None,
+        tablet: None,
+        tpm: None,
+        console_pci,
+        ahci_pci: None,
+        name: format!("vmlab:{lab}/{name}"),
+        arch: Arch::Aarch64,
+        accel: Accel::Tcg,
+        vcpus: resolved.cpus,
+        memory_mib: resolved.memory >> 20,
+        boot: Boot::Firmware {
+            boot_menu: false,
+            firmware: FirmwareKind::Aavmf,
+            code: code.clone(),
+            vars: Some(vars.clone()),
+            secure_boot: resolved.secure_boot,
+            // Under UEFI the guest's own boot order decides, as under QEMU.
+            bootorder: Vec::new(),
+        },
+        disks,
+        nics,
+        serial_log: serial_log.clone(),
+        serial_log_port: ComPort::Com1,
+        ports,
+        shares: Vec::new(),
+        audio: None,
+        vfio: Vec::new(),
+        usb: None,
+        rtc_base: rtc_base("vm", name, &resolved.rtc_base)?,
+        floppy: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,6 +1207,95 @@ mod tests {
             "vm \"t\" {{ template = \"scratch\" arch = \"x86_64\" disk = 10GiB {body} }}"
         ));
         crate::qemu::resolve_vm(&v, None, &crate::profiles::ProfileSet::of(profiles)).unwrap()
+    }
+
+    /// An aarch64 VM declared with `body`, resolved against the shipped
+    /// profiles.
+    fn aarch64(body: &str) -> Resolved {
+        let v = crate::qemu::resolve::testing::vm(&format!(
+            "vm \"t\" {{ template = \"scratch\" arch = \"aarch64\" disk = 10GiB {body} }}"
+        ));
+        crate::qemu::resolve_vm(&v, None, &crate::profiles::ProfileSet::shipped().unwrap())
+            .unwrap()
+    }
+
+    fn aavmf_paths() -> VmPaths {
+        VmPaths {
+            firmware_code: Some("/fw/aarch64/AAVMF_CODE.fd".into()),
+            ovmf_vars: Some("/lab/.vmlab/vms/v/AAVMF_VARS.fd".into()),
+            extra_disks: vec![("data".into(), "/lab/.vmlab/vms/v/disk1.qcow2".into())],
+            cdroms: vec!["/lab/.vmlab/vms/v/seed.iso".into()],
+            ..vm_paths()
+        }
+    }
+
+    /// Phase 3d: an aarch64 VM is vmlab-hv's emulated `virt` machine on
+    /// AAVMF, each function in the slot QEMU's `virt` argv gave it — the
+    /// agent's virtio-serial 00:01.0, the disks, the CD-ROM as read-only
+    /// virtio-blk, then the NIC — and headless: the virtio GPU and the xHCI
+    /// QEMU adds after them are left out.
+    #[test]
+    fn an_aarch64_vm_is_the_emulated_virt_machine_in_qemus_slots() {
+        let r = aarch64(r#"profile = "linux-modern" cpus = 2"#);
+        assert_eq!(r.display_device.as_deref(), Some("virtio-gpu-pci"));
+        let d = vm("l", &r, &aavmf_paths(), QemuAccel::Tcg, &roms()).unwrap();
+        assert_eq!(
+            (d.machine, d.arch, d.accel),
+            (Machine::Virt, Arch::Aarch64, Accel::Tcg)
+        );
+        assert_eq!((d.vcpus, d.name.as_str()), (2, "vmlab:l/t"));
+        assert_eq!(d.console_pci, at(1));
+        let slots: Vec<_> = d.disks.iter().map(|disk| (disk.id.as_str(), disk.pci)).collect();
+        assert_eq!(slots, [("disk0", at(2)), ("disk1", at(3)), ("cd0", at(4))]);
+        assert!(d.disks.iter().all(|disk| disk.bus == DiskBus::Virtio && !disk.cdrom));
+        assert!(d.disks[0].vmstate && !d.disks[0].read_only);
+        assert!(d.disks[2].read_only && d.disks[2].format == DiskFormat::Raw);
+        assert_eq!(d.nics[0].pci, at(5));
+        assert!(matches!(d.nics[0].attachment, NicAttachment::StreamVnet { .. }));
+        assert!(d.nics[0].rom.is_none());
+        assert!(d.display.is_none() && d.tablet.is_none() && d.usb.is_none());
+        assert_eq!(d.ports[0].name, vmlab_agent_proto::PORT_NAME);
+        let Boot::Firmware {
+            firmware,
+            code,
+            vars,
+            bootorder,
+            ..
+        } = &d.boot
+        else {
+            panic!("{:?}", d.boot)
+        };
+        assert_eq!(*firmware, FirmwareKind::Aavmf);
+        assert_eq!(code, Path::new("/fw/aarch64/AAVMF_CODE.fd"));
+        assert_eq!(vars.as_deref(), Some(Path::new("/lab/.vmlab/vms/v/AAVMF_VARS.fd")));
+        assert!(bootorder.is_empty());
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(serde_json::from_str::<MachineDescription>(&json).unwrap(), d);
+    }
+
+    /// What the emulated machine cannot take is refused before a spawn: KVM,
+    /// a TAP, a TPM, a missing VARS file.
+    #[test]
+    fn what_an_aarch64_launch_cannot_describe_is_refused() {
+        let r = aarch64(r#"profile = "linux-modern""#);
+        let refused = |paths: &VmPaths, accel| {
+            vm("l", &r, paths, accel, &roms()).unwrap_err().to_string()
+        };
+        assert!(refused(&aavmf_paths(), QemuAccel::Kvm).contains("emulator"));
+        let mut tap = aavmf_paths();
+        tap.nics[0].backend = NicBackend::TapQueues {
+            tap_fds: vec![3],
+            vhost_fds: vec![],
+        };
+        assert!(refused(&tap, QemuAccel::Tcg).contains("stream socket only"));
+        let no_vars = VmPaths {
+            ovmf_vars: None,
+            ..aavmf_paths()
+        };
+        assert!(refused(&no_vars, QemuAccel::Tcg).contains("VARS"));
+        let tpm = aarch64(r#"profile = "linux-modern" tpm = true"#);
+        let err = vm("l", &tpm, &aavmf_paths(), QemuAccel::Tcg, &roms()).unwrap_err();
+        assert!(err.to_string().contains("TPM"), "{err}");
     }
 
     /// The `q35-seabios-linux-modern` shape: linux-modern on SeaBIOS, as the
