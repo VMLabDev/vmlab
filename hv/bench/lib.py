@@ -1166,8 +1166,32 @@ def read_history(arch):
     return records
 
 
+# The CPU model that QEMU TCG presents to an aarch64 guest when the run
+# names none: `max` for the VM templates (vmlab's argv), `cortex-a53` for the
+# flat images (the lockstep oracle's CPU). `--qemu-cpu` chooses another one
+# (3e DESIGN.md P6), and its rows are kept apart from the default's.
+QEMU_CPU_DEFAULT = {"flat-a64": "cortex-a53"}
+QEMU_CPU_VM_DEFAULT = "max"
+
+
+def default_qemu_cpu(guest):
+    return QEMU_CPU_DEFAULT.get(guest, QEMU_CPU_VM_DEFAULT)
+
+
+def qemu_cpu(record):
+    """The CPU model of an aarch64 QEMU record, or "" for every other
+    record. A record that names none ran its guest's default model."""
+    if record.get("backend") != "qemu" or record.get("arch") != "aarch64":
+        return ""
+    env = record.get("env") or {}
+    named = env.get("qemu_cpu") or (env.get("qemu") or {}).get("cpu")
+    return named or default_qemu_cpu(record.get("guest"))
+
+
 def latest_baseline(records, arch, guest, vcpus, workload):
-    """The newest QEMU-backend record for this config, for hv history lines."""
+    """The newest QEMU-backend record for this config, for hv history lines.
+    On aarch64 only the guest's default CPU model counts (QEMU_CPU_DEFAULT):
+    a row of another model is a measurement, not the baseline."""
     for rec in reversed(records):
         if (
             rec.get("backend") == "qemu"
@@ -1175,6 +1199,7 @@ def latest_baseline(records, arch, guest, vcpus, workload):
             and rec.get("guest") == guest
             and rec.get("vcpus") == vcpus
             and rec.get("workload") == workload
+            and qemu_cpu(rec) in ("", default_qemu_cpu(guest))
         ):
             return {
                 "median": rec.get("median"),
@@ -1196,7 +1221,10 @@ def jit_mode(record):
     """How the CPU of an aarch64 vmlab-hv record ran, for bench-check (3e
     DESIGN.md card J8): `jit`, `interpreter`, or `jit-check` for a run of K3,
     which measures the check and no speed. A record that names no JIT ran
-    the interpreter, its default before J8. Other records have no mode."""
+    the interpreter, its default before J8. An aarch64 QEMU record's mode is
+    its CPU model (qemu_cpu, P6). Other records have no mode."""
+    if record.get("backend") == "qemu":
+        return qemu_cpu(record)
     if record.get("backend") != "vmlab-hv" or record.get("arch") != "aarch64":
         return ""
     env = record.get("env") or {}

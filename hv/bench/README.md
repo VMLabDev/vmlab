@@ -28,6 +28,15 @@ regression check (D2). TCG baseline method and first numbers:
 ceiling for a slow backend, `--keep` preserves per-run scratch, `--dry-run`
 prints the plan without booting anything.
 
+`--qemu-cpu MODEL` (aarch64 and `--backend qemu` only) sets QEMU's `-cpu`,
+with optional `,property=value` pairs, for example `cortex-a53` or
+`max,pauth=off`. The defaults are `max` for a VM template (vmlab's argv) and
+`cortex-a53` for `flat-a64`. A row records its model in `env.qemu_cpu` (a
+flat row in `env.qemu.cpu`). `bench-check` and `bench-report` keep each model's rows
+apart, and a vmlab-hv row takes its `qemu_baseline` from the default
+model only. Rows of another model are measurements beside the baseline
+(3e DESIGN.md P6).
+
 ### Focused phase-2 quiet window
 
 `python3 bench/phase2_window.py` runs only sequential writes, UDP TX, and
