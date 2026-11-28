@@ -73,6 +73,30 @@ pub fn parse_record(
     Ok(parse(bytes, vectors, system)?.map(|(trace, len)| (Record::Trace(trace), len)))
 }
 
+/// The `-cpu` of a K4 leader: QEMU's `cortex-a53` without its PMU. The
+/// follower adopts the leader's ID registers (`Adopt::Identity`), and the
+/// product CPU has no PMU (DESIGN.md V5). With a PMU in `ID_AA64DFR0_EL1`
+/// the guest's kernel writes `PMUSERENR_EL0`, which our CPU does not have
+/// (card #1214). `pmu=off` clears PMUVer and PerfMon in QEMU's ID
+/// registers and drops the PMU node from its device tree, so both sides
+/// take the no-PMU path.
+pub const K4_LEADER_CPU: &str = "cortex-a53,pmu=off";
+
+/// Whether the read `value` of the ID register `encoding` says that the
+/// CPU has a PMU: PMUVer of `ID_AA64DFR0_EL1` (bits 8 to 11) or PerfMon of
+/// `ID_DFR0_EL1` (bits 24 to 27) other than 0 (none) and 15 (not the
+/// architected one). Other registers say nothing about a PMU.
+pub fn reports_pmu(encoding: u16, value: u64) -> bool {
+    let field = match encoding {
+        // ID_AA64DFR0_EL1.
+        0xc028 => value >> 8 & 15,
+        // ID_DFR0_EL1.
+        0xc00a => value >> 24 & 15,
+        _ => return false,
+    };
+    !matches!(field, 0 | 15)
+}
+
 /// What the leader of a boot is started with.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -804,6 +828,41 @@ mod tests {
         assert_eq!(adoption(asm::svc(0)), None);
         assert_eq!(adoption(asm::mrs(1, 0xdf00)), None);
         assert_eq!(register_name(0xdf02), "CNTVCT_EL0");
+    }
+
+    #[test]
+    fn the_k4_leader_and_the_product_cpu_both_report_no_pmu() {
+        use crate::sysreg::{QEMU_CORTEX_A53, System, V8_0};
+        let product = System::reset(&V8_0);
+        let a53 = System::reset(&QEMU_CORTEX_A53);
+        for (name, encoding) in [("ID_AA64DFR0_EL1", 0xc028), ("ID_DFR0_EL1", 0xc00a)] {
+            let row = sysreg::position(name);
+            assert!(!reports_pmu(encoding, product.regs[row]), "{name}");
+            // QEMU's cortex-a53 with its PMU, which K4 does not run.
+            assert!(reports_pmu(encoding, a53.regs[row]), "{name}");
+        }
+        // What QEMU 11.1 reports for `cortex-a53,pmu=off` (card #1214).
+        assert!(!reports_pmu(0xc028, 0x1030_5006));
+        assert!(!reports_pmu(0xc00a, 0x0000_0006));
+        assert!(!reports_pmu(0xc028, 0xf00));
+        assert!(!reports_pmu(0xc000, 0x410f_d034));
+        let options = Options {
+            qemu: "qemu-system-aarch64".into(),
+            plugin: "/p/a64lock.so".into(),
+            directory: "/d".into(),
+            cpu: K4_LEADER_CPU.into(),
+            ram_mib: 2048,
+            code: "/f/code.fd".into(),
+            vars: "/d/vars.fd".into(),
+            system: vec![],
+            window: None,
+            guest: Some(GuestDisk {
+                disk: "/d/disk.qcow2".into(),
+            }),
+        };
+        assert!(options.argv().join(" ").contains(" -cpu cortex-a53,pmu=off "));
+        let dump = options.dump_argv(Path::new("/d/x.dtb")).join(" ");
+        assert!(dump.contains(" -cpu cortex-a53,pmu=off "));
     }
 
     #[test]
