@@ -21,7 +21,9 @@ Fedora 42) cannot move off QEMU.
 A CPU emulator faster than QEMU's TCG (D1). For riscv64 it is generated from
 the formal Sail model. For aarch64 it is decoded from the LLVM tables with our
 own semantics (D15); its design is `../phase-3d-aarch64/DESIGN.md`, which wins
-over this document for 3d. The riscv64 pipeline:
+over this document for 3d. Since D20 the product path of riscv64 is our own
+semantics too, and the pipeline below is its oracle and its decoder test
+(`../phase-3b-riscv64/DESIGN.md`). The riscv64 pipeline of 3a:
 
 1. A pinned Sail plus isla-sail toolchain in a container emits textual Jib
    (D3).
@@ -43,8 +45,8 @@ The work is done in sub-phases (D12):
 | Sub-phase | Delivers |
 |---|---|
 | 3a | Toolchain, emitter, riscv64 interpreter, lockstep and benchmarks |
-| 3b | riscv64 `virt` machine |
-| 3c | JIT |
+| 3b | riscv64: our own semantics in the typed IR with the Sail model as the oracle, the JIT forms, and the `virt` machine with OpenSBI and EDK2 (D20 to D23). Its design is `../phase-3b-riscv64/DESIGN.md`, which wins over this document for 3b |
+| 3c | riscv64 speed after 3b, measured against QEMU without a gate |
 | 3d | aarch64 decoder from the LLVM tables, our own semantics, the interpreter, the TCG vCPU path of the VMM and the `virt` machine (D15 to D18). It does not wait for 3b or 3c |
 | 3e | aarch64 JIT. Its design is `../phase-3e-aarch64-jit/DESIGN.md`, which wins over this document for 3e. Its first bar is T1 of that design, and D1 is its last |
 

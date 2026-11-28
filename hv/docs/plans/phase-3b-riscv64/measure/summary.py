@@ -33,8 +33,6 @@ def read(path):
             info["total"], info["len16"] = int(part[1]), int(part[7])
         elif part[0] == "discon":
             info["discon"] = " ".join(part[1:])
-        elif part[0] == "reset":
-            info["reset"] = " ".join(part[1:])
         elif part[0] == "enc":
             info["encodings"] = info.get("encodings", 0) + 1
     return counts, system, info
@@ -48,7 +46,7 @@ def main():
         print(f"== {path}")
         print(f"instructions {total:.4e}  16-bit {100 * info['len16'] / total:.1f} %  "
               f"distinct encodings {info.get('encodings', 0)}  mnemonics {len(counts)}")
-        print(f"reset {info.get('reset')}  discon {info.get('discon')}")
+        print(f"discon {info.get('discon')}")
         for name, test in GROUPS:
             n = sum(c for m, c in counts.items() if test(m))
             print(f"  {name}: {n} ({100 * n / total:.3f} %)")

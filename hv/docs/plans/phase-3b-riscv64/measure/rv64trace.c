@@ -20,7 +20,6 @@ static GHashTable *encodings;  /* distinct 32-bit encodings */
 static GMutex lock;
 static char *out_path;
 static uint64_t discon[3];
-static char first_regs[512];
 
 static unsigned slot_for(const char *key)
 {
@@ -84,32 +83,6 @@ static void on_discon(unsigned int vcpu, enum qemu_plugin_discon_type type,
     __atomic_fetch_add(&discon[i], 1, __ATOMIC_RELAXED);
 }
 
-static void vcpu_init(unsigned int vcpu, void *udata)
-{
-    if (vcpu != 0 || first_regs[0]) {
-        return;
-    }
-    GArray *regs = qemu_plugin_get_registers();
-    GString *s = g_string_new("");
-    for (guint i = 0; regs && i < regs->len; i++) {
-        qemu_plugin_reg_descriptor *r =
-            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
-        if (!strcmp(r->name, "pc") || !strcmp(r->name, "priv") ||
-            !strcmp(r->name, "a0") || !strcmp(r->name, "a1") ||
-            !strcmp(r->name, "a2")) {
-            GByteArray *b = g_byte_array_new();
-            if (qemu_plugin_read_register(r->handle, b)) {
-                uint64_t v = 0;
-                memcpy(&v, b->data, MIN(b->len, 8));
-                g_string_append_printf(s, "%s=%#" PRIx64 " ", r->name, v);
-            }
-            g_byte_array_free(b, TRUE);
-        }
-    }
-    g_strlcpy(first_regs, s->str[0] ? s->str : "none", sizeof(first_regs));
-    g_string_free(s, TRUE);
-}
-
 static void at_exit(void *udata)
 {
     FILE *f = fopen(out_path, "w");
@@ -118,7 +91,6 @@ static void at_exit(void *udata)
     }
     int nv = qemu_plugin_num_vcpus();
     uint64_t total = 0;
-    fprintf(f, "reset %s\n", first_regs);
     fprintf(f, "discon interrupt=%" PRIu64 " exception=%" PRIu64
             " hostcall=%" PRIu64 "\n", discon[0], discon[1], discon[2]);
     for (guint s = 0; s < slot_names->len; s++) {
@@ -164,7 +136,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     slots = g_hash_table_new(g_str_hash, g_str_equal);
     slot_names = g_ptr_array_new();
     encodings = g_hash_table_new(NULL, NULL);
-    qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);
     qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans, NULL);
     qemu_plugin_register_vcpu_discon_cb(id, QEMU_PLUGIN_DISCON_ALL, on_discon, NULL);
     qemu_plugin_register_atexit_cb(id, at_exit, NULL);
