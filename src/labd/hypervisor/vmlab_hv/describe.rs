@@ -1284,7 +1284,10 @@ mod tests {
         assert_eq!(display.device, DisplayDevice::VirtioGpu);
         assert_eq!(Some(display.pci), at(6));
         assert!(display.gpu.is_none() && display.rom.is_none() && display.render_node.is_none());
-        assert_eq!(display.socket.as_deref(), Some(Path::new("/run/l/v/display.sock")));
+        assert_eq!(
+            display.socket.as_deref(),
+            Some(Path::new("/run/l/v/display.sock"))
+        );
         assert_eq!((d.tablet, d.usb_keyboard, d.usb), (at(7), true, None));
         // No display device: headless, and the xHCI takes the slot after
         // the NIC.

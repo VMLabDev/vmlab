@@ -36,7 +36,8 @@ use vmlab_hv_devices::{BusDevice, IrqLine, MsiSink, PciSnapshot, Resettable, ged
 use vmlab_hv_firmware::fw_cfg::{self, FwCfgMmio};
 use vmlab_hv_proto::control::ShutdownReason;
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, DiskBus, DisplayDevice, FirmwareKind, Machine, MachineDescription, NicAttachment, NicModel,
+    Accel, Arch, Boot, DiskBus, DisplayDevice, FirmwareKind, Machine, MachineDescription,
+    NicAttachment, NicModel,
 };
 use vmlab_hv_tcg_aarch64::State;
 use vmlab_hv_tcg_aarch64::sysreg::CpuModel;

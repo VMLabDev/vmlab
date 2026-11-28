@@ -1277,7 +1277,12 @@ impl VmShared {
 
     pub(crate) fn sync_vga_mapping(&self) -> Result<(), VmmError> {
         use vm_memory::{GuestAddress, GuestMemoryBackend};
-        let Some(vga) = self.vga.lock().clone().filter(|vga| vga.has_linear_framebuffer()) else {
+        let Some(vga) = self
+            .vga
+            .lock()
+            .clone()
+            .filter(|vga| vga.has_linear_framebuffer())
+        else {
             return Ok(());
         };
         // The PCI hole starts where this machine's low RAM stops: at 2 GiB
