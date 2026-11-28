@@ -2797,7 +2797,14 @@ changes, each estimated at 1.03 to 1.07 times, each measured on its own.
     and a run with memory through the thunk keep the empty table. The test
     `the_store_after_an_exclusive_store_takes_the_write_table_again_in_the_same_run`
     (`tests/fasttlb.rs`) fails on `6c78c278` (two misses for one) and passes
-    with the change.
+    with the change. A run that goes on past an `ERET` or an exception
+    (`serve_next`, card T3-D2) moves that table to the new level with the
+    others (`ab6ca7d2`, found in review): kept at the level the run started
+    at, EL0 stored through EL1's entries after an exclusive store, and EL1
+    skipped PAN through EL0's. The test
+    `after_an_eret_in_the_run_the_store_after_an_exclusive_store_takes_the_table_of_el0`
+    fails without that line (the store of EL0 to a page of EL1 does not
+    fault) and passes with it.
   - *Word copies in `GuestBus`* (`e5b64d8c`): an access of RAM that is not
     1, 2, 4 or 8 bytes at its own alignment (a pair, a 16-byte access, an
     access that is not aligned) was copied one byte at a time. It now moves
@@ -2861,7 +2868,12 @@ The fastest repeat of each build, over all rounds, s:
   `VMLAB_HV_JIT_CHECK_RUNS=1000`, at a load of 7 to 16: agent ready after
   113.3 s, no difference, 135.95 million checked runs (996.9 million
   instructions) over both vCPUs up to their last JIT lines, at 12.0e9 and
-  6.0e9 instructions.
+  6.0e9 instructions. Again on the build of `ab6ca7d2`, the fix of the
+  level above (its code is that of `4006acb8`), at a load of 6 to 15:
+  agent ready after 52.4 s, no difference, 58.12 million checked runs
+  (425.9 million instructions), at 13.0e9 and 5.0e9 instructions. A first
+  try of that boot stopped in the AppArmor profile loads (V2c) and was
+  ended.
 - **V2e. The verdict.** None of the three estimates (1.03 to 1.07 times)
   shows above the noise of the host. The fastest repeats of the four
   builds are within 1 % of each other on the boot at both vCPU counts and
