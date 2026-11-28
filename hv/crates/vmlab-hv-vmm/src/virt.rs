@@ -34,7 +34,7 @@ use vmlab_hv_devices::{BusDevice, IrqLine, MsiSink, PciSnapshot, Resettable, ged
 use vmlab_hv_firmware::fw_cfg::{self, FwCfgMmio};
 use vmlab_hv_proto::control::ShutdownReason;
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, DiskBus, FirmwareKind, Machine, MachineDescription, NicAttachment, NicModel,
+    Accel, Arch, Boot, DiskBus, DisplayDevice, FirmwareKind, Machine, MachineDescription, NicAttachment, NicModel,
 };
 use vmlab_hv_tcg_aarch64::State;
 use vmlab_hv_tcg_aarch64::sysreg::CpuModel;
@@ -387,9 +387,7 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
     crate::clock::rtc_base(desc.rtc_base.as_deref())?;
     let unsupported = [
         (!desc.vfio.is_empty(), "vfio"),
-        (desc.display.is_some(), "display"),
         (desc.virtual_display.is_some(), "virtual_display"),
-        (desc.tablet.is_some(), "tablet"),
         (desc.usb.is_some(), "usb"),
         (desc.tpm.is_some(), "tpm"),
         (desc.ahci_pci.is_some(), "ahci_pci"),
@@ -405,6 +403,25 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
         return Err(invalid(format!(
             "`{name}` is not a part of the aarch64 virt machine yet"
         )));
+    }
+    // The display is a 2D virtio-gpu without VGA, as QEMU's
+    // `virtio-gpu-pci` on its `virt` machine: there is no legacy VGA to
+    // decode, and no host GPU behind it.
+    if let Some(display) = &desc.display
+        && (display.device != DisplayDevice::VirtioGpu
+            || display.gpu.is_some()
+            || display.render_node.is_some()
+            || display.rom.is_some()
+            || display.vram_bytes != vmlab_hv_proto::machine::default_gpu_vram_bytes())
+    {
+        return Err(invalid(
+            "the display of virt is a 2D virtio-gpu, with no ROM and no GPU acceleration",
+        ));
+    }
+    // There is no PS/2 controller: a keyboard is a USB one on the xHCI
+    // of the tablet.
+    if desc.usb_keyboard && desc.tablet.is_none() {
+        return Err(invalid("usb_keyboard requires the xHCI of the tablet"));
     }
     for disk in &desc.disks {
         if disk.bus != DiskBus::Virtio || disk.cdrom || disk.path.is_none() {
@@ -889,6 +906,47 @@ pub fn assemble(
             .map_err(VmmError::Other)?;
         functions.extend(built.snapshot);
     }
+    // The display and the xHCI of the tablet and the keyboard follow the
+    // NICs, as they follow them in QEMU's argv.
+    let mut video = None;
+    if let Some(display) = &desc.display {
+        let (slot, function, wiring) = place(Some(display.pci), 3)?;
+        let gpu = Arc::new(Mutex::new(
+            vmlab_hv_devices::display::virtio_gpu::VirtioGpu::new(
+                "gpu",
+                ram.device_mem.clone(),
+                Some(wiring.msi),
+                wiring.intx,
+            )
+            .map_err(|e| VmmError::DeviceUnavailable {
+                device: "virtio-gpu",
+                reason: e.to_string(),
+            })?,
+        ));
+        pci_root
+            .lock()
+            .add_device_at(slot, function, gpu.clone())
+            .map_err(VmmError::Other)?;
+        functions.push(gpu.clone());
+        video = Some(crate::display::Video::Gpu(gpu));
+    }
+    let mut xhci = None;
+    if let Some(address) = desc.tablet {
+        let (slot, function, wiring) = place(Some(address), 1)?;
+        let controller = crate::builder::input_xhci(
+            address,
+            ram.device_mem.clone(),
+            wiring.msi,
+            wiring.intx,
+            desc.usb_keyboard,
+        )?;
+        pci_root
+            .lock()
+            .add_device_at(slot, function, controller.clone())
+            .map_err(VmmError::Other)?;
+        functions.push(controller.clone());
+        xhci = Some(controller);
+    }
     let bars = pci_root.lock().save_bar_states();
 
     let shared = VmShared::emulated(
@@ -906,6 +964,8 @@ pub fn assemble(
             ),
         ),
     );
+    *shared.vga.lock() = video;
+    *shared.xhci.lock() = xhci;
     shared.set_reset_description(desc.clone());
     crate::snapshot::remove_stale_checkpoints(&disks).map_err(|error| {
         VmmError::Other(format!("cleaning stale rollback checkpoints: {error}"))
