@@ -14,9 +14,11 @@
 //! past there, so a machine with an emulated CPU must not give its RAM to a
 //! vhost backend.
 //!
-//! With more than one CPU, a stamped store, an exclusive load and an
-//! exclusive store hold one lock, so that the check of a reservation and
-//! its store are one step (DESIGN.md M6).
+//! With more than one CPU, a stamped store holds one lock. An exclusive
+//! load and an exclusive store of the aarch64 CPU hold none (card #1232):
+//! the store checks the generation and then makes one compare and exchange
+//! of the host, and a write of the same value between the two is the
+//! accepted ABA case (3e DESIGN.md, "Exclusives without the lock").
 //!
 //! # Stores without stamps (card S3)
 //!
@@ -53,12 +55,14 @@
 //! - **Reservations.** An exclusive store needs that no other CPU wrote
 //!   the reserved bytes since its load. A straight write moves no stamp, so
 //!   the exclusive store is one compare and exchange of the host against
-//!   the value that its load read (`compare_and_store`), under the lock. A
+//!   the value that its load read (`compare_and_store`), without a lock. A
 //!   store of another CPU after the load that changes the value fails the
 //!   exchange. One that writes the same value back is taken as a store
 //!   before the load, which is what QEMU's exclusive store, a compare and
 //!   exchange, does too. A device write and a stamped write still move the
-//!   stamps, so they fail a reservation as before.
+//!   stamps, so they fail a reservation as before, unless one that leaves
+//!   the value as it was lands between the store's check of the stamp and
+//!   its exchange: the ABA case that card #1232 accepts.
 //!
 //! A host without the barrier or without a compare and exchange of 16 bytes
 //! runs a machine of more than one CPU as before: every write is stamped.
@@ -759,10 +763,10 @@ impl Memory for GuestBus {
     }
 
     fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
-        let shared = self.shared.clone();
-        let _atomic = shared.serialize.then(|| shared.transaction.lock());
-        // The generation first: a device write between the two reads is
-        // then seen by the store.
+        // No lock (card #1232). The generation first, and a stamped write
+        // moves its stamp after its bytes: a stamped or device write that
+        // lands between the two reads, or during the read, moves the
+        // generation past the one returned, and the store fails.
         let generation = self.reservation_generation(address, bytes.len());
         self.read(address, bytes)?;
         Ok(generation)
@@ -881,8 +885,10 @@ impl Memory for GuestBus {
                 return Ok(swapped);
             }
         }
-        // A memory where every write takes the lock that the caller holds,
-        // a ROM, the bus, or one CPU on a host without the operation.
+        // A memory where every write takes the lock, a ROM, the bus, or one
+        // CPU on a host without the operation: read, compare and write under
+        // the lock, which the caller no longer holds (card #1232).
+        let _atomic = shared.serialize.then(|| shared.transaction.lock());
         let mut now = [0u8; 16];
         let now = &mut now[..expected.len()];
         self.read(address, now)?;

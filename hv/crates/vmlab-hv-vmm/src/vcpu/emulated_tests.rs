@@ -567,22 +567,33 @@ fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
     // The interpreter, and the JIT with chaining (3e card J7), each on a
     // machine of two CPUs that tell each other through their mailboxes.
     for jit in [false, true] {
-        count_on_two_cpus(jit);
+        count_on_cpus(2, jit);
     }
 }
 
-fn count_on_two_cpus(jit: bool) {
+/// The same at four CPUs, with exclusives that take no lock of the machine
+/// (card #1232).
+#[test]
+fn four_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
+    for jit in [false, true] {
+        count_on_cpus(4, jit);
+    }
+}
+
+fn count_on_cpus(cpus: u64, jit: bool) {
     const ROUNDS: u64 = 200_000;
     const CODE: u64 = RAM + 0x10_0000;
     const DATA: u64 = RAM + 0x2000;
     let memory = ram();
-    let bus = GuestBus::new(memory.clone(), host_with_latch(), 2).unwrap();
+    let bus = GuestBus::new(memory.clone(), host_with_latch(), cpus as usize).unwrap();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     assert!(
         bus.writes_straight(),
         "the host has membarrier and cmpxchg16b"
     );
-    let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(2));
+    let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(
+        cpus as usize,
+    ));
     let program = [
         ldaxr32(5, 1),      // 0 lock: w5 = [x1]
         cbnz32(5, -1),      // 1 held: again
@@ -604,7 +615,7 @@ fn count_on_two_cpus(jit: bool) {
     memory
         .write_slice(&asm::bytes(&program), GuestAddress(CODE))
         .unwrap();
-    let threads: Vec<_> = (0..2u64)
+    let threads: Vec<_> = (0..cpus)
         .map(|id| {
             let bus = bus.clone();
             let shootdown = shootdown.clone();
@@ -642,14 +653,109 @@ fn count_on_two_cpus(jit: bool) {
     assert_eq!(word(DATA), 0, "the lock is free");
     assert_eq!(
         word(DATA + 0x40),
-        2 * ROUNDS as u32,
-        "under the lock, jit {jit}"
+        (cpus * ROUNDS) as u32,
+        "under the lock, {cpus} CPUs, jit {jit}"
     );
     assert_eq!(
         word(DATA + 0x80),
-        2 * ROUNDS as u32,
-        "exclusive increments, jit {jit}"
+        (cpus * ROUNDS) as u32,
+        "exclusive increments, {cpus} CPUs, jit {jit}"
     );
+}
+
+/// `LDAXR Xt, [Xn]`.
+fn ldaxr64(rt: u32, rn: u32) -> u32 {
+    0xc85f_fc00 | rn << 5 | rt
+}
+
+/// `STLXR Ws, Xt, [Xn]`.
+fn stlxr64(rs: u32, rt: u32, rn: u32) -> u32 {
+    0xc800_fc00 | rs << 16 | rn << 5 | rt
+}
+
+/// `LDXP Xt1, Xt2, [Xn]`.
+fn ldxp64(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xc87f_0000 | rt2 << 10 | rn << 5 | rt
+}
+
+/// `STXP Ws, Xt1, Xt2, [Xn]`.
+fn stxp64(rs: u32, rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xc820_0000 | rs << 16 | rt2 << 10 | rn << 5 | rt
+}
+
+/// Card #1232: four CPUs on four threads count with exclusives alone, which
+/// take no lock of the machine: a 64-bit counter with `LDAXR`/`STLXR`, and a
+/// pair of 64-bit counters with `LDXP`/`STXP`, the 16-byte exchange of the
+/// host. Every increment is a read-modify-write that can race, and the
+/// counts are exact.
+#[test]
+fn four_cpus_count_with_exclusive_words_and_pairs_to_the_exact_count() {
+    for jit in [false, true] {
+        count_atomically_on_four_cpus(jit);
+    }
+}
+
+fn count_atomically_on_four_cpus(jit: bool) {
+    const CPUS: u64 = 4;
+    const ROUNDS: u64 = 200_000;
+    const CODE: u64 = RAM + 0x10_0000;
+    const DATA: u64 = RAM + 0x2000;
+    let memory = ram();
+    let bus = GuestBus::new(memory.clone(), host_with_latch(), CPUS as usize).unwrap();
+    let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(
+        CPUS as usize,
+    ));
+    let program = [
+        ldaxr64(5, 1),        // 0 x5 = [x1]
+        asm::add(5, 5, 1),    // 1
+        stlxr64(6, 5, 1),     // 2 [x1] = x5
+        cbnz32(6, -3),        // 3 lost: again
+        ldxp64(7, 8, 3),      // 4 x7, x8 = [x3]
+        asm::add(7, 7, 1),    // 5
+        asm::add(8, 8, 2),    // 6
+        stxp64(6, 7, 8, 3),   // 7 [x3] = x7, x8
+        cbnz32(6, -4),        // 8 lost: again from 4
+        sub64(2, 2, 1),       // 9
+        asm::cbnz(2, -10),    // 10
+        asm::hvc(0),          // 11
+    ];
+    memory
+        .write_slice(&asm::bytes(&program), GuestAddress(CODE))
+        .unwrap();
+    let threads: Vec<_> = (0..CPUS)
+        .map(|id| {
+            let bus = bus.clone();
+            let shootdown = shootdown.clone();
+            std::thread::spawn(move || {
+                let mut state = State::reset(CODE);
+                state.set_x(1, DATA);
+                state.set_x(2, ROUNDS);
+                state.set_x(3, DATA + 0x40);
+                let mut cpu = vmlab_hv_tcg_aarch64::Cpu::new(bus, state);
+                cpu.set_jit(jit).unwrap();
+                cpu.shootdown = Some((shootdown, id as usize));
+                loop {
+                    match cpu.run(100_000) {
+                        vmlab_hv_tcg_aarch64::Stop::Budget => {}
+                        vmlab_hv_tcg_aarch64::Stop::Hypercall { .. } => break,
+                        other => panic!("cpu {id}: {other:?}"),
+                    }
+                }
+                cpu.state.x(2)
+            })
+        })
+        .collect();
+    for thread in threads {
+        assert_eq!(thread.join().unwrap(), 0);
+    }
+    let double = |at: u64| {
+        let mut bytes = [0u8; 8];
+        memory.read_slice(&mut bytes, GuestAddress(at)).unwrap();
+        u64::from_le_bytes(bytes)
+    };
+    assert_eq!(double(DATA), CPUS * ROUNDS, "the word, jit {jit}");
+    assert_eq!(double(DATA + 0x40), CPUS * ROUNDS, "the pair's low, jit {jit}");
+    assert_eq!(double(DATA + 0x48), 2 * CPUS * ROUNDS, "the pair's high, jit {jit}");
 }
 
 /// `LDR Xt, [Xn]`.

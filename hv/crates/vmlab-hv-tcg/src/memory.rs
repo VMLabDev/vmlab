@@ -129,8 +129,10 @@ pub trait Memory {
     fn reservation_generation(&self, _address: u64, _len: usize) -> u64 {
         self.generation()
     }
-    /// Read and return `reservation_generation` for the range as one atomic
-    /// host operation.
+    /// Read and return `reservation_generation` for the range. One atomic
+    /// host operation, or the generation read before the bytes where every
+    /// write that moves it moves it after its bytes: a write that the read
+    /// may have seen then fails the store.
     fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64>;
     /// Validate that generation against the range's reservation granules and
     /// write, as one atomic host operation.
@@ -185,10 +187,12 @@ pub trait Memory {
     /// Write `new` at `address` when the memory holds `expected` there, as
     /// one host operation against the writes of every other CPU, also those
     /// that a CPU makes straight. Both are the same size and the range is
-    /// aligned to it. The caller holds `transaction_lock`. The default reads,
-    /// compares and writes: right for a memory whose every write takes that
-    /// lock.
+    /// aligned to it. The caller need not hold `transaction_lock` (card
+    /// #1232). The default reads, compares and writes under that lock:
+    /// right for a memory whose every write takes it.
     fn compare_and_store(&mut self, address: u64, expected: &[u8], new: &[u8]) -> Result<bool> {
+        let lock = self.transaction_lock();
+        let _atomic = lock.as_ref().map(|lock| lock.lock());
         let mut now = [0u8; 16];
         let now = &mut now[..expected.len()];
         self.read(address, now)?;

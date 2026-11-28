@@ -46,6 +46,14 @@
 //! CPU that changed the value fails the store, and one that wrote the same
 //! value back does not, as on QEMU.
 //!
+//! No lock of the machine is taken by an exclusive load, an exclusive store,
+//! or a store while a mark is set (card #1232). The check of the generation
+//! and the exchange are two steps, so a stamped write of another CPU that
+//! leaves the value as it was can land between them, and the store then
+//! succeeds. This is the ABA case: the architecture fails such a store,
+//! vmlab-hv does not, and the operator accepted the difference (3e
+//! DESIGN.md, "Exclusives without the lock").
+//!
 //! A load or a store whose page the TLB holds with its host address
 //! (`Memory::host_page`) reads and writes the host mapping itself. A store
 //! does so only while no CPU holds code of the page, which its watch word
@@ -930,11 +938,12 @@ impl Side {
             Some(reservation) => {
                 // The store moves the write generation of its granules, and
                 // those can be the reserved ones. A reservation that was
-                // intact takes the new generation. The lock keeps the store
-                // of another CPU from landing between the check and the new
-                // generation, where it would be taken for our own.
-                let lock = memory.transaction_lock();
-                let _atomic = lock.as_ref().map(|lock| lock.lock());
+                // intact takes the new generation. No lock is taken (card
+                // #1232): a stamped write of another CPU that lands between
+                // the check and the new generation is taken for our own, and
+                // the compare and exchange of the exclusive store still fails
+                // when that write changed the value. One that wrote the same
+                // value back is the accepted ABA case (the module comment).
                 let len = usize::from(reservation.bytes);
                 let intact =
                     memory.reservation_generation(reservation.phys, len) == reservation.generation;
@@ -1002,13 +1011,12 @@ impl Side {
         single: bool,
     ) -> Result<(bool, bool), Unstored> {
         self.machine.exclusive_stores += 1;
-        let done = self.store_exclusive_locked(memory, address, bytes, value, user, single);
-        // After the lock of the store is let go: the others may wait for it.
+        let done = self.store_exclusive_inner(memory, address, bytes, value, user, single);
         self.tell_code(memory);
         done
     }
 
-    fn store_exclusive_locked<M: Memory>(
+    fn store_exclusive_inner<M: Memory>(
         &mut self,
         memory: &mut M,
         address: u64,
@@ -1046,37 +1054,37 @@ impl Side {
         let phys = spot.first;
         let buffer = value.to_le_bytes();
         let part = &buffer[..usize::from(bytes)];
-        let lock = memory.transaction_lock();
-        let _atomic = lock.as_ref().map(|lock| lock.lock());
-        let mut now = [0u8; 16];
-        memory
-            .read(phys, &mut now[..usize::from(bytes)])
-            .map_err(|error| Fault::memory(error, address))?;
-        let now = u128::from_le_bytes(now);
-        let Some(reservation) = self.exclusive.take() else {
+        let Some(reservation) = self.exclusive else {
+            // No mark, at the address 2^64 - 1: an access that writes
+            // nothing, as above.
+            let mut now = [0u8; 16];
+            memory
+                .read(phys, &mut now[..usize::from(bytes)])
+                .map_err(|error| Fault::memory(error, address))?;
             return Ok((false, false));
         };
         let expected = u128::from(self.exclusive_value) | u128::from(self.exclusive_high) << 64;
-        // The memory holds the value, as far as the store reaches.
-        let same = now == expected & bits_mask(bytes);
-        // The memory holds the whole value: 64 bits, or 128 for a pair of
-        // 64-bit registers.
-        let whole = same && (bytes == 16 || now == u128::from(self.exclusive_value));
-        if !same {
-            return Ok((false, false));
-        }
-        // The granules of the load are untouched, and the memory still holds
-        // what was read under the lock. A CPU writes RAM straight without
-        // the lock (card S3), so the write is one compare and exchange of
-        // the host against that value: a store of another CPU that lands
-        // after the read fails it. A store of the same value that lands
-        // there is taken as one made before the load, as QEMU's compare and
-        // exchange does.
-        let wrote = memory.reservation_generation(reservation.phys, usize::from(reservation.bytes))
-            == reservation.generation
+        let mask = bits_mask(bytes);
+        // The memory is to hold the value as far as the store reaches. It
+        // reports success only when that is the whole value: 64 bits, or 128
+        // for a pair of 64-bit registers.
+        let whole = bytes == 16 || expected & mask == u128::from(self.exclusive_value);
+        // No stamped write reached the granules of the load, and then one
+        // compare and exchange of the host against the value of the load
+        // (card #1232): no lock of the machine is taken. A store of another
+        // CPU that changed the value fails the exchange. A store that wrote
+        // the same value back, also one between the check of the generation
+        // and the exchange, is taken as one made before the load, as QEMU's
+        // compare and exchange does. That is the ABA case, which the
+        // architecture forbids and the operator accepted.
+        let intact = memory.reservation_generation(reservation.phys, usize::from(reservation.bytes))
+            == reservation.generation;
+        let wrote = intact
             && memory
-                .compare_and_store(phys, &now.to_le_bytes()[..usize::from(bytes)], part)
+                .compare_and_store(phys, &(expected & mask).to_le_bytes()[..usize::from(bytes)], part)
                 .map_err(|error| Fault::memory(error, address))?;
+        // The store completed, written or not: the mark ends.
+        self.exclusive = None;
         if wrote {
             self.wrote(address, spot, bytes, value, code);
         }

@@ -484,8 +484,15 @@ in `tests/loadstore.rs`.
   alignment. A store at the marked address is an access and checks its
   alignment. "No mark" is the address 2^64 - 1, so a store there is an access
   too. An exception keeps the mark. The core follows all of it (DESIGN.md
-  U1). With more CPUs it also fails a store when another CPU wrote to the
-  page of the load, which QEMU does not when the value is the same again.
+  U1). With more CPUs it also fails a store when a device or a write into a
+  page of translated code wrote to the page of the load since the load,
+  which QEMU does not when the value is the same again. The store takes no
+  lock of the machine (card #1232): it checks the stamp of the page, then
+  makes one compare and exchange of the host. A write of another CPU that
+  leaves the value as it was succeeds the store, also a stamped one that
+  lands between the check and the exchange. That is the ABA case, which
+  the architecture forbids and the operator accepted (3e DESIGN.md,
+  "Exclusives without the lock").
 - **The plugin reports an exclusive store that fails its compare as a write**
   of the bytes that were there. The follower compares what the memory holds
   after an instruction, not the two lists of writes.
