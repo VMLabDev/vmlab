@@ -301,7 +301,7 @@ impl EmulatedVcpu {
         self.jit_report = self.cpu.instructions + JIT_REPORT;
         let jit = self.cpu.jit_counts();
         log::info!(
-            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses, {} flushes, {} scans, {} ms flushing; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting; compiles: {} first, {} after a drop of the region, {} after an invalidation, {} after an eviction, {} drops for the memory; translations: {} blocks, {} ms; returns: {} jump cache misses served in code, {} at a block that the loop ends, {} with nothing to chain to, {} at the budget, {} kicked; {} changes of the address space kept the jump cache; superblocks: {} joins, {} side exits",
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses, {} flushes, {} scans, {} ms flushing; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting; compiles: {} first, {} after a drop of the region, {} after an invalidation, {} after an eviction, {} drops for the memory; translations: {} blocks, {} ms; returns: {} jump cache misses served in code, {} at a block that the loop ends, {} with nothing to chain to, {} at the budget, {} kicked; {} changes of the address space kept the jump cache; superblocks: {} joins, {} side exits; terminals: {} served in code, {} served then left; by kind, returned/served: {}",
             self.id,
             self.cpu.instructions,
             jit.interpreted_instructions,
@@ -353,6 +353,14 @@ impl EmulatedVcpu {
             jit.jump_spaces,
             jit.joins,
             jit.side_exits,
+            jit.terminal_served.iter().sum::<u64>(),
+            jit.returns_trapped,
+            vmlab_hv_tcg_aarch64::exec::TERMINAL_KIND_NAMES
+                .iter()
+                .zip(jit.terminal_returns.iter().zip(&jit.terminal_served))
+                .map(|(name, (returned, served))| format!("{name} {returned}/{served}"))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         let waits = &jit.machine.waits;
         if waits.code_page.count + waits.code_mail.count + waits.all.count > 0
