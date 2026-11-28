@@ -21,12 +21,18 @@
 //! other CPU translates through what it invalidated, which is what the guest
 //! counts on after the `DSB ISH` that follows it.
 //!
+//! A CPU inside a device access of a block leaves its run loop for that
+//! time (3e card T3-D4): a device can take seconds on a loaded host, and
+//! every other CPU that posted waited that long. It holds no translation
+//! that it uses while the device runs, and it takes its mail when the
+//! device returns, before the block goes on (`Away`).
+//!
 //! The rule is general knowledge of the architecture: a TLB maintenance
 //! operation of the Inner Shareable domain affects every PE of that domain.
 //! No file of S2 to S5 was opened, no QEMU source (X1) and no Arm pseudocode
 //! (X2).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Mutex};
 use vmlab_hv_tcg_jit::seat::Seat;
 
@@ -55,7 +61,11 @@ pub struct Mail {
     pub code: bool,
 }
 
+/// Each mailbox on cache lines of its own: a CPU reads `pending` before
+/// every block, and another CPU writes its own `running` at every run
+/// (3e card T3-D4).
 #[derive(Default)]
+#[repr(align(128))]
 struct Mailbox {
     /// There is mail. Read before every block, so it is one load.
     pending: AtomicBool,
@@ -130,7 +140,7 @@ impl Shootdown {
     pub(crate) fn kick_outstanding(&self, from: usize) {
         for (id, mailbox) in self.cpus.iter().enumerate() {
             if id != from
-                && mailbox.running.load(Ordering::Acquire)
+                && mailbox.running.load(Ordering::SeqCst)
                 && mailbox.pending.load(Ordering::Acquire)
             {
                 Self::kick(mailbox);
@@ -156,12 +166,28 @@ impl Shootdown {
     }
 
     /// Whether some CPU but `from` that runs has mail that it has not taken.
+    /// The post stored `pending` before, and a CPU that enters its loop
+    /// stores `running` before it looks at `pending`: one of the two sees
+    /// the other (both sequentially consistent).
     pub(crate) fn outstanding(&self, from: usize) -> bool {
         self.cpus.iter().enumerate().any(|(id, mailbox)| {
             id != from
-                && mailbox.running.load(Ordering::Acquire)
+                && mailbox.running.load(Ordering::SeqCst)
                 && mailbox.pending.load(Ordering::Acquire)
         })
+    }
+
+    /// `cpu` leaves its run loop for a device access, and says whether it
+    /// was in it.
+    fn leave(&self, cpu: usize) -> bool {
+        self.cpus[cpu].running.swap(false, Ordering::SeqCst)
+    }
+
+    /// `cpu` comes back from a device access. Its mail is looked at after
+    /// this.
+    fn enter(&self, cpu: usize) {
+        self.cpus[cpu].running.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
     }
 
     /// `cpu` enters or leaves its run loop. A CPU that enters has mail
@@ -179,6 +205,41 @@ impl Shootdown {
             .unwrap_or_else(|e| e.into_inner());
         if !place.as_ref().is_some_and(|now| Arc::ptr_eq(now, seat)) {
             *place = Some(seat.clone());
+        }
+    }
+}
+
+/// The `Quiesce` of a CPU of a machine, for one device access of a block
+/// (3e card T3-D4). After the access, the CPU takes its mail when `left`
+/// says that it left its loop.
+pub(crate) struct Away<'a> {
+    shootdown: &'a Shootdown,
+    cpu: usize,
+    /// The CPU was in its run loop when it left: it goes back into it.
+    was: bool,
+    pub(crate) left: bool,
+}
+
+impl<'a> Away<'a> {
+    pub(crate) fn new(shootdown: &'a Shootdown, cpu: usize) -> Self {
+        Self {
+            shootdown,
+            cpu,
+            was: false,
+            left: false,
+        }
+    }
+}
+
+impl vmlab_hv_tcg::Quiesce for Away<'_> {
+    fn leave(&mut self) {
+        self.was = self.shootdown.leave(self.cpu);
+        self.left = true;
+    }
+
+    fn enter(&mut self) {
+        if self.was {
+            self.shootdown.enter(self.cpu);
         }
     }
 }
@@ -243,6 +304,28 @@ mod tests {
             );
         }
         assert_eq!(shootdown.take(1), Some(mail(vec![Invalidation::All])));
+    }
+
+    #[test]
+    fn a_cpu_away_in_a_device_is_not_waited_for_and_comes_back_as_it_left() {
+        use vmlab_hv_tcg::Quiesce;
+        let shootdown = Shootdown::new(2);
+        shootdown.set_running(1, true);
+        let mut away = Away::new(&shootdown, 1);
+        away.leave();
+        shootdown.post(0, Invalidation::All);
+        assert!(!shootdown.outstanding(0));
+        away.enter();
+        assert!(away.left);
+        assert!(shootdown.outstanding(0));
+        shootdown.take(1);
+        // A CPU outside its loop (a step of the debug port) stays outside.
+        shootdown.set_running(1, false);
+        let mut away = Away::new(&shootdown, 1);
+        away.leave();
+        away.enter();
+        shootdown.post(0, Invalidation::All);
+        assert!(!shootdown.outstanding(0));
     }
 
     #[test]

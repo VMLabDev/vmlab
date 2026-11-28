@@ -759,34 +759,91 @@ impl Side {
     }
 
     fn read_at<M: Memory>(
+        &mut self,
         memory: &mut M,
         va: u64,
         spot: Spot,
         part: &mut [u8],
     ) -> Result<(), Fault> {
+        if spot.in_first == part.len() {
+            return self
+                .read_phys(memory, spot.first, part)
+                .map_err(|error| Fault::memory(error, va));
+        }
         let (low, high) = part.split_at_mut(spot.in_first);
         memory
             .read(spot.first, low)
             .map_err(|error| Fault::memory(error, va))?;
-        if !high.is_empty() {
-            memory
-                .read(spot.second, high)
-                .map_err(|error| Fault::memory(error, va.wrapping_add(spot.in_first as u64)))?;
-        }
+        memory
+            .read(spot.second, high)
+            .map_err(|error| Fault::memory(error, va.wrapping_add(spot.in_first as u64)))?;
         Ok(())
     }
 
-    fn write_at<M: Memory>(memory: &mut M, va: u64, spot: Spot, part: &[u8]) -> Result<(), Fault> {
+    fn write_at<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        va: u64,
+        spot: Spot,
+        part: &[u8],
+    ) -> Result<(), Fault> {
+        if spot.in_first == part.len() {
+            return self
+                .write_phys(memory, spot.first, part)
+                .map_err(|error| Fault::memory(error, va));
+        }
         let (low, high) = part.split_at(spot.in_first);
         memory
             .write(spot.first, low)
             .map_err(|error| Fault::memory(error, va))?;
-        if !high.is_empty() {
-            memory
-                .write(spot.second, high)
-                .map_err(|error| Fault::memory(error, va.wrapping_add(spot.in_first as u64)))?;
-        }
+        memory
+            .write(spot.second, high)
+            .map_err(|error| Fault::memory(error, va.wrapping_add(spot.in_first as u64)))?;
         Ok(())
+    }
+
+    /// Read an access of a block that is inside one page. On a machine of
+    /// several CPUs a device access runs with this CPU out of its run loop,
+    /// so that no other CPU waits for the device to post to it, and the
+    /// CPU takes its mail after it, before the block uses a translation
+    /// again (`shootdown.rs`, 3e card T3-D4). An access over two pages
+    /// does not leave: its second page was translated before the first
+    /// was read.
+    #[inline]
+    fn read_phys<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        phys: u64,
+        bytes: &mut [u8],
+    ) -> vmlab_hv_tcg::Result<()> {
+        let Some((shootdown, id)) = &self.shootdown else {
+            return memory.read(phys, bytes);
+        };
+        let mut away = crate::shootdown::Away::new(shootdown, *id);
+        let result = memory.read_device(phys, bytes, &mut away);
+        if away.left {
+            self.take_mail();
+        }
+        result
+    }
+
+    /// Write an access of a block that is inside one page, as `read_phys`.
+    #[inline]
+    fn write_phys<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        phys: u64,
+        bytes: &[u8],
+    ) -> vmlab_hv_tcg::Result<()> {
+        let Some((shootdown, id)) = &self.shootdown else {
+            return memory.write(phys, bytes);
+        };
+        let mut away = crate::shootdown::Away::new(shootdown, *id);
+        let result = memory.write_device(phys, bytes, &mut away);
+        if away.left {
+            self.take_mail();
+        }
+        result
     }
 
     fn load<M: Memory>(
@@ -819,7 +876,7 @@ impl Side {
                 self.exclusive_high = (value >> 64) as u64;
             }
         } else {
-            Self::read_at(memory, address, spot, part)?;
+            self.read_at(memory, address, spot, part)?;
         }
         let value = u128::from_le_bytes(buffer);
         if let Some(log) = &mut self.log {
@@ -852,7 +909,7 @@ impl Side {
         let buffer = value.to_le_bytes();
         let part = &buffer[..usize::from(bytes)];
         match self.exclusive {
-            None => Self::write_at(memory, address, spot, part)?,
+            None => self.write_at(memory, address, spot, part)?,
             Some(reservation) => {
                 // The store moves the write generation of its granules, and
                 // those can be the reserved ones. A reservation that was
@@ -864,7 +921,7 @@ impl Side {
                 let len = usize::from(reservation.bytes);
                 let intact =
                     memory.reservation_generation(reservation.phys, len) == reservation.generation;
-                Self::write_at(memory, address, spot, part)?;
+                self.write_at(memory, address, spot, part)?;
                 if intact {
                     self.exclusive = Some(Reservation {
                         generation: memory.reservation_generation(reservation.phys, len),
@@ -2054,7 +2111,7 @@ fn load<M: Memory, const N: usize>(
             && aligned(flags)
         {
             let mut bytes = [0u8; 8];
-            if memory.read(phys, &mut bytes[..N]).is_ok() {
+            if side.read_phys(memory, phys, &mut bytes[..N]).is_ok() {
                 // SAFETY: as above.
                 unsafe { block::set_word(frame, usize::from(op.dst), u64::from_le_bytes(bytes)) };
                 return Ok(());
@@ -2261,7 +2318,9 @@ fn store<M: Memory, const N: usize>(
         if let Some((phys, flags)) = side.mmu.hit(at, N as u64, need)
             && aligned(flags)
             && !side.maybe_code(phys)
-            && memory.write(phys, &value.to_le_bytes()[..N]).is_ok()
+            && side
+                .write_phys(memory, phys, &value.to_le_bytes()[..N])
+                .is_ok()
         {
             side.own_writes += 1;
             // Translated code of another CPU can be in the page.
@@ -6036,6 +6095,137 @@ mod tests {
         };
         let quiet = runs(false);
         assert_eq!(runs(true), quiet + 1, "the run after the TLBI");
+    }
+
+    /// 3e card T3-D4: a CPU inside a device access of a block is out of
+    /// its run loop, so a TLBI that another CPU posts then finds no CPU to
+    /// wait for, and the CPU takes the invalidation when the device
+    /// returns, before the block goes on. In the interpreter and in
+    /// compiled code. The device posts from CPU 0 while it serves the load
+    /// of CPU 1, single-threaded.
+    #[test]
+    fn a_cpu_inside_a_device_access_is_not_waited_for_and_takes_its_mail_after() {
+        use crate::shootdown::{Invalidation, Shootdown};
+        use std::sync::Arc;
+        use vmlab_hv_tcg::{CodeStamp, HostPage, Quiesce};
+        const DEVICE: u64 = 0x0900_0000;
+        struct Device {
+            flat: FlatMemory,
+            shootdown: Arc<Shootdown>,
+            /// For each device read: whether CPU 0 found a CPU to wait for,
+            /// and whether CPU 1 had the mail.
+            seen: Vec<(bool, bool)>,
+        }
+        impl Memory for Device {
+            fn read(&mut self, address: u64, bytes: &mut [u8]) -> vmlab_hv_tcg::Result<()> {
+                if !(DEVICE..DEVICE + 0x1000).contains(&address) {
+                    return self.flat.read(address, bytes);
+                }
+                self.shootdown.post(0, Invalidation::All);
+                self.seen
+                    .push((self.shootdown.outstanding(0), self.shootdown.has_mail(1)));
+                bytes.copy_from_slice(&0x5a5a_5a5a_u32.to_le_bytes()[..bytes.len()]);
+                Ok(())
+            }
+            fn read_device(
+                &mut self,
+                address: u64,
+                bytes: &mut [u8],
+                quiesce: &mut dyn Quiesce,
+            ) -> vmlab_hv_tcg::Result<()> {
+                if !(DEVICE..DEVICE + 0x1000).contains(&address) {
+                    return self.flat.read(address, bytes);
+                }
+                quiesce.leave();
+                let result = self.read(address, bytes);
+                quiesce.enter();
+                result
+            }
+            fn write(&mut self, address: u64, bytes: &[u8]) -> vmlab_hv_tcg::Result<()> {
+                self.flat.write(address, bytes)
+            }
+            fn generation(&self) -> u64 {
+                self.flat.generation()
+            }
+            fn code_stamp(&self, address: u64, len: usize) -> Option<CodeStamp> {
+                self.flat.code_stamp(address, len)
+            }
+            fn ram_bounds(&self, address: u64) -> Option<(u64, u64)> {
+                self.flat.ram_bounds(address)
+            }
+            fn load_reserved(
+                &mut self,
+                address: u64,
+                bytes: &mut [u8],
+            ) -> vmlab_hv_tcg::Result<u64> {
+                self.flat.load_reserved(address, bytes)
+            }
+            fn store_conditional(
+                &mut self,
+                address: u64,
+                bytes: &[u8],
+                generation: u64,
+            ) -> vmlab_hv_tcg::Result<bool> {
+                self.flat.store_conditional(address, bytes, generation)
+            }
+            fn transaction_lock(
+                &self,
+            ) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
+                self.flat.transaction_lock()
+            }
+            fn host_page(&mut self, page: u64) -> Option<HostPage> {
+                self.flat.host_page(page)
+            }
+            fn host_mapping(&self) -> Option<(u64, u64)> {
+                self.flat.host_mapping()
+            }
+            fn watch_code(&mut self, address: u64) -> Option<u32> {
+                self.flat.watch_code(address)
+            }
+            fn watch_holds(&self, address: u64, word: u32) -> bool {
+                self.flat.watch_holds(address, word)
+            }
+            fn wrote_straight(&mut self, address: u64, len: usize) {
+                self.flat.wrote_straight(address, len)
+            }
+            fn ended_code(&self) -> u64 {
+                self.flat.ended_code()
+            }
+        }
+        for jit in [false, true] {
+            let shootdown = Arc::new(Shootdown::new(2));
+            let mut data = vec![0u8; 0x2000];
+            // ldr w1, [x2] ; b .
+            for (index, word) in [0xb940_0041_u32, 0x1400_0000].iter().enumerate() {
+                data[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            let device = Device {
+                flat: FlatMemory::new(BASE, data),
+                shootdown: shootdown.clone(),
+                seen: Vec::new(),
+            };
+            let mut cpu = Cpu::new(device, State::reset(BASE));
+            cpu.set_jit(jit).unwrap();
+            cpu.shootdown = Some((shootdown.clone(), 1));
+            cpu.state.set_x(2, DEVICE);
+            // The block is translated (and compiled) by a first run.
+            assert_eq!(cpu.run(100), Stop::Budget);
+            assert!(!shootdown.has_mail(1));
+            // Then it runs whole, and no block head follows it in the run:
+            // the mail is taken after the device or not at all.
+            cpu.memory.seen.clear();
+            cpu.state.set_x(1, 0);
+            cpu.state.set_pc(BASE);
+            let compiled = cpu.jit_counts().compiled_runs;
+            assert_eq!(cpu.run(2), Stop::Budget);
+            assert_eq!(cpu.state.x(1), 0x5a5a_5a5a, "jit {jit}");
+            // CPU 0 had nobody to wait for, and the mail was there.
+            assert_eq!(cpu.memory.seen, [(false, true)], "jit {jit}");
+            // CPU 1 took it when the device returned.
+            assert!(!shootdown.has_mail(1), "jit {jit}");
+            // In compiled code when the JIT is on.
+            assert_eq!(cpu.jit_counts().compiled_runs > compiled, jit);
+        }
     }
 
     /// 3e card J13: the inline forms of `ADD`, `SUB`, `CMEQ`, `CMTST` and

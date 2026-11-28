@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, com
 use parking_lot::ReentrantMutex;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
 use vmlab_hv_devices::GuestMemory;
-use vmlab_hv_tcg::{CodeStamp, Error, HostPage, Memory, Result};
+use vmlab_hv_tcg::{CodeStamp, Error, HostPage, Memory, Quiesce, Result};
 
 use super::VcpuHost;
 
@@ -524,6 +524,73 @@ impl GuestBus {
             .read_slice(bytes, GuestAddress(address))
             .map_err(|_| Error::Memory(address))
     }
+
+    /// The device part of `read`, with the CPU out of its run loop while
+    /// the device serves it when `quiesce` is given (3e card T3-D4).
+    fn device_read(
+        &mut self,
+        address: u64,
+        bytes: &mut [u8],
+        quiesce: Option<&mut dyn Quiesce>,
+    ) -> Result<()> {
+        if self.touches_ram(address, bytes.len()) {
+            return Err(Error::Memory(address));
+        }
+        let started = std::time::Instant::now();
+        let mut away = quiesce;
+        if let Some(quiesce) = away.as_deref_mut() {
+            quiesce.leave();
+        }
+        let mut at = address;
+        let mut result = Ok(());
+        for part in bytes.chunks_mut(BUS_WIDTH) {
+            if !self.shared.host.mmio_read(at, part) {
+                result = Err(Error::Memory(at));
+                break;
+            }
+            at += part.len() as u64;
+        }
+        if let Some(quiesce) = away {
+            quiesce.enter();
+        }
+        self.device.add(started);
+        result
+    }
+
+    /// The device part of `write`, as `device_read`.
+    fn device_write(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        quiesce: Option<&mut dyn Quiesce>,
+    ) -> Result<()> {
+        if self.touches_ram(address, bytes.len()) {
+            return Err(Error::Memory(address));
+        }
+        let started = std::time::Instant::now();
+        let mut away = quiesce;
+        if let Some(quiesce) = away.as_deref_mut() {
+            quiesce.leave();
+        }
+        let mut at = address;
+        let mut result = Ok(());
+        for part in bytes.chunks(BUS_WIDTH) {
+            if !self.shared.host.mmio_write(at, part) {
+                result = Err(Error::Memory(at));
+                break;
+            }
+            at += part.len() as u64;
+        }
+        if let Some(quiesce) = away {
+            quiesce.enter();
+        }
+        self.device.add(started);
+        result?;
+        // The CPU counts each of its writes as one generation.
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
+        self.own += 1;
+        Ok(())
+    }
 }
 
 impl Memory for GuestBus {
@@ -538,19 +605,7 @@ impl Memory for GuestBus {
             unsafe { copy_in(region.host + offset as usize, bytes) };
             return Ok(());
         }
-        if self.touches_ram(address, bytes.len()) {
-            return Err(Error::Memory(address));
-        }
-        let mut at = address;
-        let started = std::time::Instant::now();
-        for part in bytes.chunks_mut(BUS_WIDTH) {
-            if !self.shared.host.mmio_read(at, part) {
-                return Err(Error::Memory(at));
-            }
-            at += part.len() as u64;
-        }
-        self.device.add(started);
-        Ok(())
+        self.device_read(address, bytes, None)
     }
 
     #[inline]
@@ -589,22 +644,33 @@ impl Memory for GuestBus {
             self.own += 1;
             return Ok(());
         }
-        if self.touches_ram(address, bytes.len()) {
-            return Err(Error::Memory(address));
+        self.device_write(address, bytes, None)
+    }
+
+    fn read_device(
+        &mut self,
+        address: u64,
+        bytes: &mut [u8],
+        quiesce: &mut dyn Quiesce,
+    ) -> Result<()> {
+        if let Some((region, offset)) = self.ram(address, bytes.len()) {
+            // SAFETY: as in `read`.
+            unsafe { copy_in(region.host + offset as usize, bytes) };
+            return Ok(());
         }
-        let mut at = address;
-        let started = std::time::Instant::now();
-        for part in bytes.chunks(BUS_WIDTH) {
-            if !self.shared.host.mmio_write(at, part) {
-                return Err(Error::Memory(at));
-            }
-            at += part.len() as u64;
+        self.device_read(address, bytes, Some(quiesce))
+    }
+
+    fn write_device(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        quiesce: &mut dyn Quiesce,
+    ) -> Result<()> {
+        if shared_ram(&self.shared, address, bytes.len()).is_some() {
+            return self.write(address, bytes);
         }
-        self.device.add(started);
-        // The CPU counts each of its writes as one generation.
-        self.shared.generation.fetch_add(1, Ordering::SeqCst);
-        self.own += 1;
-        Ok(())
+        self.device_write(address, bytes, Some(quiesce))
     }
 
     fn generation(&self) -> u64 {
