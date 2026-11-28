@@ -391,6 +391,48 @@ fn the_store_after_an_exclusive_store_takes_the_write_table_again_in_the_same_ru
 }
 
 #[test]
+fn after_an_eret_in_the_run_the_store_after_an_exclusive_store_takes_the_table_of_el0() {
+    // At EL1: str x3, [x4] ; eret. Then at EL0, in the same run once the
+    // blocks are compiled: ldxr x2, [x0] ; stxr w5, x1, [x0] ; str x1, [x4].
+    // The page of x4 only EL1 may write, so the store of EL0 faults.
+    let mut machine = Machine::new(&[
+        str(3, 4),
+        asm::ERET,
+        ldxr(2, 0),
+        stxr(5, 1, 0),
+        str(1, 4),
+        HVC,
+    ]);
+    machine.map(VA, DATA | AF | USER | NO_EXECUTE);
+    machine.map(VA + 0x1000, OTHER | AF | NO_EXECUTE);
+    let pass = |machine: &mut Machine| {
+        let state = &mut machine.cpu.state;
+        state.set_x(0, VA);
+        state.set_x(1, 0xbad);
+        state.set_x(3, 0x600d);
+        state.set_x(4, VA + 0x1008);
+        state.system.regs[sysreg::reg::ELR_EL1] = CODE + 8;
+        state.system.regs[sysreg::reg::SPSR_EL1] = 0;
+        state.system.regs[sysreg::reg::FAR_EL1] = 0;
+        machine.run();
+        // The fault of the store of EL0 reached the vector of EL1.
+        assert_eq!(machine.cpu.state.system.regs[sysreg::reg::FAR_EL1], VA + 0x1008);
+        assert_eq!(machine.word(OTHER + 8), 0x600d, "EL0 wrote a page of EL1");
+        assert_eq!(machine.cpu.state.x(5), 0, "the exclusive store wrote");
+    };
+    // The first pass compiles the blocks of both levels.
+    pass(&mut machine);
+    assert!(machine.holds(EL1, true, VA + 0x1000));
+    // The second goes on past the ERET in the run of EL1 (card T3-D2).
+    let served = machine.cpu.jit_counts().terminal_served.iter().sum::<u64>();
+    pass(&mut machine);
+    assert!(
+        machine.cpu.jit_counts().terminal_served.iter().sum::<u64>() > served,
+        "the ERET was served in the run"
+    );
+}
+
+#[test]
 fn every_flush_of_the_tlb_empties_the_fast_tlb() {
     // ldr x1, [x0] ; <the operation of x3> ; then the end.
     let mut cases: Vec<(&str, u32, u64, bool)> = vec![

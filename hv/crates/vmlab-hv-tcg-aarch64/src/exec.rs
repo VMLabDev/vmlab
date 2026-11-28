@@ -3037,6 +3037,14 @@ unsafe fn serve_next<M: Memory>(
         && let Some(fast) = env.side.mmu.fast()
     {
         let level = usize::from(!user);
+        // The write table that the thunk gives back when a mark ends is
+        // that of the level now too (card #1216): one of the level that the
+        // run started at would let EL0 store through EL1's entries after an
+        // `ERET`, and EL1 skip PAN through EL0's after an `SVC`. A run that
+        // has none (a replay of K3) keeps none.
+        if !env.writes.is_null() {
+            env.writes = fast.table(level, true);
+        }
         // SAFETY: as above.
         unsafe {
             (*env.context).reads = fast.table(level, false);
