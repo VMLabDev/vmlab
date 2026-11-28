@@ -66,6 +66,13 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
         ));
     }
     if let Some(display) = &desc.display {
+        if display.device == vmlab_hv_proto::machine::DisplayDevice::VirtioGpu {
+            return Err(VmmError::InvalidMachine(
+                "virtio-gpu without VGA is the display of the aarch64 virt machine; \
+                 an x86 machine takes virtio-vga"
+                    .into(),
+            ));
+        }
         vmlab_hv_proto::machine::validate_gpu_vram_bytes(display.vram_bytes)
             .map_err(VmmError::InvalidMachine)?;
         if display.gpu.is_none()
@@ -540,6 +547,41 @@ fn hid_serial(address: PciAddress, prefix: u32, connector: u8) -> String {
         "{prefix}-0000:{:02x}:{:02x}.{}-{connector}",
         address.bus, address.device, address.function
     )
+}
+
+/// The xHCI that carries the absolute tablet at `address`, and with
+/// `keyboard` a USB keyboard ahead of it, as QEMU's `usb-kbd` and
+/// `usb-tablet` take the first two ports in that order.
+pub(crate) fn input_xhci(
+    address: PciAddress,
+    mem: vmlab_hv_devices::GuestMemory,
+    msi: Arc<dyn vmlab_hv_devices::MsiSink>,
+    intx: Option<Arc<dyn vmlab_hv_devices::IrqLine>>,
+    keyboard: bool,
+) -> Result<Arc<Mutex<vmlab_hv_devices::usb::XhciController>>, VmmError> {
+    use vmlab_hv_devices::usb::{KEYBOARD_PORT, Keyboard, TABLET_PORT, Tablet, XhciController};
+    let device = |e: vmlab_hv_devices::DeviceError| VmmError::Other(e.to_string());
+    let mut controller = XhciController::new("xhci", mem, msi, intx);
+    controller.detach(TABLET_PORT).map_err(device)?;
+    controller
+        .attach(
+            TABLET_PORT + u8::from(keyboard),
+            Box::new(Tablet::new(hid_serial(
+                address,
+                28754,
+                if keyboard { 2 } else { 1 },
+            ))),
+        )
+        .map_err(device)?;
+    if keyboard {
+        controller
+            .attach(
+                KEYBOARD_PORT,
+                Box::new(Keyboard::new(hid_serial(address, 68284, 1))),
+            )
+            .map_err(device)?;
+    }
+    Ok(Arc::new(Mutex::new(controller)))
 }
 
 /// Build the whole machine. With `paused`, the vCPUs stay parked until the
@@ -1456,38 +1498,13 @@ pub fn build(
     };
     let xhci = if let Some(address) = xhci_address {
         let transport = wiring(Some(address), 1, false)?;
-        let xhci = Arc::new(Mutex::new(vmlab_hv_devices::usb::XhciController::new(
-            "xhci",
+        let xhci = input_xhci(
+            address,
             ram.device_mem.clone(),
             transport.msi,
             transport.intx,
-        )));
-        {
-            let mut controller = xhci.lock();
-            controller
-                .detach(vmlab_hv_devices::usb::TABLET_PORT)
-                .map_err(|e| VmmError::Other(e.to_string()))?;
-            controller
-                .attach(
-                    vmlab_hv_devices::usb::TABLET_PORT + u8::from(desc.usb_keyboard),
-                    Box::new(vmlab_hv_devices::usb::Tablet::new(hid_serial(
-                        address,
-                        28754,
-                        if desc.usb_keyboard { 2 } else { 1 },
-                    ))),
-                )
-                .map_err(|e| VmmError::Other(e.to_string()))?;
-        }
-        if desc.usb_keyboard {
-            xhci.lock()
-                .attach(
-                    vmlab_hv_devices::usb::KEYBOARD_PORT,
-                    Box::new(vmlab_hv_devices::usb::Keyboard::new(hid_serial(
-                        address, 68284, 1,
-                    ))),
-                )
-                .map_err(|e| VmmError::Other(e.to_string()))?;
-        }
+            desc.usb_keyboard,
+        )?;
         place(xhci.clone(), Some(address))?;
         snap_nodes.push(DeviceNode::Virtio(xhci.clone()));
         Some(xhci)
@@ -1813,7 +1830,7 @@ fn parse_nic_mac(text: &str) -> Result<[u8; 6], VmmError> {
 fn load_vga_rom(device: DisplayDevice, path: Option<&Path>) -> Result<Option<Vec<u8>>, VmmError> {
     let path = match (device, path) {
         (_, Some(path)) => path,
-        (DisplayDevice::VmwareSvga, None) => return Ok(None),
+        (DisplayDevice::VmwareSvga | DisplayDevice::VirtioGpu, None) => return Ok(None),
         (DisplayDevice::StdVga, None) => Path::new("/usr/share/qemu/vgabios-stdvga.bin"),
         (DisplayDevice::CirrusVga, None) => Path::new("/usr/share/qemu/vgabios-cirrus.bin"),
         (DisplayDevice::VirtioVga, None) => Path::new("/usr/share/qemu/vgabios-virtio.bin"),

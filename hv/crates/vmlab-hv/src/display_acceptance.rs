@@ -36,7 +36,7 @@ struct State {
 
 #[derive(Clone, Default)]
 pub(super) struct Image {
-    flags: vmlab_hv_display::FrameFlags,
+    pub(super) flags: vmlab_hv_display::FrameFlags,
     pub(super) width: u32,
     pub(super) height: u32,
     /// XRGB8888, `width * 4` bytes per row.
