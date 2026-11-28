@@ -184,7 +184,7 @@ fn an_emulated_aarch64_guest_mounts_a_share_and_runs_a_program_from_it() {
         &mut agent,
         &format!(
             "{BUSYBOX} mkdir -p /mnt/work && {BUSYBOX} mount -t virtiofs work /mnt/work || \
-             {{ {BUSYBOX} dmesg | {BUSYBOX} tail -40; {BUSYBOX} grep . \
+             {{ {BUSYBOX} dmesg | {BUSYBOX} grep -i -E \"pci|virtio|bar|fs\"; {BUSYBOX} grep . \
              /sys/bus/pci/devices/*/device /sys/bus/virtio/devices/*/device; exit 1; }}"
         ),
     );
