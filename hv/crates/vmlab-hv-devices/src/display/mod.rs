@@ -19,6 +19,7 @@ pub mod cirrus;
 pub mod font;
 #[cfg(test)]
 mod tests;
+pub mod virtio_gpu;
 pub mod virtio_vga;
 
 use crate::{BarInfo, BarKind, DeviceError, GuestMemory, PciDevice, Snapshot};

@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ipclass import CLASSES, strip_generics  # noqa: E402
+from ipclass import classify, strip_generics  # noqa: E402
 
 JIT = "compiled code"
 
@@ -122,14 +122,6 @@ def dynamic_symbols(path):
     return found
 
 
-def classify(function, where):
-    text = function + " " + where
-    for name, pattern in CLASSES:
-        if re.search(pattern, text):
-            return name
-    return "other in the binary"
-
-
 def main():
     args = sys.argv[1:]
     options = {"--perf-map": None, "--thread": "", "--top": "25"}
@@ -158,6 +150,9 @@ def main():
             if not parts or options["--thread"] not in names.get(parts[0], ""):
                 continue
             frames = []
+            # "| <stack words> @<time>" of IPSTACK_WORDS (card #1212) is not a frame.
+            if "|" in parts:
+                parts = parts[:parts.index("|")]
             for index, text in enumerate(parts[1:]):
                 ip = int(text, 16)
                 if in_jit(jit, jit_starts, ip):

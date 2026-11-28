@@ -339,6 +339,35 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(base["median"], 26.0)
         self.assertEqual(base["recorded"], "t4")
 
+    def test_latest_baseline_skips_another_cpu_model(self):
+        # P6: a cortex-a53 row is a measurement, the max row stays the baseline.
+        lib.append_history("aarch64", self.record(median=26.0, recorded="t1"))
+        lib.append_history("aarch64", self.record(median=24.0, recorded="t2",
+                                                  env={"qemu_cpu": "cortex-a53"}))
+        base = lib.latest_baseline(
+            lib.read_history("aarch64"), "aarch64", "debian-13", 1, "boot_to_agent_ready"
+        )
+        self.assertEqual(base["recorded"], "t1")
+
+    def test_flat_baseline_is_the_oracle_cpu(self):
+        flat = dict(guest="flat-a64", workload="coremark_algorithms_1000")
+        lib.append_history("aarch64", self.record(median=1.0, recorded="t1",
+                                                  env={"qemu": {"cpu": "cortex-a53"}}, **flat))
+        lib.append_history("aarch64", self.record(median=2.0, recorded="t2",
+                                                  env={"qemu": {"cpu": "max"}}, **flat))
+        base = lib.latest_baseline(
+            lib.read_history("aarch64"), "aarch64", "flat-a64", 1, "coremark_algorithms_1000"
+        )
+        self.assertEqual(base["recorded"], "t1")
+
+    def test_qemu_cpu_of_a_record(self):
+        self.assertEqual(lib.qemu_cpu(self.record()), "max")
+        self.assertEqual(lib.qemu_cpu(self.record(env={"qemu_cpu": "cortex-a53"})),
+                         "cortex-a53")
+        self.assertEqual(lib.qemu_cpu(self.record(guest="flat-a64")), "cortex-a53")
+        self.assertEqual(lib.qemu_cpu(self.record(backend="vmlab-hv")), "")
+        self.assertEqual(lib.qemu_cpu(self.record(arch="riscv64")), "")
+
     def test_latest_baseline_none_when_only_hv(self):
         lib.append_history(
             "aarch64", self.record(backend="vmlab-hv", median=60.0)
@@ -396,6 +425,21 @@ class CheckTests(unittest.TestCase):
         regressions, _ = check.compare("aarch64", self.args)
         self.assertEqual(len(regressions), 1)
         self.assertIn("(jit)", regressions[0])
+
+    def test_qemu_rows_compare_with_their_cpu_model_only(self):
+        import check
+
+        # P6: a cortex-a53 row far faster than the max row is no "better",
+        # and the next max row is compared with the max row.
+        self.write([(30.0, 0.5)], workload="boot_to_agent_ready")
+        self.write([(20.0, 0.5)], workload="boot_to_agent_ready",
+                   env={"qemu_cpu": "cortex-a53"})
+        self.write([(40.0, 0.5)], workload="boot_to_agent_ready", env={"qemu_cpu": "max"})
+        regressions, notes = check.compare("aarch64", self.args)
+        self.assertEqual(len(regressions), 1)
+        self.assertIn("(max)", regressions[0])
+        self.assertIn("30.0 -> 40.0", regressions[0])
+        self.assertTrue(any("(cortex-a53)" in n and "only 1 entry" in n for n in notes))
 
     def test_a_row_of_the_check_is_not_gated(self):
         import check
@@ -507,6 +551,14 @@ class QemuArgvTests(unittest.TestCase):
                 "-S",
             ],
         )
+
+    def test_cpu_model_is_the_argument(self):
+        argv = qemu_vm_argv(
+            "aarch64", 4,
+            overlay="/o", code_fd="/c", vars_fd="/v", serial="/s",
+            agent_sock="/a", qmp_sock="/q", vnc_sock="/n", cpu="cortex-a53",
+        )
+        self.assertEqual(argv[argv.index("-cpu") + 1], "cortex-a53")
 
     def test_aarch64_machine_is_acpi_virt(self):
         argv = qemu_vm_argv(

@@ -168,6 +168,10 @@ impl HostFacts {
 /// guests under KVM and aarch64 guests on its emulator (phase 3d).
 const VMLAB_HOST_ARCH: &str = "x86_64";
 
+/// The one display device of the emulated `virt` machine, by QEMU's name:
+/// a 2D virtio-gpu without VGA.
+const VIRT_DISPLAY: &str = "virtio-gpu-pci";
+
 /// The vCPUs the emulated `virt` machine's GICv2 takes at most.
 const VIRT_MAX_VCPUS: u32 = 8;
 
@@ -331,9 +335,11 @@ fn vm_refusals(
 /// What an aarch64 guest's resolved hardware asks for that vmlab-hv's
 /// emulated `virt` machine (phase 3d) does not present: a GICv2 machine of
 /// one to eight vCPUs on AAVMF, with virtio-blk disks and CD-ROMs, virtio-net
-/// NICs and the agent's virtio-serial port. It has no display, input, USB,
-/// TPM, sound or virtio-fs yet. A display device the profile names is left
-/// out rather than refused: the guest runs headless, on its serial console.
+/// NICs, the agent's virtio-serial port, a 2D virtio-gpu (QEMU's
+/// `virtio-gpu-pci`, which `virtio-vga` becomes on `virt`) and the xHCI of
+/// the USB tablet and keyboard. It has no other display device, no USB
+/// passthrough, TPM, sound or virtio-fs yet. A VM with no display device
+/// runs headless, on its serial console.
 fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
     use crate::profiles::AgentTransport;
     let mut refuse = |what: &str, fix: &str| {
@@ -366,6 +372,16 @@ fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
     if h.gpu.is_some() {
         refuse("a `gpu {}` block", "remove it");
     }
+    if let Some(device) = h
+        .display_device
+        .as_deref()
+        .filter(|device| *device != VIRT_DISPLAY)
+    {
+        refuse(
+            &format!("display device `{device}`"),
+            "set display = \"virtio-gpu\"",
+        );
+    }
     if h.usb {
         refuse(
             "`usb = true` (an xHCI for passthrough)",
@@ -396,27 +412,6 @@ fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
     if h.apple_smc {
         refuse("an Apple SMC", "remove `apple_smc`");
     }
-}
-
-/// The line `up` and `vm start` print for an aarch64 VM on vmlab-hv whose
-/// profile, template or block names a display device: the emulated `virt`
-/// machine leaves it and the input devices out rather than refusing them
-/// (§22.5), so the VM loses the screen it had on QEMU. The display and input
-/// are the only devices `virt` lacks that are not refused, and only until
-/// R2 (#1225) brings them. `None` for any other VM.
-pub fn virt_display_dropped(h: &ResolvedVm) -> Option<String> {
-    let device = h.display_device.as_deref()?;
-    emulated_guest(&h.arch).then(|| {
-        format!(
-            "vm \"{}\": runs headless on vmlab-hv's emulated aarch64 `virt` machine, which \
-             has no display or input devices yet (PRD §22.5) — its display device `{device}` \
-             is left out, so screenshots, keyboard and mouse input, `vmlab record`, \
-             `vmlab console` and `gui = true` do not work; read its serial console with \
-             `vmlab logs`, or set hypervisor = \"qemu\" to keep a screen. This warning goes \
-             when virtio-gpu and input arrive on `virt` (R2, #1225)",
-            h.name
-        )
-    })
 }
 
 /// The resolved launch's hardware refusals, including attachments not carried
@@ -1464,35 +1459,9 @@ mod tests {
         );
     }
 
-    /// An aarch64 VM whose profile names a display device is told it runs
-    /// headless; an x86 VM, and an aarch64 one with no display device, are not.
-    #[test]
-    fn a_dropped_virt_display_is_said() {
-        let file = lab(r#"lab "l" {
-  vm "arm" { template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 1GiB }
-  vm "pc" { template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 1GiB }
-}"#);
-        let resolved = |name: &str| {
-            let crate::config::model::MachineCfg::Vm(vm) = file.lab.machine(name).unwrap() else {
-                unreachable!()
-            };
-            crate::qemu::resolve_vm(vm, None, &crate::profiles::ProfileSet::shipped().unwrap())
-                .unwrap()
-        };
-        let mut arm = resolved("arm");
-        let said = virt_display_dropped(&arm).expect("said");
-        assert!(
-            said.contains("virtio-gpu-pci") && said.contains("hypervisor = \"qemu\""),
-            "{said}"
-        );
-        assert_eq!(virt_display_dropped(&resolved("pc")), None);
-        arm.display_device = None;
-        assert_eq!(virt_display_dropped(&arm), None);
-    }
-
-    /// The emulated `virt` machine runs a modern aarch64 Linux VM headless
-    /// (its virtio GPU is left out) and refuses, by name, the hardware it
-    /// does not present yet.
+    /// The emulated `virt` machine runs a modern aarch64 Linux VM with its
+    /// virtio GPU, and refuses, by name, the hardware it does not present
+    /// yet: any other display device among it (#1225).
     #[test]
     fn an_aarch64_vm_is_refused_only_what_virt_lacks() {
         let base = r#"template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 10GiB"#;
@@ -1501,6 +1470,7 @@ mod tests {
             format!("{base} cpus = 8 secure_boot = true"),
             format!(r#"{base} accel = "tcg""#),
             format!(r#"{base} display = "virtio-gpu""#),
+            format!(r#"{base} display = "virtio-vga""#),
         ] {
             let why = refused(&body);
             assert!(why.is_empty(), "{body}: {why:?}");
@@ -1512,6 +1482,8 @@ mod tests {
             ("audio = true", "sound card"),
             (r#"cpu_model = "cortex-a72""#, "cpu_model"),
             (r#"gpu { mode = "virgl" }"#, "gpu {}"),
+            (r#"display = "std""#, "display device `VGA`"),
+            (r#"display = "ramfb""#, "display device `ramfb`"),
         ] {
             let why = refused(&format!("{base} {extra}"));
             assert!(
@@ -1525,8 +1497,8 @@ mod tests {
     /// as its `template` block declares them) and this repo's own aarch64
     /// labs. With no QEMU fallback (§22.5) each Linux one still selects
     /// vmlab-hv, new or existing on QEMU, and is refused nothing: its
-    /// profile's display device is left out with a warning, not refused,
-    /// until R2 (#1225). windows-11-arm64's profile asks for a TPM, which
+    /// profile's display device is the virtio GPU `virt` presents (#1225).
+    /// windows-11-arm64's profile asks for a TPM, which
     /// `virt` does not present, so it is refused by name, not moved to QEMU.
     #[test]
     fn every_shipped_aarch64_linux_template_selects_vmlab_hv() {
@@ -1575,8 +1547,7 @@ mod tests {
                     "{name}"
                 );
                 assert!(why.is_empty(), "{name}: {why:?}");
-                let said = virt_display_dropped(&hw).unwrap_or_default();
-                assert!(said.contains("#1225"), "{name}: {said}");
+                assert_eq!(hw.display_device.as_deref(), Some(VIRT_DISPLAY), "{name}");
             }
         }
         let (picked, why, _) = select(
