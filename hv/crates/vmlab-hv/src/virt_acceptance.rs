@@ -529,7 +529,7 @@ fn a_virt_machine_with_a_display_serves_its_screen_and_its_input() {
     let mut machine = Machine::start(dir.path(), &desc);
     for capability in [Capability::Display, Capability::Input] {
         assert!(
-            machine.client.has_capability(capability),
+            machine.client.has_capability(capability.clone()),
             "{capability:?}: {:?}",
             machine.client.capabilities()
         );
