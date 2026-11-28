@@ -1341,7 +1341,11 @@ mod tests {
         let share = &a.shares[0];
         assert_eq!((share.pci, share.tag.as_str()), (at(8), "work"));
         assert_eq!(
-            (share.socket.as_deref(), share.path.as_deref(), share.read_only),
+            (
+                share.socket.as_deref(),
+                share.path.as_deref(),
+                share.read_only
+            ),
             (None, Some(Path::new("/lab/work")), true)
         );
         assert_eq!(

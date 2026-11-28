@@ -581,9 +581,13 @@ fn a_host_write_into_translated_code_ends_it(jit: bool) {
         cbnz32(3, -2),  // 2
         asm::hvc(0),    // 3
     ];
-    memory.write_slice(&asm::bytes(&main), GuestAddress(MAIN)).unwrap();
+    memory
+        .write_slice(&asm::bytes(&main), GuestAddress(MAIN))
+        .unwrap();
     let function = |value: u16| asm::bytes(&[asm::movz(1, value, 0), asm::RET]);
-    memory.write_slice(&function(1), GuestAddress(FUNCTION)).unwrap();
+    memory
+        .write_slice(&function(1), GuestAddress(FUNCTION))
+        .unwrap();
     let mut cpu = vmlab_hv_tcg_aarch64::Cpu::new(bus, State::reset(MAIN));
     cpu.set_jit(jit).unwrap();
     let mut value = 1;

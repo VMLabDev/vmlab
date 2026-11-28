@@ -378,7 +378,10 @@ fn an_emulated_aarch64_guest_passes_traffic_on_tap_queues_and_refuses_vhost() {
             Duration::from_secs(60),
         )
         .unwrap();
-    assert_eq!(output.exit_code, 0, "aarch64 TAP guest configuration: {output:?}");
+    assert_eq!(
+        output.exit_code, 0,
+        "aarch64 TAP guest configuration: {output:?}"
+    );
     let echo = Echo::start();
     let output = agent
         .exec(

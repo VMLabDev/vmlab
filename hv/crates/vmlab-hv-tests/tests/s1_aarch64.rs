@@ -179,7 +179,11 @@ fn an_emulated_aarch64_guest_mounts_a_share_and_runs_a_program_from_it() {
         &format!("{BUSYBOX} mkdir -p /mnt/work && {BUSYBOX} mount -t virtiofs work /mnt/work"),
     );
     assert_eq!(
-        exec(&guest, &mut agent, &format!("{BUSYBOX} cat /mnt/work/hello.txt")),
+        exec(
+            &guest,
+            &mut agent,
+            &format!("{BUSYBOX} cat /mnt/work/hello.txt")
+        ),
         b"from the host share\n"
     );
     exec(
@@ -203,7 +207,11 @@ fn an_emulated_aarch64_guest_mounts_a_share_and_runs_a_program_from_it() {
     );
     assert!(host.path().join("busybox").is_file());
     assert_eq!(
-        exec(&guest, &mut agent, "/mnt/work/busybox echo ran-from-the-share"),
+        exec(
+            &guest,
+            &mut agent,
+            "/mnt/work/busybox echo ran-from-the-share"
+        ),
         b"ran-from-the-share\n"
     );
     exec(&guest, &mut agent, &format!("{BUSYBOX} umount /mnt/work"));
