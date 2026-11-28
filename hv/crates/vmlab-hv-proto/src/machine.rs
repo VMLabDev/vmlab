@@ -535,6 +535,9 @@ pub enum DisplayDevice {
     VirtioVga,
     CirrusVga,
     VmwareSvga,
+    /// virtio-gpu without VGA (QEMU's `virtio-gpu-pci`): the display of the
+    /// aarch64 `virt` machine, which decodes no legacy VGA. 2D only.
+    VirtioGpu,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -710,10 +710,16 @@ impl VmInstance {
     }
 
     /// Whether this VM is vmlab-hv's emulated aarch64 `virt` machine (§22,
-    /// phase 3d), which has no display, input devices or virtio-fs yet.
-    fn headless_virt(&self) -> bool {
+    /// phase 3d), which has no virtio-fs yet.
+    fn emulated_virt(&self) -> bool {
         self.hypervisor() == HypervisorKind::Vmlab
             && crate::config::hypervisor::emulated_guest(&self.template().resolved.arch)
+    }
+
+    /// Whether this VM is an emulated `virt` machine with no display
+    /// device: it runs headless on its serial console.
+    fn headless_virt(&self) -> bool {
+        self.emulated_virt() && self.template().resolved.display_device.is_none()
     }
 
     /// One of the running machine's capabilities (ADR-0020). Absent both
@@ -2364,14 +2370,14 @@ impl super::machine::Machine for VmInstance {
     }
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
-        if self.headless_virt() {
+        if self.emulated_virt() {
             return None;
         }
         self.emulator().virtiofsd()
     }
 
     fn virtiofs_in_process(&self) -> bool {
-        self.headless_virt() || self.emulator().virtiofs_in_process()
+        self.emulated_virt() || self.emulator().virtiofs_in_process()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {
@@ -2575,7 +2581,7 @@ impl super::machine::Machine for VmInstance {
         }
         // `virt` has no CD-ROM drive: the install medium is a read-only
         // virtio disk on either hypervisor, which nothing can eject.
-        if self.headless_virt() {
+        if self.emulated_virt() {
             bail!(
                 "vm \"{}\": the install CD-ROM of an aarch64 VM is a read-only virtio disk, \
                  which cannot be ejected (PRD §22.5); remove `cdrom` from the vm block and \
@@ -2758,9 +2764,6 @@ impl super::machine::Machine for VmInstance {
         let mut warnings: Vec<String> = qemu::secure_boot_store_unprotected(&t.resolved)
             .into_iter()
             .collect();
-        if self.headless_virt() {
-            warnings.extend(crate::config::hypervisor::virt_display_dropped(&t.resolved));
-        }
         let kvm = qemu::kvm_usable(&t.resolved.arch);
         let Ok(plan) = qemu::plan_accel(&t.resolved, kvm) else {
             return warnings;
@@ -2915,9 +2918,10 @@ impl super::machine::Machine for VmInstance {
         self.usb.lock().await.clone()
     }
 
-    /// None on vmlab-hv's emulated aarch64 `virt` machine, which runs
-    /// headless on its serial console (§22, phase 3d): every screen, input
-    /// and recording verb says the machine has no display.
+    /// None on vmlab-hv's emulated aarch64 `virt` machine when it has no
+    /// display device and runs headless on its serial console (§22, phase
+    /// 3d): every screen, input and recording verb says the machine has no
+    /// display. With one it has its virtio GPU and USB input (#1225).
     fn display(self: Arc<Self>) -> Option<super::display::Display> {
         if self.headless_virt() {
             return None;

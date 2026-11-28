@@ -3130,23 +3130,24 @@ setting, and not as a product path. riscv64 stays on QEMU until phase 3b.
 - **Firmware.** The AAVMF pair is looked up as for QEMU (§5.2): the host
   config's `firmware_dir`, vmlab's bundle, then the distro's. Each VM has its
   own VARS copy. The x86 OVMF size check does not apply.
-- **No display yet.** The machine has no display device, input device or
-  USB controller. A profile's display device is left out, not refused: the
-  guest runs headless on its serial console (`vmlab logs`), and is reached
-  with `vmlab exec` and `vmlab shell`. `vm screenshot`, `vm type` and the
-  other screen and input verbs, `vmlab record` and `--record` say the machine
-  has no display, and `machine.capabilities` reports none. Because a VM that
-  ran on QEMU had a screen, `up` and `vm start` warn, for a VM whose hardware
-  names a display device, that it runs headless, what that takes away, and
-  that `hypervisor = "qemu"` keeps a screen. The display and input devices are
-  the only ones the machine lacks that are left out with a warning rather
-  than refused, until virtio-gpu and input arrive on `virt` (R2, #1225). The
-  install CD-ROM is a read-only virtio disk on either hypervisor, and an
+- **Display and input.** The display is a 2D virtio-gpu without VGA, QEMU's
+  `virtio-gpu-pci` (a profile's `virtio-vga` or `virtio-gpu` resolves to it
+  on `virt`), in the slot after the NICs, served on `display.sock` and
+  `vnc.sock` as every vmlab-hv display is. The xHCI in the slot after it
+  carries the USB tablet and a USB keyboard: `virt` has no PS/2 controller,
+  so the keyboard is always there, also where QEMU adds `usb-kbd` only under
+  `input = "usb"`. AAVMF draws its console on the GPU and reads the
+  keyboard. `vm screenshot`, `vm type` and the other screen and input verbs,
+  `vmlab record`, `--record` and `gui = true` work. Any other display device
+  is refused like any other device the machine lacks (#1225). A VM with no
+  display device runs headless on its serial console (`vmlab logs`), is
+  reached with `vmlab exec` and `vmlab shell`, and its screen and input
+  verbs say the machine has no display. The install CD-ROM is a read-only virtio disk on either hypervisor, and an
   eject of it is refused by name.
 - **Refusals.** vmlab-hv refuses, for an aarch64 VM: a host that is not
   x86_64; `accel = "kvm"`; `qemu_args`; a machine other than `virt`; firmware
-  other than UEFI; more than eight vCPUs or less than 64 MiB; a `gpu {}`
-  block; `usb = true`; a TPM; `audio`; a `cpu_model`; a NIC model other than
+  other than UEFI; more than eight vCPUs or less than 64 MiB; a display
+  device other than the virtio-gpu; a `gpu {}` block; `usb = true`; a TPM; `audio`; a `cpu_model`; a NIC model other than
   virtio-net; `agent_transport = "isa-serial"`; an Apple SMC; and a floppy.
   `accel = "tcg"` is accepted and changes nothing. A share is never virtio-fs
   on this machine: `transport = "auto"` places it on SMB, and an explicit
