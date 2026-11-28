@@ -2948,6 +2948,158 @@ column is the newest row of the same suite, not run beside these: N10c
   vmlab-hv row's `qemu_baseline` comes from `max` (or `cortex-a53` for the
   flat images, as before).
 
+### P1 to P5, measured by card #1212
+
+The costs that T3d named and did not draft, profiled after T3-D1 to T3-D4.
+Helios, 2026-11-28, *measured*, `next` at `13ea856e` (T3-D1 to T3-D4, V3
+and P6 merged); the tree of the card differs from it by the tools of
+`measure/` only. A W1 build of `vmlab-hv` (line tables, frame pointers),
+`VMLAB_HV_JIT_PERF_MAP=1`, Debian 13 (`--suite full --repeats 1`), the
+reserved cores of #1205 (no `--cpus`). Two runs a vCPU count, one VM of
+this card at a time: run 1 at a load average of 4.9 to 6.3 (4.5 and 5.0
+busy CPUs beside the reserved ones), run 2 at 8.2 to 10.8 (5.7 and 4.8).
+Other cards ran builds and VMs at the same time. The W1 build boots in
+48.65 and 52.26 s at one vCPU (370 and 350 MIPS) and in 32.24 and 36.92 s
+at four; `sha256_256M` took 3.21 and 3.24 s at one vCPU. The rows of these
+runs are not in `bench/history/aarch64.jsonl`: the build is not the release
+build. No QEMU source was read (X1 to X3), and no source outside this
+repository.
+
+**The method.** `measure/ipstack.c` samples every thread of the VM at
+1000 Hz in windows of 5 s, from the launch to the end of the suite, with
+the call chain over frame pointers and, new in this card, the first 8
+words at the stack pointer and the time of each sample (`IPSTACK_WORDS`).
+`measure/ipcost.py` cuts the window of a workload by the sample times, the
+boot from the release of the CPUs to agent ready, `sha256_256M` the part
+of its run that the second-resolution bench log puts inside it for certain
+(2.21 and 2.24 s of 3.21 and 3.24 s). It classes the leaf of each sample of
+the vCPU threads as `measure/ipclass.py` does, with two corrections that
+this card made in `ipclass.py`:
+
+- **P2a. The classes matched the generic arguments of a function.** A
+  function of the JIT over `GuestBus`, such as `serve_jump`,
+  `serve_terminal`, `effect` and `store_exclusive_locked`, has
+  `vmlab_hv_vmm` in its name, and fell into "devices and the VMM". On run
+  1 at one vCPU that was 5.6 % of the boot under the old classes, and 0.1 %
+  is code of a device. `ipclass.py` now classes the name without its
+  generic arguments, and puts the serving of T3-D2 under the thunk. The 8.9
+  and 8.2 % of T3d are most likely the same error: T3d ran before T3-D2,
+  and `effect`, `store_pair` and the exclusive paths over `GuestBus` were
+  there.
+- A leaf in libc is named by the function of libc's `.eh_frame` that holds
+  it, and charged to its caller: the first stack word that returns into
+  the binary or into compiled code (P3).
+
+A share is of the samples of the vCPU threads in user space. Kernel time
+(a vCPU thread asleep in `WFI`, a futex) is not sampled.
+
+**The classes**, run 1 and run 2:
+
+| Share of the vCPU samples | Boot, 1 vCPU | Boot, 4 vCPUs | `sha256`, 1 vCPU |
+|---|---|---|---|
+| Samples | 42,346 and 46,192 | 66,582 and 81,277 | 2,179 and 2,240 |
+| Compiled code: the blocks | 30.5 and 29.9 % | 21.3 and 21.1 % | 21.8 and 20.7 % |
+| The thunk, the pure calls and the serving of T3-D2 | 11.3 and 11.4 % | 8.5 and 8.6 % | 8.4 and 7.4 % |
+| Entering and leaving compiled code in the Rust loop | 10.2 and 10.1 % | 17.7 and 18.3 % | 5.0 and 6.7 % |
+| The block lookup and the checks of the loop | 10.2 and 10.7 % | 12.0 and 12.8 % | 4.0 and 5.4 % |
+| P1: RAM behind a TLB hit (`GuestBus`) | 6.4 and 6.2 % | 5.8 and 5.2 % | 18.3 and 17.4 % |
+| The softmmu | 4.9 and 5.1 % | 5.5 and 5.5 % | 5.4 and 6.0 % |
+| Translation and compile | 5.4 and 5.1 % | 7.4 and 6.9 % | 2.7 and 2.4 % |
+| P3: libc, every leaf | 4.9 and 4.9 % | 6.0 and 6.0 % | 3.3 and 2.4 % |
+| Helpers: FP, vector, crypto | 2.5 and 2.3 % | 1.6 and 1.4 % | 18.3 and 20.2 % |
+| System: exceptions, system registers, the GIC, the timer | 1.5 and 1.5 % | 1.2 and 1.1 % | 0.4 % |
+| P2: devices and the VMM on the vCPU threads | 0.1 and 0.1 % | 0.1 and 0.1 % | 0.2 and 0.0 % |
+| P2: all other threads, against the vCPU samples | 0.8 and 0.9 % | 0.4 and 0.4 % | 1.0 and 0.5 % |
+| Other in the binary | 6.8 and 7.3 % | 8.9 and 8.7 % | 5.8 and 5.1 % |
+
+- **P1a. RAM behind a TLB hit is mostly a reference count.** `GuestBus`
+  clones its `Arc<Shared>` at every `write`, `load_reserved`,
+  `store_conditional` and `compare_and_store` (`guest_bus.rs`, the first
+  line of each) and drops it at the end: a locked increment and a locked
+  decrement per access, on one counter that the `GuestBus` of every vCPU
+  shares. The samples of those two instructions (the leaf in `sync.rs` of
+  `Arc::clone` and `Arc::drop`, the line in `guest_bus.rs` around it) are
+  4.4 and 4.4 % of the boot at one vCPU, 3.7 and 3.1 % at four, and 16.4
+  and 15.7 % of `sha256`. The basis of an explanation, not measured apart:
+  a locked instruction waits for the store buffer, so the drop also holds
+  the cost of the stores of the copy before it, and at four vCPUs the
+  counter's cache line moves between the cores. The bounds, the region
+  lookup and the copy are the rest: 2.0 and 1.8 % at one vCPU, 1.0 % at
+  four.
+- **P1b. The mutex at four vCPUs** is the transaction lock of
+  `load_reserved` (`guest_bus.rs`, the `serialize` lock of its second
+  line): 1.1 and 0.9 % of the boot, `RawMutex::lock_slow` 0.8 % of it. At
+  one vCPU none.
+- **P2b. Devices and the VMM are 1 % of a boot.** 0.1 % on the vCPU
+  threads, and the other threads (`machine-events`, `diagnostic-check`,
+  `disk0-queues`, `control-serve`, `virtio-console`) 0.4 to 0.9 % beside
+  them. The 9 % of T3d was most likely P2a.
+- **P3a. The libc leaves with no frame below them are malloc and free, not
+  memmove and memset.** At one vCPU (run 1; run 2 within 0.1): `_int_free`
+  1.7 %, 1.6 of it under `Jit::unlink_all`; `_int_malloc` 1.3 %, whose
+  caller is not in the first 8 stack words; the slow path of `malloc` 0.8 %,
+  0.5 of it under `RawVec::finish_grow` of the translation; memmove 0.7 %,
+  under `Cpu::run` and the loop; memset 0.1 %. At four vCPUs `_int_free`
+  2.0 and 2.2 % (1.9 under `unlink_all`), memmove 1.2 %, `_int_malloc` 1.1
+  %, the slow path 1.0 %. glibc exports none of these names: memmove and
+  memset are the functions that glibc selects for this CPU, which
+  `measure/libcsyms.c` finds with `dlsym`; `_int_free` is the function
+  that only `free` and `realloc` call, `_int_malloc` the one with the
+  10,000-turn limit of the unsorted bin (`0x2710`), and the slow path the
+  one that `malloc` and `free` call and that calls `_int_malloc`, read in
+  the disassembly of this host's libc (glibc 2.44, build id `141aba5f`).
+  C13b's 8.4 % was measured before J11 and T3-D3 cut the compiles.
+- **P4a. `sha256` at one vCPU** is three costs of about a fifth each. The
+  SHA-256 helpers, 26.3 % with their callers (`sha256_rounds` 18.3 %,
+  called from `in_registers`, which compiled code calls directly, J13).
+  8-byte stores that leave compiled code for the general path: 21.4 % of
+  the samples are under `store` called by `effect` from the thunk, 16.3 %
+  under `Side::store`, `write_at` and `GuestBus::write`, and 15.6 % of
+  that is the leaf of P1a. And compiled code, 21.8 % (two blocks of the
+  loop of `sha256sum` 11.6 %). The rest is the loop and the round trips
+  (about 15 %), the softmmu (5.4 %), libc and translation (5 %). The basis
+  of an explanation, not measured: the stores are the kernel's
+  `copy_to_user`, which writes the file into the buffer of `sha256sum`
+  with unprivileged 8-byte stores (`STTR`); 256 MiB is 33.6 million of
+  them, about 15 ns each at 16 % of 3.2 s. The shortcut of `store` fills
+  the fast TLB for a privileged store only, and most of these stores (16.3
+  of the 21.4 %) miss both shortcuts of `store` as well.
+- **P5a. Exclusives and spins at four vCPUs are small now.** With their
+  callers, `load_reserved` is 2.6 and 2.2 % of the boot and
+  `store_exclusive` 1.8 and 1.5 % (`compare_and_store` 0.6 and 0.5 % of
+  it). At one vCPU they are 1.2 and 1.1 % and 1.5 and 1.4 %. P1b is
+  inside them. The waits of J7c, J7d and T3-D4 (`Side::take_mail`,
+  `Side::broadcast`, `Shootdown::take`) are 1.5 and 1.6 %. The JIT lines
+  at the end of the suite count 7.5 to 9.9 million exclusive loads and 3.8
+  to 5.7 million exclusive stores a vCPU, against 18 to 21 million of each
+  at one vCPU: about 15 million loads over the four vCPUs that a store
+  does not follow, the spins of J7g, under 0.1 % of the instructions. Each
+  vCPU waited 98 to 186 ms for the others in the whole run, against 2.6 to
+  8.2 s of J7g, and the broadcasts of a page waited 78 to 81 ms a vCPU in
+  run 1.
+- **P5b. Not drafted, for the lead:** entering and leaving compiled code
+  is 17.7 and 18.3 % of the boot at four vCPUs against 10.1 and 10.2 % at
+  one, the leaf at the return from compiled code in `execute`
+  (`exec.rs`, after `counts.exit`) 7.6 % of it. It is none of P1 to P5.
+
+**Draft cards**, for the lead to file. The estimates are
+*est.*, from the shares above.
+
+| Draft | Title | What | Measured share | Estimate |
+|---|---|---|---|---|
+| P1-D | aarch64 3e: guest memory accesses without a reference count | `GuestBus` borrows its shared state in `write`, `load_reserved`, `store_conditional` and `compare_and_store` and in any other per-access path, where it clones the `Arc` today, so that an access has no locked instruction and the vCPUs share no counter. The stress tests of J7 and C3, K2, K6, the boot rows at 1 and 4 vCPUs, the `sha256` rows, and the profile of this section again. | 4.4 % of a boot at one vCPU, 3.1 to 3.7 % at four, 15.7 to 16.4 % of `sha256` (P1a). | A boot 1.02 to 1.05 times. `sha256` 1.05 to 1.2 times: the leaf also holds the drain of the stores before it, so the gain is between the two locked instructions alone and the whole share. |
+| P2-D | none | No card: devices and the VMM are 1 % of a boot (P2b). The error in the classes is fixed by this card (P2a). | 0.5 to 1.0 % | none |
+| P3-D | aarch64 3e: no heap calls in unlinking and in the rest of the translation | Count the heap calls of a boot by caller (J11's test for the translation), then: `Jit::unlink_all` keeps the vectors of the incoming sites and empties them, and the vectors that the translation still grows (`finish_grow`) are kept by the CPU, as J11 did for the lifter. K2, K3 on a Debian boot, the boot rows. | libc 4.9 % of a boot at one vCPU and 6.0 % at four, of which malloc and free 4.1 and 4.5 % (P3a). | A boot 1.02 to 1.04 times. |
+| P4-D1 | aarch64 3e: unprivileged stores and loads without the general path | First count the stores of a `sha256` run that reach `Side::store`, by the condition of `store` that sent them there (no `hit_host`, an exclusive mark, `maybe_code`, an unprivileged access). Then serve the cause in compiled code or in the shortcut of `store`, for example a fast TLB for `STTR` and `LDTR` with the user's rights. K1 for the load and store group with `LDTR` and `STTR`, K2, K3, the `sha256` rows at 1 and 4 vCPUs. | 21.4 % of `sha256` under the thunk's `store`, 16.3 % in the general path (P4a), which holds most of P1-D's share in `sha256`. | `sha256` 1.1 to 1.25 times, with P1-D: at most 1.27 times, the whole 21.4 %. A boot: not measured (the kernel copies to user space in a boot too). |
+| P4-D2 | aarch64 3e: the SHA-256 instructions on the host's SHA extension | `SHA256H`, `SHA256H2`, `SHA256SU0` and `SHA256SU1` as helpers over the x86 SHA instructions (`sha256rnds2`, `sha256msg1`, `sha256msg2`) where the host CPU has them, the helpers of J13 otherwise. K1 for the crypto group with the JIT on, on both helpers, and the `sha256` rows. | 26.3 % of `sha256` at one vCPU in the helpers and their callers (P4a). | `sha256` 1.15 to 1.25 times, if the helpers cost a quarter to a half of today. |
+| P5-D | aarch64 3e: exclusive loads without the transaction lock | `load_reserved` takes the transaction lock only where the store that it pairs with needs it, the generation read of `reservation_generation` without the lock otherwise, keeping the guarantees of C3 and J7. The stress tests of J7 and C3, kvm-unit-tests at 4 vCPUs, the boot rows at 4 vCPUs. | 0.9 to 1.1 % of a boot at four vCPUs in the lock; the exclusives 3.7 to 4.4 % and the waits 1.5 to 1.6 % (P1b, P5a). | A boot at four vCPUs 1.01 to 1.02 times. None at one vCPU. The lowest of these drafts. |
+
+- **The order.** For `sha256`, P4-D1 and P1-D share most of a
+  fifth, and P4-D2 another fifth: together they put it at about 80 to 100 %
+  of QEMU (*est.*, from 65 to 68 % today, T3b and P6). For the boot, P1-D and P3-D
+  are 2 to 5 % each, and the larger costs stay those of T3d2 and P5b: the
+  round trips and the loop.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -3188,6 +3340,21 @@ VMLAB_HV_JIT=1 just tcg-a64-lockstep loadstore 100000 1
 VMLAB_HV_JIT=1 just tcg-a64-lockstep c8 100000 1
 VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv --arch aarch64 \
   --vcpus 1 --repeats 1 --guest debian-13 --suite boot --keep --timeout-scale 4 --hv-bin <after>
+```
+
+P1 to P5 (card #1212), a W1 build of the commit, the firmware of J12, the reserved cores of
+#1205 (no `--cpus`), one VM at a time:
+
+```sh
+cc -O2 -o ipstack measure/ipstack.c && cc -O2 -o libcsyms measure/libcsyms.c && ./libcsyms > libc-names.txt
+# and one line "<address in libc, hex> <name>" for each malloc internal, read in the disassembly
+VMLAB_HV_JIT_PERF_MAP=1 python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 \
+  --guest debian-13 --suite full --keep --hv-bin <W1 binary> &                     # and --vcpus 4
+while kill -0 <pid of vmlab-hv>; do IPSTACK_WORDS=8 ./ipstack <pid> 5 out/w-$(date +%s); done
+cp /tmp/perf-<pid>.map out/perf.map
+python3 measure/ipcost.py <W1 binary> out --perf-map out/perf.map --libc-names libc-names.txt \
+  --window <from> <to> --top 40                       # unix seconds, fractions allowed
+python3 measure/ipcost.py ... --callers 'Side>::write_at'          # who calls a function
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the
