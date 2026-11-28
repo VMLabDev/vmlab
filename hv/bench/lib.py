@@ -158,6 +158,33 @@ X86_UBUNTU_WORKLOADS = (
     "idle_cpu_pct",
 )
 X86_WINDOWS_WORKLOADS = ("boot_to_agent_ready",)
+# `--suite idle` (card #1197): one VM booted to agent ready, left alone for
+# `--idle-settle` seconds, then sampled for IDLE_WINDOW: the host CPU of the
+# VM process and KVM's own exit counters summed over its vCPUs, read from
+# vmlab-hv's diagnostics report (vm.kvm_stats) and from QEMU's query-stats.
+X86_IDLE_WORKLOADS = (
+    "boot_to_agent_ready",
+    "idle_cpu_pct",
+    "idle_exits_per_s",
+    "idle_halt_exits_per_s",
+    "idle_irq_exits_per_s",
+    "idle_hypercalls_per_s",
+    "idle_user_exits_per_s",
+    "idle_emulations_per_s",
+)
+# KVM's statistic behind each idle exit workload. `user` exits are those
+# KVM hands to the VMM (I/O and MMIO that no in-kernel device takes).
+IDLE_EXIT_COUNTERS = {
+    "idle_exits_per_s": ("exits",),
+    "idle_halt_exits_per_s": ("halt_exits",),
+    "idle_irq_exits_per_s": ("irq_exits",),
+    "idle_hypercalls_per_s": ("hypercalls",),
+    "idle_user_exits_per_s": ("io_exits", "mmio_exits"),
+    # Instructions KVM emulates: xAPIC MMIO accesses on a host without APIC
+    # virtualization. A Windows guest told to use the Hyper-V APIC MSRs makes
+    # few (card #1197: about 2000/s on 4 vCPUs before, under 110/s after).
+    "idle_emulations_per_s": ("insn_emulation",),
+}
 X86_G2G_WORKLOADS = ("net_g2g_a2b_tcp_mbps", "net_g2g_b2a_tcp_mbps")
 X86_G2G1500_WORKLOADS = ("net_g2g1500_a2b_tcp_mbps", "net_g2g1500_b2a_tcp_mbps")
 X86_G2G_MULTIFLOW_WORKLOADS = (
@@ -188,6 +215,7 @@ UNIT = {
     "net_g2g_b2a_tcp_mbps": "Mbit/s",
     **{name: "Mbit/s" for name in X86_G2G1500_WORKLOADS + X86_G2G_MULTIFLOW_WORKLOADS},
     "idle_cpu_pct": "%cpu",
+    **{name: "exits/s" for name in IDLE_EXIT_COUNTERS},
 }
 
 
@@ -197,6 +225,8 @@ def workloads(arch, guest="debian-13", suite="full"):
         return TCG_WORKLOADS
     if suite in G2G_SUITES:
         return G2G_SUITES[suite]["workloads"]
+    if suite == "idle":
+        return X86_IDLE_WORKLOADS
     return X86_WINDOWS_WORKLOADS if guest.startswith("windows-") else X86_UBUNTU_WORKLOADS
 
 
@@ -215,12 +245,13 @@ D28_BAR = {
     "net_g2g_a2b_tcp_mbps": (">=", 0.80),
     "net_g2g_b2a_tcp_mbps": (">=", 0.80),
     "idle_cpu_pct": None,
+    **{name: None for name in IDLE_EXIT_COUNTERS},
 }
 
 # Which way is a regression, for bench-check. Time and idle CPU grow when
 # worse. Throughput and boot MIPS shrink when worse.
 DIRECTION = {
-    name: ("lower" if unit in ("s", "%cpu") else "higher")
+    name: ("lower" if unit in ("s", "%cpu", "exits/s") else "higher")
     for name, unit in UNIT.items()
 }
 
@@ -558,6 +589,80 @@ def qmp_cont(path, timeout=60):
 # ---------------------------------------------------------------------------
 
 
+KVM_STAT_NAMES = ("exits", "halt_exits", "irq_exits", "hypercalls", "io_exits", "mmio_exits",
+                  "insn_emulation")
+
+
+def sum_vcpu_stats(per_vcpu):
+    """Each named KVM statistic summed over a list of {name: value} maps."""
+    return {name: sum(int(v.get(name, 0)) for v in per_vcpu) for name in KVM_STAT_NAMES}
+
+
+def hv_kvm_stats(control_sock, timeout=60):
+    """KVM's vCPU statistics of a vmlab-hv VM, summed over its vCPUs: a
+    `dump_diagnostics` report on a second control connection, read and
+    removed. None when the report carries no statistics."""
+    client = HvControlClient(control_sock, timeout)
+    try:
+        client.request("dump_diagnostics")
+        path = client.dumped_path()
+    finally:
+        client.close()
+    try:
+        with open(path) as f:
+            report = json.load(f)
+    finally:
+        os.remove(path)
+    stats = (report.get("vm") or {}).get("kvm_stats")
+    if not stats:
+        return None
+    return sum_vcpu_stats([v.get("counters") or {} for v in stats["vcpus"]])
+
+
+def qemu_kvm_stats(qmp_sock, timeout=60):
+    """The same statistics of a QEMU VM, from QMP `query-stats`."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(qmp_sock)
+        s.settimeout(timeout)
+        stream = s.makefile("rwb")
+        stream.readline()
+        reply = None
+        for request_id, request in enumerate((
+            {"execute": "qmp_capabilities"},
+            {"execute": "query-stats", "arguments": {
+                "target": "vcpu",
+                "providers": [{"provider": "kvm", "names": list(KVM_STAT_NAMES)}]}},
+        ), start=1):
+            stream.write((json.dumps({**request, "id": request_id}) + "\n").encode())
+            stream.flush()
+            while True:
+                line = stream.readline()
+                if not line:
+                    raise BenchError("QMP connection closed before its reply")
+                reply = json.loads(line)
+                if reply.get("id") == request_id:
+                    break
+            if "error" in reply:
+                raise BenchError(f"QMP {request['execute']}: {reply['error']}")
+    finally:
+        s.close()
+    return sum_vcpu_stats([
+        {stat["name"]: stat["value"] for stat in vcpu.get("stats", [])}
+        for vcpu in reply["return"] if vcpu.get("provider") == "kvm"
+    ])
+
+
+def idle_rates(cpu0, cpu1, stats0, stats1, window):
+    """The idle workloads from two samples `window` seconds apart."""
+    samples = {"idle_cpu_pct": round((cpu1 - cpu0) / window * 100, 2)}
+    if stats0 is not None and stats1 is not None:
+        for name, counters in IDLE_EXIT_COUNTERS.items():
+            delta = sum(stats1[c] - stats0[c] for c in counters)
+            samples[name] = round(delta / window, 1)
+    return samples
+
+
 class HvControlClient:
     """The vmlab-hv control socket: handshake, then one command per request.
 
@@ -605,7 +710,21 @@ class HvControlClient:
                 if m.get("outcome") != "ok":
                     raise BenchError(f"control {command} failed: {m}")
                 return m
-            # Events (e.g. run-state changes) are ignored here.
+            if m.get("type") == "event" and m.get("event") == "diagnostics_dumped":
+                self.dumped = m["path"]
+            # Other events (e.g. run-state changes) are ignored here.
+
+    def dumped_path(self):
+        """The report path of the `diagnostics_dumped` event that follows a
+        `dump_diagnostics` reply (the event can also precede it)."""
+        pending = getattr(self, "dumped", None)
+        if pending:
+            self.dumped = None
+            return pending
+        while True:
+            m = self._read()
+            if m.get("type") == "event" and m.get("event") == "diagnostics_dumped":
+                return m["path"]
 
     def debug(self, operation, **kwargs):
         """One debug request; its response (vmlab-hv-proto debug.rs)."""
@@ -711,10 +830,18 @@ def prepare_run_dir(run, arch, guest, version):
     return overlay, code, os.path.join(run, "vars.fd")
 
 
+# `run.py --no-apicv`: configure VMs as on a host without APIC
+# virtualization (a nested host such as WSL2), where KVM emulates every
+# xAPIC access a guest makes.
+NO_APIC_VIRTUALIZATION = False
+
+
 def host_apic_virtualization():
     """vmlab's cmdline::host_apic_virtualization: kvm_intel's enable_apicv
     or kvm_amd's avic. Decides the hv-avic enlightenment and QEMU's
     kvm-pit lost-tick global on this host."""
+    if NO_APIC_VIRTUALIZATION:
+        return False
     for module, param in [("kvm_intel", "enable_apicv"), ("kvm_amd", "avic")]:
         try:
             with open(f"/sys/module/{module}/parameters/{param}") as f:
