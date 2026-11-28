@@ -1277,7 +1277,12 @@ impl VmShared {
 
     pub(crate) fn sync_vga_mapping(&self) -> Result<(), VmmError> {
         use vm_memory::{GuestAddress, GuestMemoryBackend};
-        let Some(vga) = self.vga.lock().clone() else {
+        let Some(vga) = self
+            .vga
+            .lock()
+            .clone()
+            .filter(|vga| vga.has_linear_framebuffer())
+        else {
             return Ok(());
         };
         // The PCI hole starts where this machine's low RAM stops: at 2 GiB
@@ -1732,32 +1737,7 @@ impl Vm {
                     .map_err(|e| VmmError::Other(format!("spawning chipset timer: {e}")))?,
             )
         };
-        // Rendering a frame can exceed the guest's PCM I/O timeout. Keep
-        // it off the thread that advances audio and the platform timers.
-        // The binary attaches the display server after constructing the VM.
-        if machine.shared.vga.lock().is_some()
-            || machine.shared.virtual_display.lock().is_some()
-            || machine.shared.display.lock().is_some()
-        {
-            let weak = Arc::downgrade(&machine.shared);
-            machine.display_worker = Some(
-                std::thread::Builder::new()
-                    .name("display-frames".into())
-                    .spawn(move || {
-                        while let Some(shared) = weak.upgrade() {
-                            if shared.exited() {
-                                break;
-                            }
-                            shared.poll_display();
-                            let mut state = shared.state.lock();
-                            shared
-                                .state_cv
-                                .wait_for(&mut state, std::time::Duration::from_millis(16));
-                        }
-                    })
-                    .map_err(|e| VmmError::Other(format!("spawning display worker: {e}")))?,
-            );
-        }
+        machine.spawn_display_worker()?;
         if machine.shared.pflash.lock().is_some() {
             let weak = Arc::downgrade(&machine.shared);
             std::thread::Builder::new()
@@ -1777,6 +1757,38 @@ impl Vm {
         Ok(machine)
     }
 
+    /// Rendering a frame can exceed the guest's PCM I/O timeout, so the
+    /// display has its own thread, off the one that advances audio and the
+    /// platform timers. The binary attaches the display server after the
+    /// machine is built.
+    fn spawn_display_worker(&mut self) -> Result<(), VmmError> {
+        if self.shared.vga.lock().is_none()
+            && self.shared.virtual_display.lock().is_none()
+            && self.shared.display.lock().is_none()
+        {
+            return Ok(());
+        }
+        let weak = Arc::downgrade(&self.shared);
+        self.display_worker = Some(
+            std::thread::Builder::new()
+                .name("display-frames".into())
+                .spawn(move || {
+                    while let Some(shared) = weak.upgrade() {
+                        if shared.exited() {
+                            break;
+                        }
+                        shared.poll_display();
+                        let mut state = shared.state.lock();
+                        shared
+                            .state_cv
+                            .wait_for(&mut state, std::time::Duration::from_millis(16));
+                    }
+                })
+                .map_err(|e| VmmError::Other(format!("spawning display worker: {e}")))?,
+        );
+        Ok(())
+    }
+
     /// A machine whose vCPUs run on the emulator. Each backend is shared
     /// with the machine, which reaches a vCPU while its thread is parked:
     /// PSCI turns one on, and a reset puts each back.
@@ -1794,6 +1806,7 @@ impl Vm {
             timer: None,
             display_worker: None,
         };
+        machine.spawn_display_worker()?;
         for (id, vcpu) in vcpus {
             machine.vcpus.push(
                 VcpuThread::spawn_backend(id, vcpu, machine.shared.clone())

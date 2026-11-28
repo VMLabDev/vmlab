@@ -150,9 +150,9 @@ def down_isolation(h, attempts=1):
 def emulated_aarch64(h):
     """`arch.emulated`: the aarch64 guest of `admin-lab`, in a lab of its own.
     A vmlab run leaves it to automatic selection, which puts it on vmlab-hv's
-    emulated `virt` machine (PRD §22, phase 3d): headless, so the screen verbs
-    say it has no display. A QEMU run pins it to QEMU under TCG, the
-    troubleshooting route, which draws a screen."""
+    emulated `virt` machine (PRD §22, phase 3d), whose virtio GPU the
+    firmware draws on. A QEMU run pins it to QEMU under TCG, the
+    troubleshooting route, which draws a screen too."""
     with h.lab("admin-lab") as lab:
 
         def on_vmlab_hv():
@@ -167,11 +167,15 @@ def emulated_aarch64(h):
             # vmlab's own AAVMF: the image carries no qemu-efi-aarch64.
             assert boot["firmware"] == "aavmf", boot
             assert boot["code"] == "/usr/share/vmlab/guest/firmware/aarch64/AAVMF_CODE.fd", boot
-            assert "display" not in desc, desc
+            assert desc["display"]["device"] == "virtio-gpu", desc["display"]
+            assert desc.get("tablet") and desc.get("usb_keyboard"), desc
             h.wait_until(lambda: "UEFI" in h.vmlab("logs", "arm01", "-n", "200", cwd=lab, check=False).out,
                          timeout=180, what="the aarch64 firmware on the serial console")
-            shot = h.vmlab("vm", "screenshot", "arm01", str(WORK / "arm01.png"), cwd=lab, check=False)
-            assert shot.code != 0 and "has no display" in shot.text, shot.text
+            png = WORK / "arm01.png"
+            png.unlink(missing_ok=True)
+            h.vmlab("vm", "screenshot", "arm01", str(png), cwd=lab)
+            data = png.read_bytes()
+            assert data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 1000, f"{len(data)} bytes"
             return True
 
         def on_qemu():
@@ -204,7 +208,7 @@ def emulated_aarch64(h):
         else:
             h.check("arch.emulated", on_vmlab_hv,
                     "vmlab-hv's emulated virt machine on the bundled AAVMF reached UEFI on serial; "
-                    "no QEMU; vm screenshot refused: no display")
+                    "no QEMU; vm screenshot of its virtio GPU wrote a PNG")
         # Both labs are `e2e-admin`: this one goes before the next comes up.
         h.destroy(lab)
 

@@ -19,6 +19,9 @@ pub(crate) enum Video {
     Standard(Arc<Mutex<vmlab_hv_devices::display::StandardVga>>),
     Virtio(Arc<Mutex<vmlab_hv_devices::display::virtio_vga::VirtioVga>>),
     Cirrus(Arc<Mutex<vmlab_hv_devices::display::cirrus::CirrusVga>>),
+    /// virtio-gpu without VGA: the display of the aarch64 `virt` machine.
+    /// It has no legacy ports, aperture or linear framebuffer BAR.
+    Gpu(Arc<Mutex<vmlab_hv_devices::display::virtio_gpu::VirtioGpu>>),
 }
 
 impl Video {
@@ -27,6 +30,7 @@ impl Video {
             Self::Standard(device) => device.lock().scanout_active(),
             Self::Cirrus(device) => device.lock().scanout_active(),
             Self::Virtio(device) => device.lock().scanout_active(),
+            Self::Gpu(device) => device.lock().scanout_active(),
         }
     }
     pub(crate) fn accelerated(&self) -> bool {
@@ -36,6 +40,7 @@ impl Video {
         match self {
             Self::Standard(_) | Self::Cirrus(_) => true,
             Self::Virtio(device) => device.lock().poll_scanout(),
+            Self::Gpu(device) => device.lock().poll_scanout(),
         }
     }
     pub(crate) fn set_aperture_base(&self, base: Option<u64>) -> Result<(), VmmError> {
@@ -52,6 +57,7 @@ impl Video {
             Self::Standard(device) => device.lock().io_read(port, data),
             Self::Cirrus(device) => device.lock().io_read(port, data),
             Self::Virtio(device) => device.lock().io_read(port, data),
+            Self::Gpu(_) => {}
         }
     }
     pub(crate) fn io_write(&self, port: u16, data: &[u8]) {
@@ -59,6 +65,7 @@ impl Video {
             Self::Standard(device) => device.lock().io_write(port, data),
             Self::Cirrus(device) => device.lock().io_write(port, data),
             Self::Virtio(device) => device.lock().io_write(port, data),
+            Self::Gpu(_) => {}
         }
     }
     pub(crate) fn legacy_read(&self, offset: u64, data: &mut [u8]) {
@@ -66,6 +73,7 @@ impl Video {
             Self::Standard(device) => device.lock().legacy_read(offset, data),
             Self::Cirrus(device) => device.lock().legacy_read(offset, data),
             Self::Virtio(device) => device.lock().legacy_read(offset, data),
+            Self::Gpu(_) => {}
         }
     }
     pub(crate) fn legacy_write(&self, offset: u64, data: &[u8]) {
@@ -73,6 +81,7 @@ impl Video {
             Self::Standard(device) => device.lock().legacy_write(offset, data),
             Self::Cirrus(device) => device.lock().legacy_write(offset, data),
             Self::Virtio(device) => device.lock().legacy_write(offset, data),
+            Self::Gpu(_) => {}
         }
     }
     pub(crate) fn frame(&self) -> (u64, vmlab_hv_devices::display::Frame) {
@@ -83,6 +92,10 @@ impl Video {
                 let mut device = device.lock();
                 (device.scanout_generation(), device.frame())
             }
+            Self::Gpu(device) => {
+                let device = device.lock();
+                (device.scanout_generation(), device.frame())
+            }
         }
     }
     pub(crate) fn linear_framebuffer(&self) -> vmlab_hv_devices::GuestMemory {
@@ -90,6 +103,8 @@ impl Video {
             Self::Standard(device) => device.lock().linear_framebuffer(),
             Self::Cirrus(device) => device.lock().linear_framebuffer(),
             Self::Virtio(device) => device.lock().linear_framebuffer(),
+            // Never asked: `has_linear_framebuffer` is false.
+            Self::Gpu(_) => unreachable!("virtio-gpu has no linear framebuffer"),
         }
     }
     pub(crate) fn mark_framebuffer_dirty(&self) {
@@ -97,6 +112,7 @@ impl Video {
             Self::Standard(device) => device.lock().mark_framebuffer_dirty(),
             Self::Cirrus(device) => device.lock().mark_framebuffer_dirty(),
             Self::Virtio(device) => device.lock().mark_framebuffer_dirty(),
+            Self::Gpu(_) => {}
         }
     }
     pub(crate) fn framebuffer_size(&self) -> usize {
@@ -104,35 +120,42 @@ impl Video {
             Self::Standard(_) => 16 << 20,
             Self::Cirrus(_) => vmlab_hv_devices::display::cirrus::VRAM_SIZE,
             Self::Virtio(_) => 8 << 20,
+            Self::Gpu(_) => 0,
         }
     }
     pub(crate) fn pci_id(&self) -> u32 {
         match self {
             Self::Standard(device) => device.lock().pci_identity(),
             Self::Cirrus(device) => device.lock().pci_identity(),
-            Self::Virtio(_) => 0x10501af4,
+            Self::Virtio(_) | Self::Gpu(_) => 0x10501af4,
         }
     }
     pub(crate) fn framebuffer_bar(&self) -> usize {
         match self {
             Self::Standard(device) => device.lock().framebuffer_bar(),
-            Self::Virtio(_) | Self::Cirrus(_) => 0,
+            Self::Virtio(_) | Self::Cirrus(_) | Self::Gpu(_) => 0,
         }
+    }
+    /// Whether the device has a framebuffer BAR that a KVM machine maps
+    /// into the guest directly.
+    pub(crate) fn has_linear_framebuffer(&self) -> bool {
+        !matches!(self, Self::Gpu(_))
     }
     pub(crate) fn unsupported_fifo(&self) -> Option<String> {
         match self {
             Self::Standard(device) => device.lock().unsupported_fifo(),
-            Self::Virtio(_) | Self::Cirrus(_) => None,
+            Self::Virtio(_) | Self::Cirrus(_) | Self::Gpu(_) => None,
         }
     }
     pub(crate) fn cursor(&self) -> vmlab_hv_display::Cursor {
         if !self.scanout_active() {
             return Default::default();
         }
-        let Self::Virtio(device) = self else {
-            return Default::default();
+        let c = match self {
+            Self::Virtio(device) => device.lock().cursor(),
+            Self::Gpu(device) => device.lock().cursor(),
+            Self::Standard(_) | Self::Cirrus(_) => return Default::default(),
         };
-        let c = device.lock().cursor();
         vmlab_hv_display::Cursor {
             width: c.width,
             height: c.height,
@@ -145,8 +168,14 @@ impl Video {
         }
     }
     pub(crate) fn request_size(&self, width: u32, height: u32) {
-        if let Self::Virtio(device) = self {
-            let _ = device.lock().request_size(width, height);
+        match self {
+            Self::Virtio(device) => {
+                let _ = device.lock().request_size(width, height);
+            }
+            Self::Gpu(device) => {
+                let _ = device.lock().request_size(width, height);
+            }
+            Self::Standard(_) | Self::Cirrus(_) => {}
         }
     }
 }
@@ -681,11 +710,14 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
     if let Some(source) = virtual_source {
         let _ = source.server.set(Arc::downgrade(&server));
     }
-    if let Some(Video::Virtio(device)) = shared.vga.lock().as_ref() {
-        device.lock().set_display_sink(Arc::new(GpuSink {
-            source,
-            server: Arc::downgrade(&server),
-        }));
+    let sink = Arc::new(GpuSink {
+        source,
+        server: Arc::downgrade(&server),
+    });
+    match shared.vga.lock().as_ref() {
+        Some(Video::Virtio(device)) => device.lock().set_display_sink(sink),
+        Some(Video::Gpu(device)) => device.lock().set_display_sink(sink),
+        _ => {}
     }
     for (listener, rfb, name) in [
         (native_listener, false, "display-native"),
