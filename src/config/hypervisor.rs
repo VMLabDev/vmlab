@@ -278,7 +278,11 @@ fn vm_refusals(
                     host.arch
                 )
             } else {
-                arch_refusal("vm host", name, &host.arch)
+                format!(
+                    "vm \"{name}\": vmlab-hv runs on an x86_64 host only so far, and this host \
+                     is {} (PRD §22) — use hypervisor = \"qemu\"",
+                    host.arch
+                )
             },
         );
     }
@@ -705,7 +709,11 @@ fn container_refusals(c: &Container, host: &HostFacts) -> Vec<String> {
     let mut why = Vec::new();
     // A container runs the host's own architecture.
     if host.arch != VMLAB_HOST_ARCH {
-        why.push(arch_refusal("container", name, &host.arch));
+        why.push(format!(
+            "container \"{name}\": vmlab-hv runs containers under KVM on x86_64 only so far, \
+             and this host is {} (PRD §22) — use hypervisor = \"qemu\"",
+            host.arch
+        ));
     } else if !host.kvm {
         why.push(kvm_required("container", name));
     }
