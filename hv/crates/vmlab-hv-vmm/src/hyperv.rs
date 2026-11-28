@@ -524,7 +524,8 @@ mod tests {
                 .find(|e| e.function == BASE + 4)
                 .unwrap()
                 .eax,
-            0xc24
+            // No AVIC: the APIC access recommendation (bit 3) is on.
+            0xc2c
         );
     }
 
