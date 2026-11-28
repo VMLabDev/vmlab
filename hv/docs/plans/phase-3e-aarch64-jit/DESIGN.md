@@ -2323,6 +2323,105 @@ the median of 3, s:
   for a device on a loaded host: seconds a boot in T3-D4c, where a broadcast
   waited as long as the slowest device access of another CPU.
 
+### V2, measured by card #1216
+
+Proposal V2 of the review (thread 1, posts 28 and 33): three low-risk
+changes, each estimated at 1.03 to 1.07 times, each measured on its own.
+
+- **V2a. What was built.**
+  - *ThinLTO* (`84a73772`): `[profile.release] lto = "thin"` in the root
+    `Cargo.toml`, which had no release profile. The merge bar builds no
+    release binary, so `just ci::check` does not change. A release build
+    of `vmlab-hv` took 44 s without it and 49 s with it on helios.
+  - *The write table after an exclusive* (`743c268d`): the thunk took the
+    write table of the fast TLB away when an operation left an exclusive
+    mark, and only the next run gave it back. Now the thunk gives it back
+    as soon as an operation ends the mark (an exclusive store, `CLREX`),
+    so the plain stores after an `LDXR`/`STXR` pair in the same chained run
+    hit the table again. `fill_fast` fills no write entry while a mark is
+    set, so the table is the one the next run would take. A replay of K3
+    and a run with memory through the thunk keep the empty table. The test
+    `the_store_after_an_exclusive_store_takes_the_write_table_again_in_the_same_run`
+    (`tests/fasttlb.rs`) fails on `6c78c278` (two misses for one) and passes
+    with the change.
+  - *Word copies in `GuestBus`* (`e5b64d8c`): an access of RAM that is not
+    1, 2, 4 or 8 bytes at its own alignment (a pair, a 16-byte access, an
+    access that is not aligned) was copied one byte at a time. It now moves
+    in the largest of 8, 4, 2 and 1 bytes that the host address is aligned
+    to and that fits, so every 8-byte element of an aligned pair is one host
+    access. Unit tests: every offset 0 to 23 and every length 0 to 47 against
+    the bytes, and the choice of the size. The flat images run on
+    `FlatMemory` and do not reach this path.
+- **V2b. How it was measured.** Helios, 2026-11-28, *measured*, the
+  release build, the pin of card #1205. Base is `next` at `6c78c278`. Each
+  variant is base with one of the three commits and nothing else, built in
+  its own tree and target directory. A round runs the full suite (`--suite
+  full`: boot, `sha256`, `xz`, Debian 13, 1 and 4 vCPUs, three repeats) and
+  the flat rows (`--backend jit`, three repeats) of each variant in turn:
+  round 1 base, ThinLTO, write table, words, round 2 the reverse, round 3
+  the order of round 1, and round 4 base again. Other cards ran builds and VMs
+  at the same time. The load is the 1-minute load average at the starts of
+  the repeats (32 logical CPUs). The rows are in `bench/history/aarch64.jsonl`
+  with the note "card #1216 V2", the variant and the round, each repeat
+  with its host load. The rows of a variant are marked dirty with the
+  commit `6c78c278`, as the picked commit has no commit of its own there.
+  The flat rows of base are dirty by the history file alone. CoreMark is the
+  flat image, one CPU: there is no CoreMark row at four vCPUs. No QEMU
+  source was read (X1).
+- **V2c. A hang that is not of this card.** Two boots stopped before agent
+  ready and the bench gave up on that configuration: round 1 of the word
+  copies at one vCPU, and round 3 of base at one vCPU, which has none of
+  the three changes. Both ran 17 billion instructions in about 135 s, as a
+  good boot does, then one billion in the next 400 to 840 s. The serial log
+  of the base boot stops at 142 s of guest time, in the AppArmor profile
+  loads. The same timeout is in an older bench log on helios
+  (`b1143-before`). Those two configurations have no rows.
+
+The rows, the median of three per round, s (CoreMark: s for 1,000
+iterations), with the load at the starts:
+
+| Row | Base | ThinLTO | Write table | Words |
+|---|---|---|---|---|
+| Boot, 1 vCPU | 64.44 (7-12), 49.55 (3-5), 56.26 (5-11) | 125.67 (14-17), 60.28 (8-13), 48.90 (4-7) | 53.78 (5-9), 48.23 (4-6), 72.30 (5-9) | hang, 52.72 (4-6), 50.76 (4-8) |
+| Boot, 4 vCPUs | 98.73 (14-21), 41.36 (3-7), 40.83 (7-10) | 40.48 (11-14), 36.32 (5-8), 37.51 (5-6) | 36.49 (3-6), 49.25 (3-12), 41.82 (8-9) | 36.64 (6-7), 36.25 (4-5) |
+| `sha256`, 1 vCPU | 3.27, 2.23, 2.40 | 2.43, 1.91, 2.44 | 2.30, 2.32, 2.33 | 2.34, 2.26 |
+| `sha256`, 4 vCPUs | 2.16, 1.89, 1.93 | 1.91, 1.88, 1.93 | 1.88, 1.87, 1.97 | 1.94, 1.89 |
+| `xz`, 1 vCPU | 9.54, 8.73, 9.02 | 8.84, 8.90, 8.77 | 8.84, 8.71, 8.84 | 8.71, 8.74 |
+| `xz`, 4 vCPUs | 9.03, 8.41, 8.56 | 8.54, 8.58, 8.58 | 8.91, 8.54, 8.97 | 8.66, 8.68 |
+| CoreMark, 1 CPU | 0.0916, 0.0887, 0.0919, 0.0910 | 0.0918, 0.0899, 0.0879 | 0.0909, 0.0900, 0.0939 | 0.0933, 0.0913, 0.0883 |
+
+The fastest repeat of each build, over all rounds, s:
+
+| Row | Base | ThinLTO | Write table | Words |
+|---|---|---|---|---|
+| Boot, 1 vCPU | 49.21 | 48.65 | 48.19 | 48.44 |
+| Boot, 4 vCPUs | 36.37 | 36.24 | 36.22 | 36.16 |
+| `sha256`, 1 vCPU | 2.20 | 1.81 | 1.84 | 1.86 |
+| `sha256`, 4 vCPUs | 1.83 | 1.87 | 1.84 | 1.88 |
+| `xz`, 1 vCPU | 8.70 | 8.51 | 8.58 | 8.52 |
+| `xz`, 4 vCPUs | 8.37 | 8.40 | 8.47 | 8.48 |
+| CoreMark, 1 CPU | 0.0885 | 0.0874 | 0.0886 | 0.0882 |
+
+- **V2d. K3 (J2).** A Debian 13 boot at two vCPUs on the build of
+  `09daf8a5` (all three changes), `VMLAB_HV_JIT_CHECK=1`,
+  `VMLAB_HV_JIT_CHECK_RUNS=1000`, at a load of 7 to 16: agent ready after
+  113.3 s, no difference, 135.95 million checked runs (996.9 million
+  instructions) over both vCPUs up to their last JIT lines, at 12.0e9 and
+  6.0e9 instructions.
+- **V2e. The verdict.** None of the three estimates (1.03 to 1.07 times)
+  shows above the noise of the host. The fastest repeats of the four
+  builds are within 1 % of each other on the boot at both vCPU counts and
+  on `xz` at four, and within 2.2 % on `xz` at one vCPU and on CoreMark,
+  where no build is ahead in every round. The medians at four vCPUs seem to favour ThinLTO and
+  the words (36 to 38 s against 41 s for base in its quiet rounds), but
+  base reaches 36.4 s in its fastest repeat as well: the difference is in
+  the slow repeats, which the load gives. `sha256` at one vCPU spreads
+  1.8 to 4.8 s inside one build. The changes are kept: the write table
+  fixes a run that wrote through the thunk without a reason, the words
+  make each element of a pair one host access, and ThinLTO costs 5 s of
+  a release build. A verdict at the 1 to 3 % level needs a host that runs
+  nothing else.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -2515,6 +2614,18 @@ grep -o "superblocks: .*" bench/run/*/stderr.log
 # J14i: K2 with joins, K1 for the branch group
 cargo test --release -p vmlab-hv-tcg-aarch64 --test jit -- superblocks
 VMLAB_HV_JIT=1 just tcg-a64-lockstep branch 100000 1
+```
+
+Card #1216 (V2), one tree and one target directory for each variant: base,
+and base with one commit picked without a commit (`git cherry-pick -n`):
+
+```sh
+cargo build --release -p vmlab-hv            # in each tree, its CARGO_TARGET_DIR
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1,4 --repeats 3 --guest debian-13 \
+  --suite full --keep --hv-bin <variant>/vmlab-hv     # the variants in turn, a round each order
+python3 bench/run.py --backend jit --arch aarch64 --vcpus 1 --repeats 3     # in each tree
+VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv \
+  --arch aarch64 --vcpus 2 --repeats 1 --guest debian-13 --suite boot --keep --timeout-scale 3
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the
