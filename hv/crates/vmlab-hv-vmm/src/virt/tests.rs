@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use vmlab_hv_proto::control::ShutdownReason;
-use vmlab_hv_proto::machine::{Accel, Arch, Boot, FirmwareKind, Machine, MachineDescription};
+use vmlab_hv_proto::machine::{
+    Accel, Arch, Boot, DisplayDevice, FirmwareKind, Machine, MachineDescription,
+};
 use vmlab_hv_tcg_aarch64::oracle::asm;
 
 use super::{map, psci};
@@ -393,6 +395,47 @@ fn a_description_that_is_not_a_virt_machine_is_refused_by_name() {
         },
         "does not exist",
     );
+    // The display is a 2D virtio-gpu, and the keyboard rides the xHCI of
+    // the tablet (#1225).
+    let at = |device| vmlab_hv_proto::machine::PciAddress {
+        bus: 0,
+        device,
+        function: 0,
+    };
+    let gpu = vmlab_hv_proto::machine::Display {
+        device: DisplayDevice::VirtioGpu,
+        gpu: None,
+        vram_bytes: vmlab_hv_proto::machine::default_gpu_vram_bytes(),
+        render_node: None,
+        pci: at(6),
+        rom: None,
+        socket: None,
+        vnc_socket: None,
+    };
+    let mut shown = good.clone();
+    shown.display = Some(gpu.clone());
+    shown.tablet = Some(at(7));
+    shown.usb_keyboard = true;
+    assert!(crate::validate(&shown).is_ok());
+    let vga = vmlab_hv_proto::machine::Display {
+        device: DisplayDevice::VirtioVga,
+        ..gpu.clone()
+    };
+    refused(&|d| d.display = Some(vga.clone()), "2D virtio-gpu");
+    let rom = vmlab_hv_proto::machine::Display {
+        rom: Some(dir.path().join("rom")),
+        ..gpu.clone()
+    };
+    refused(&|d| d.display = Some(rom.clone()), "no ROM");
+    refused(&|d| d.usb_keyboard = true, "usb_keyboard");
+    refused(&|d| d.usb = Some(at(7)), "`usb`");
+    // An x86 machine takes no virtio-gpu without VGA.
+    let mut q35 = shown.clone();
+    q35.arch = Arch::X86_64;
+    q35.accel = Accel::Kvm;
+    q35.machine = Machine::Q35;
+    let error = crate::validate(&q35).unwrap_err().to_string();
+    assert!(error.contains("virtio-vga"), "{error}");
     // An x86 machine does not take the machine of aarch64.
     let mut x86 = good.clone();
     x86.arch = Arch::X86_64;

@@ -1,8 +1,10 @@
 //! The aarch64 `virt` machine (phase 3d, F4): the memory map, the device
 //! tree, fw_cfg over MMIO, the two flash banks, the GICv2 with its v2m
 //! frame, the PL011, the PL031, the GED, the PCI host with its ECAM and the
-//! virtio functions, PSCI on `HVC` and `SMC`, reset and power-off. Its vCPUs
-//! run on the emulator (`vcpu::emulated`), so the machine needs no KVM.
+//! virtio functions, the display (a 2D virtio-gpu) and the xHCI of the USB
+//! tablet and keyboard (#1225), PSCI on `HVC` and `SMC`, reset and
+//! power-off. Its vCPUs run on the emulator (`vcpu::emulated`), so the
+//! machine needs no KVM.
 //!
 //! The map is the one of QEMU's `virt` machine, as the ACPI tables of
 //! `vmlab-hv-firmware` name it. The firmware starts at the reset vector of
