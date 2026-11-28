@@ -276,6 +276,8 @@ pub struct MachineSpec {
     /// 3d) in place of the x86_64 one on KVM. The assets come from
     /// [`probe_assets_aarch64`].
     pub aarch64: bool,
+    /// virtio-fs shares of the machine, as they go into its description.
+    pub shares: Vec<vmlab_hv_proto::machine::FsShare>,
 }
 
 impl MachineSpec {
@@ -293,6 +295,7 @@ impl MachineSpec {
             rtc_base: None,
             extra_ports: Vec::new(),
             aarch64: false,
+            shares: Vec::new(),
         }
     }
 
@@ -565,7 +568,7 @@ pub fn launch(spec: &MachineSpec, assets: &Assets) -> Guest {
                 socket: dir.join("agent.sock"),
             },
         ],
-        shares: Vec::new(),
+        shares: spec.shares.clone(),
         audio: None,
         rtc_base: spec.rtc_base.clone(),
     };

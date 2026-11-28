@@ -521,6 +521,112 @@ fn an_exclusive_store_is_a_compare_and_exchange_and_a_stamp_still_fails_it() {
     assert!(single.transaction_lock().is_none());
 }
 
+/// How a host writes guest RAM in `a_host_write_into_translated_code_ends_it`.
+#[derive(Clone, Copy, Debug)]
+enum HostWrite {
+    /// vm-memory's own copy, as a device writes a used ring or a reply.
+    Bytes,
+    /// A copy through the raw pointer of a slice and its `mark_dirty`, as
+    /// the receive path of virtio-net writes a frame.
+    Pointer,
+    /// `pread` from a file straight into the slice and its `mark_dirty`, as
+    /// the in-process virtio-fs answers a `FUSE_READ`.
+    File,
+}
+
+/// Write `bytes` into guest RAM at `at` as a host does (`HostWrite`).
+fn host_write(memory: &GuestMemory, at: u64, bytes: &[u8], how: HostWrite) {
+    use vm_memory::GuestMemoryBackend;
+    use vm_memory::bitmap::Bitmap;
+    match how {
+        HostWrite::Bytes => memory.write_slice(bytes, GuestAddress(at)).unwrap(),
+        HostWrite::Pointer => {
+            let slice = memory.get_slice(GuestAddress(at), bytes.len()).unwrap();
+            let guard = slice.ptr_guard_mut();
+            // SAFETY: the slice is guest RAM, writable for its length, and
+            // the source is a disjoint host buffer of the same length.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), guard.as_ptr(), bytes.len()) };
+            slice.bitmap().mark_dirty(0, bytes.len());
+        }
+        HostWrite::File => {
+            use std::os::fd::AsRawFd;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(bytes).unwrap();
+            let slice = memory.get_slice(GuestAddress(at), bytes.len()).unwrap();
+            let guard = slice.ptr_guard_mut();
+            let target = guard.as_ptr().cast();
+            // SAFETY: the slice is guest RAM, writable for its length.
+            let read = unsafe { libc::pread(file.as_raw_fd(), target, bytes.len(), 0) };
+            assert_eq!(read, bytes.len() as isize);
+            slice.bitmap().mark_dirty(0, bytes.len());
+        }
+    }
+}
+
+/// A host write into guest RAM ends the code that a CPU translated there
+/// (#1227): the in-process virtio-fs, a TAP NIC served in userspace and
+/// every other device write through the bitmap of the region, which moves
+/// the write generations. The CPU calls a function many times, so that its
+/// code is translated (and compiled, with the JIT), the host writes another
+/// function over it, and the next call returns the value of the new one.
+fn a_host_write_into_translated_code_ends_it(jit: bool) {
+    const MAIN: u64 = RAM + 0x10_0000;
+    const FUNCTION: u64 = RAM + 0x11_0000;
+    const CALLS: u64 = 200;
+    let memory = ram();
+    let bus = GuestBus::new(memory.clone(), host_with_latch(), 1).unwrap();
+    let main = [
+        asm::blr(2),    // 0 the function
+        sub64(3, 3, 1), // 1
+        cbnz32(3, -2),  // 2
+        asm::hvc(0),    // 3
+    ];
+    memory.write_slice(&asm::bytes(&main), GuestAddress(MAIN)).unwrap();
+    let function = |value: u16| asm::bytes(&[asm::movz(1, value, 0), asm::RET]);
+    memory.write_slice(&function(1), GuestAddress(FUNCTION)).unwrap();
+    let mut cpu = vmlab_hv_tcg_aarch64::Cpu::new(bus, State::reset(MAIN));
+    cpu.set_jit(jit).unwrap();
+    let mut value = 1;
+    for how in [HostWrite::Bytes, HostWrite::Pointer, HostWrite::File] {
+        cpu.state.set_pc(MAIN);
+        cpu.state.set_x(2, FUNCTION);
+        cpu.state.set_x(3, CALLS);
+        match cpu.run(1 << 20) {
+            vmlab_hv_tcg_aarch64::Stop::Hypercall { immediate: 0, .. } => {}
+            other => panic!("{how:?}: {other:?}"),
+        }
+        assert_eq!(cpu.state.x(1), value, "{how:?}: the code before the write");
+        value += 1;
+        host_write(&memory, FUNCTION, &function(value as u16), how);
+        cpu.state.set_pc(MAIN);
+        cpu.state.set_x(3, 1);
+        match cpu.run(1 << 20) {
+            vmlab_hv_tcg_aarch64::Stop::Hypercall { immediate: 0, .. } => {}
+            other => panic!("{how:?}: {other:?}"),
+        }
+        assert_eq!(
+            cpu.state.x(1),
+            value,
+            "{how:?}: the CPU ran the code from before the host write: {:?}",
+            cpu.jit_counts()
+        );
+    }
+    if jit {
+        assert!(cpu.jit_counts().compiled_runs > 0, "{:?}", cpu.jit_counts());
+    }
+}
+
+#[test]
+fn a_host_write_into_translated_code_ends_it_in_the_interpreter() {
+    a_host_write_into_translated_code_ends_it(false);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn a_host_write_into_translated_code_ends_it_in_compiled_code() {
+    a_host_write_into_translated_code_ends_it(true);
+}
+
 /// `LDAXR Wt, [Xn]`.
 fn ldaxr32(rt: u32, rn: u32) -> u32 {
     0x885f_fc00 | rn << 5 | rt

@@ -102,6 +102,13 @@ impl WriteDiscard {
         self.watch.set(watch).is_ok()
     }
 
+    /// Whether `watch` was called: an emulated CPU keeps translated code
+    /// against the writes to this region, so a write that does not come
+    /// past `mark_dirty` (vhost, another process) must not reach it.
+    pub fn watched(&self) -> bool {
+        self.watch.get().is_some()
+    }
+
     /// Whether `arm` was called: a write must come past `mark_dirty`, which
     /// drops the private pages that it leaves.
     pub fn discards(&self) -> bool {

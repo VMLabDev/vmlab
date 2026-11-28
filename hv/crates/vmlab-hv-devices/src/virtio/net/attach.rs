@@ -7,6 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
 
 use super::{Net, NetConfig, Shared, notify_worker, tap::TapBackend};
 use crate::{GuestMemory, VirtioDevice};
@@ -27,6 +28,21 @@ impl NetBackendHandle {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "queue count differs from configured TAP attachment",
+            ));
+        }
+        // The kernel's vhost-net writes guest RAM from outside this process,
+        // past the bitmap where an emulated CPU learns of each write into
+        // its translated code (`WriteDiscard::watch`). The queues of such a
+        // machine are served here, in userspace.
+        if vhost
+            && self
+                .memory
+                .iter()
+                .any(|region| region.get_mmap().bitmap().watched())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an emulated machine takes no vhost-net backend: pass the TAP queues alone",
             ));
         }
         let mut shared = self.shared.lock();
@@ -145,6 +161,40 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         let mut byte = [0];
         assert_eq!(std::io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn memory_of_an_emulated_cpu_refuses_vhost_and_closes_the_fds() {
+        use vm_memory::GuestAddress;
+        let memory = GuestMemory::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        assert!(
+            memory
+                .iter()
+                .all(|region| region.get_mmap().bitmap().watch(Box::new(|_, _| {})))
+        );
+        let (_net, handle) = Net::with_tap(
+            NetConfig {
+                id: "net0".into(),
+                mac: [2, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                switch: Default::default(),
+            },
+            1,
+            memory,
+        )
+        .unwrap();
+        let (tap, mut tap_peer) = UnixStream::pair().unwrap();
+        let (kernel, mut kernel_peer) = UnixStream::pair().unwrap();
+        let error = handle
+            .install(1, true, vec![tap.into(), kernel.into()])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("vhost-net"), "{error}");
+        for peer in [&mut tap_peer, &mut kernel_peer] {
+            let mut byte = [0];
+            assert_eq!(std::io::Read::read(peer, &mut byte).unwrap(), 0);
+        }
+        assert!(!handle.ready());
     }
 
     #[test]

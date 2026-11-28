@@ -132,3 +132,80 @@ fn an_emulated_aarch64_guest_answers_after_a_snapshot_load_and_a_reset() {
     assert_eq!(exec(&guest, &mut agent, "uname -m"), b"aarch64\n");
     guest.quit_and_exit_zero();
 }
+
+/// A share of the emulated `virt` machine (#1227): the in-process virtio-fs
+/// device serves a host directory, and the aarch64 guest mounts it, reads a
+/// host file, writes one the host then reads, and runs a program from it.
+/// The program's pages reach guest RAM as the device's replies to
+/// `FUSE_READ`, host writes that the emulator must see before it runs them.
+#[test]
+#[cfg_attr(
+    vmlab_ci_no_host_assets,
+    ignore = "requires the aarch64 guest asset and a rootfs"
+)]
+fn an_emulated_aarch64_guest_mounts_a_share_and_runs_a_program_from_it() {
+    let assets = probe_assets_aarch64();
+    if let Some(reason) = assets.skip_reason() {
+        eprintln!("skipping S1 aarch64 share: {reason}");
+        return;
+    }
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("hello.txt"), b"from the host share\n").unwrap();
+    let mut spec = MachineSpec::idle("s1-aarch64-share");
+    spec.aarch64 = true;
+    spec.shares.push(vmlab_hv_proto::machine::FsShare {
+        pci: None,
+        tag: "work".into(),
+        socket: None,
+        path: Some(host.path().to_path_buf()),
+        read_only: false,
+    });
+    let mut guest = vmlab_hv_tests::launch(&spec, &assets);
+    let container = spec.container_spec();
+    let mut ctl =
+        CtlClient::connect(&guest.ctl_sock, Duration::from_secs(60)).expect("connect the ctl port");
+    ctl.send_spec(&container).expect("send spec");
+    ctl.wait_event(
+        &container,
+        BOOT,
+        |e| matches!(e, CtlEvent::Idle),
+        |_| {},
+        || guest.diagnostics("waiting for cinit idle"),
+    );
+    let mut agent = AgentClient::connect(&guest.agent_sock, BOOT).expect("agent handshake");
+    exec(
+        &guest,
+        &mut agent,
+        &format!("{BUSYBOX} mkdir -p /mnt/work && {BUSYBOX} mount -t virtiofs work /mnt/work"),
+    );
+    assert_eq!(
+        exec(&guest, &mut agent, &format!("{BUSYBOX} cat /mnt/work/hello.txt")),
+        b"from the host share\n"
+    );
+    exec(
+        &guest,
+        &mut agent,
+        &format!("echo written-by-guest > /mnt/work/guest.txt && {BUSYBOX} sync"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(host.path().join("guest.txt")).unwrap(),
+        "written-by-guest\n"
+    );
+    // A program copied onto the share, dropped from the guest's page cache
+    // and run from it: every page of its code is read through the device.
+    exec(
+        &guest,
+        &mut agent,
+        &format!(
+            "{BUSYBOX} cp {BUSYBOX} /mnt/work/busybox && {BUSYBOX} sync && \
+             echo 3 > /proc/sys/vm/drop_caches"
+        ),
+    );
+    assert!(host.path().join("busybox").is_file());
+    assert_eq!(
+        exec(&guest, &mut agent, "/mnt/work/busybox echo ran-from-the-share"),
+        b"ran-from-the-share\n"
+    );
+    exec(&guest, &mut agent, &format!("{BUSYBOX} umount /mnt/work"));
+    guest.quit_and_exit_zero();
+}

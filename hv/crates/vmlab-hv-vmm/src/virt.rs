@@ -37,7 +37,7 @@ use vmlab_hv_firmware::fw_cfg::{self, FwCfgMmio};
 use vmlab_hv_proto::control::ShutdownReason;
 use vmlab_hv_proto::machine::{
     Accel, Arch, Boot, DiskBus, DisplayDevice, FirmwareKind, Machine, MachineDescription,
-    NicAttachment, NicModel,
+    FsBacking, NicModel,
 };
 use vmlab_hv_tcg_aarch64::State;
 use vmlab_hv_tcg_aarch64::sysreg::CpuModel;
@@ -398,7 +398,6 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
         (desc.floppy.is_some(), "floppy"),
         (desc.applesmc.is_some(), "applesmc"),
         (!desc.hyperv.is_empty(), "hyperv"),
-        (!desc.shares.is_empty(), "shares"),
         (desc.cpu_model.is_some(), "cpu_model"),
         (!desc.serial_log_port.is_com1(), "serial_log_port"),
     ];
@@ -438,15 +437,21 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
         if nic.model != NicModel::Virtio {
             return Err(invalid("a virt NIC is a virtio-net NIC"));
         }
-        // A vhost backend writes guest RAM from the kernel, past the write
-        // generations that the emulator keeps its translated code against.
-        if matches!(
-            nic.attachment,
-            NicAttachment::Tap { .. } | NicAttachment::TapRaw { .. }
-        ) {
-            return Err(invalid(
-                "a NIC of an emulated machine uses the stream attachment",
-            ));
+        // A TAP NIC is served in this process, whose writes into guest RAM
+        // move the write generations of the emulator. Its queues come over
+        // the control socket, which refuses a vhost-net backend here
+        // (`NetBackendRegistry::install`): the kernel writes guest RAM past
+        // those generations.
+    }
+    // A share is the in-process virtio-fs device, for the same reason: an
+    // external virtiofsd writes guest RAM from another process.
+    for share in &desc.shares {
+        if !matches!(share.backing(), Some(FsBacking::Directory(_))) {
+            return Err(invalid(format!(
+                "share `{}`: a virt share is served in process (`path`), not by an \
+                 external virtiofsd (`socket`)",
+                share.tag
+            )));
         }
     }
     // One port may be the PL011 itself: `com1` names the first serial port
@@ -949,6 +954,18 @@ pub fn assemble(
             .map_err(VmmError::Other)?;
         functions.push(controller.clone());
         xhci = Some(controller);
+    }
+    // The virtio-fs shares come last, as they do in QEMU's argv.
+    for share in &desc.shares {
+        let (slot, function, wiring) = place(share.pci, 2)?;
+        let built = factory
+            .fs_share(share, &ram.device_mem, wiring)
+            .map_err(unavailable(format!("share `{}`", share.tag)))?;
+        pci_root
+            .lock()
+            .add_device_at(slot, function, built.function.clone())
+            .map_err(VmmError::Other)?;
+        functions.extend(built.snapshot);
     }
     let bars = pci_root.lock().save_bar_states();
 
