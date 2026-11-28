@@ -2,9 +2,10 @@
 """card-1235: the ID registers that a QEMU CPU model presents, read over the
 gdbstub of a stopped machine (S6 of the 3d design: QEMU as a running program).
 
-usage: idregs.py <cpu> [machine options, default "virt"]
+usage: idregs.py <cpu> [machine options, default "virt"] [vCPUs] [name pattern]
 example: idregs.py max
-         idregs.py max virt,gic-version=3
+         idregs.py max,sve=off,sme=off virt,gic-version=3 16
+         idregs.py neoverse-n1 virt 1 'ISAR|PFR'
 """
 import os
 import re
@@ -17,6 +18,7 @@ import time
 cpu = sys.argv[1]
 machine = sys.argv[2] if len(sys.argv) > 2 else "virt"
 smp = sys.argv[3] if len(sys.argv) > 3 else "1"
+pattern = sys.argv[4] if len(sys.argv) > 4 else r"ID_AA64|MIDR|CTR_EL0|DCZID|GMID"
 directory = tempfile.mkdtemp(prefix="idregs.")
 path = os.path.join(directory, "gdb.sock")
 qemu = subprocess.Popen(
@@ -66,7 +68,7 @@ try:
             found[attributes["name"]] = (number, int(attributes["bitsize"]))
             number += 1
     wanted = sorted(name for name in found
-                    if re.match(r"(ID_AA64|MIDR|ID_AA64ZFR|ICC_SRE|GMID|CTR_EL0|DCZID)", name))
+                    if re.search(pattern, name))
     print(f"qemu -machine {machine} -cpu {cpu} -smp {smp}: {len(found)} registers")
     for name in wanted:
         index, bits = found[name]
