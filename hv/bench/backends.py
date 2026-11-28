@@ -118,11 +118,13 @@ def _raise_launch_failure(session, what):
 # ---------------------------------------------------------------------------
 
 
-def qemu_vm_argv(arch, smp, overlay, code_fd, vars_fd, serial, agent_sock, qmp_sock, vnc_sock):
+def qemu_vm_argv(arch, smp, overlay, code_fd, vars_fd, serial, agent_sock, qmp_sock, vnc_sock,
+                 cpu="max"):
     """The QEMU TCG argv exactly as notes/03 captured from vmlab's builder.
 
     Deviations from vmlab's real VM, both forced by the harness (no network
-    segment): `-nic none`, and no TPM/GPU. The `-name` label is ours.
+    segment): `-nic none`, and no TPM/GPU. The `-name` label is ours. `cpu`
+    is vmlab's `max` unless `--qemu-cpu` names another model (3e P6).
     """
     return [
         f"qemu-system-{arch}",
@@ -133,7 +135,7 @@ def qemu_vm_argv(arch, smp, overlay, code_fd, vars_fd, serial, agent_sock, qmp_s
         "-accel",
         "tcg",
         "-cpu",
-        "max",
+        cpu,
         "-smp",
         str(smp),
         "-m",
@@ -175,7 +177,7 @@ def qemu_vm_argv(arch, smp, overlay, code_fd, vars_fd, serial, agent_sock, qmp_s
 class QemuBackend:
     name = "qemu"
 
-    def __init__(self, run_dir, arch, smp, pin, overlay, code_fd, vars_fd, log):
+    def __init__(self, run_dir, arch, smp, pin, overlay, code_fd, vars_fd, log, cpu="max"):
         self.run_dir = run_dir
         self.arch = arch
         self.smp = smp
@@ -195,6 +197,7 @@ class QemuBackend:
             self.agent_sock,
             self.qmp_sock,
             self.vnc_sock,
+            cpu,
         )
 
     def launch(self):

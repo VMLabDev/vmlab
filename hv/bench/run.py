@@ -77,6 +77,11 @@ def parse_args(argv):
                    help="x86_64: configure VMs as on a host without APIC virtualization "
                         "(no hv-avic), as a nested host such as WSL2 must")
     p.add_argument("--cpus", default=None, help="taskset window override (e.g. 16-19)")
+    p.add_argument("--qemu-cpu", default=None,
+                   help="aarch64 qemu: the -cpu model, with optional ,property=value "
+                        "pairs (default max for a template, "
+                        "cortex-a53 for flat-a64); rows of another model are kept "
+                        "apart from the default's")
     p.add_argument("--hv-bin", default=os.path.join(lib.REPO_DIR, "target/release/vmlab-hv"))
     p.add_argument("--timeout-scale", type=float, default=1.0)
     p.add_argument("--keep", action="store_true", help="keep per-run scratch dirs")
@@ -114,10 +119,28 @@ def log(msg):
 
 def make_backend(args, run_dir, arch, smp, pin, overlay, code_fd, vars_fd):
     if args.backend == "qemu":
-        return QemuBackend(run_dir, arch, smp, pin, overlay, code_fd, vars_fd, log)
+        return QemuBackend(run_dir, arch, smp, pin, overlay, code_fd, vars_fd, log,
+                           qemu_cpu(args, arch))
     return HvBackend(
         run_dir, arch, smp, pin, overlay, code_fd, vars_fd, log, args.hv_bin
     )
+
+
+def qemu_cpu(args, arch):
+    """The -cpu model of a QEMU TCG VM: `--qemu-cpu` on aarch64, else max."""
+    return (args.qemu_cpu if arch == "aarch64" and args.qemu_cpu
+            else lib.QEMU_CPU_VM_DEFAULT)
+
+
+def check_qemu_cpu(args, arches):
+    """`--qemu-cpu` is for the aarch64 QEMU rows (3e DESIGN.md P6) only."""
+    if args.qemu_cpu is None:
+        return
+    if args.backend != "qemu" or arches != ["aarch64"]:
+        raise lib.BenchError("--qemu-cpu needs --backend qemu --arch aarch64")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*(,[a-z0-9-]+=[a-z0-9]+)*", args.qemu_cpu):
+        raise lib.BenchError(f"--qemu-cpu {args.qemu_cpu!r} is not a CPU model name"
+                             " with optional ,property=value pairs")
 
 
 def measures_boot_mips(args, arch):
@@ -305,6 +328,8 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host, cores=None):
     if cores is not None:
         env["cores"] = cores
         env["repeat_host_load"] = []
+    if args.backend == "qemu" and arch == "aarch64":
+        env["qemu_cpu"] = qemu_cpu(args, arch)
     if args.backend == "vmlab-hv" and arch == "aarch64":
         # The JIT of 3e is on unless VMLAB_HV_JIT=0 turns it off (DESIGN.md T1, J8).
         env["jit"] = lib.jit_enabled()
@@ -1285,6 +1310,7 @@ def main(argv=None):
             raise lib.BenchError("the guest flat-a64 is an aarch64 image")
         if args.suite == "boot":
             raise lib.BenchError("--suite boot requires a TCG VM template")
+        check_qemu_cpu(args, ["aarch64"])
         import micro_a64
         commit, dirty = git_commit()
         return micro_a64.run(args, commit, dirty, os.uname().nodename, log)
@@ -1294,12 +1320,14 @@ def main(argv=None):
             args.backend == "qemu" and args.guest == "flat-rv64gc"):
         if args.suite == "boot":
             raise lib.BenchError("--suite boot requires a TCG VM template")
+        check_qemu_cpu(args, ["riscv64"])
         import micro
         commit, dirty = git_commit()
         return micro.run(args, commit, dirty, os.uname().nodename, log)
     if args.repeats < 2:
         log("note: --repeats < 2 leaves no spread; bench-check treats that as zero noise")
     arches = resolve_arches(args.arch)
+    check_qemu_cpu(args, arches)
     if args.suite == "boot" and "x86_64" in arches:
         raise lib.BenchError("--suite boot requires a TCG arch")
     if args.suite == "idle" and arches != ["x86_64"]:
@@ -1353,7 +1381,8 @@ def main(argv=None):
         vcpu_spec = args.vcpus or "1,4"
         for smp in [int(v) for v in vcpu_spec.split(",") if v.strip()]:
             pin, cores = lib.reserve_cores(smp, args.cpus)
-            log(f"### {args.backend} {arch} smp={smp} {args.guest}@{version} pin={pin} "
+            cpu = f" cpu={qemu_cpu(args, arch)}" if args.backend == "qemu" else ""
+            log(f"### {args.backend} {arch}{cpu} smp={smp} {args.guest}@{version} pin={pin} "
                 f"cores={cores['cores']} chosen={cores['chosen']} "
                 f"governor={lib.read_governor()} load={lib.read_loadavg()}")
             if cores["chosen"] == "loaded":
