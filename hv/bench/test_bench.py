@@ -1513,6 +1513,127 @@ class NetPeerTests(unittest.TestCase):
                     self.assertEqual(received, record)
 
 
+class CoreReservationTests(unittest.TestCase):
+    """The bench's core choice over a fake sysfs: 8 cores, threads N and
+    N+8 siblings, cores 0-3 on one L3 and 4-7 on the other."""
+
+    def fake_sys(self, tmp, online="0-15"):
+        with open(os.path.join(tmp, "online"), "w") as f:
+            f.write(online + "\n")
+        for cpu in range(16):
+            core = cpu % 8
+            l3 = "0-3,8-11" if core < 4 else "4-7,12-15"
+            topo = os.path.join(tmp, f"cpu{cpu}", "topology")
+            cache = os.path.join(tmp, f"cpu{cpu}", "cache", "index3")
+            os.makedirs(topo)
+            os.makedirs(cache)
+            with open(os.path.join(topo, "thread_siblings_list"), "w") as f:
+                f.write(f"{core},{core + 8}\n")
+            with open(os.path.join(cache, "shared_cpu_list"), "w") as f:
+                f.write(l3 + "\n")
+        return tmp
+
+    def cores(self, allowed=range(16)):
+        with tempfile.TemporaryDirectory() as tmp:
+            return lib.read_core_topology(self.fake_sys(tmp), allowed=allowed)
+
+    def test_cpu_lists_round_trip(self):
+        self.assertEqual(lib.parse_cpu_list("0-2,8,10-11\n"), [0, 1, 2, 8, 10, 11])
+        self.assertEqual(lib.format_cpu_list([11, 10, 8, 0, 1, 2]), "0-2,8,10-11")
+
+    def test_topology_groups_siblings_into_cores(self):
+        cores = self.cores()
+        self.assertEqual([c["cpus"] for c in cores], [[i, i + 8] for i in range(8)])
+        self.assertEqual(cores[0]["l3"], "0-3,8-11")
+        self.assertEqual(cores[7]["l3"], "4-7,12-15")
+
+    def test_topology_drops_cores_outside_the_affinity(self):
+        cores = self.cores(allowed=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        self.assertEqual([c["cpus"] for c in cores], [[0, 8], [1, 9]])
+
+    def test_topology_skips_offline_threads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cores = lib.read_core_topology(self.fake_sys(tmp, online="0-7,15"),
+                                           allowed=range(16))
+        self.assertEqual(cores[-1]["cpus"], [7, 15])
+        self.assertEqual(cores[0]["cpus"], [0])
+
+    def test_idle_host_takes_the_top_cores_of_one_l3(self):
+        chosen, free = lib.choose_cores(self.cores(), {}, 2)
+        self.assertTrue(free)
+        self.assertEqual([c["cpus"] for c in chosen], [[7, 15], [6, 14]])
+
+    def test_a_busy_sibling_takes_its_core_out(self):
+        chosen, free = lib.choose_cores(self.cores(), {15: 0.9}, 2)
+        self.assertTrue(free)
+        self.assertEqual([c["cpus"] for c in chosen], [[6, 14], [5, 13]])
+
+    def test_one_l3_is_preferred_over_higher_scattered_cores(self):
+        busy = {13: 0.5, 14: 0.5, 15: 0.5}
+        chosen, free = lib.choose_cores(self.cores(), busy, 2)
+        self.assertTrue(free)
+        self.assertEqual([c["cpus"] for c in chosen], [[3, 11], [2, 10]])
+
+    def test_free_cores_across_l3_when_no_l3_holds_enough(self):
+        busy = {cpu: 0.5 for cpu in (2, 3, 6, 7)}
+        chosen, free = lib.choose_cores(self.cores(), busy, 3)
+        self.assertTrue(free)
+        self.assertEqual([c["cpus"] for c in chosen], [[5, 13], [4, 12], [1, 9]])
+
+    def test_too_few_free_cores_fill_with_the_least_busy(self):
+        busy = {cpu: 0.9 for cpu in range(16)}
+        busy[3] = busy[11] = 0.3
+        busy[12] = 0.05
+        busy[4] = 0.05
+        chosen, free = lib.choose_cores(self.cores(), busy, 2)
+        self.assertFalse(free)
+        self.assertEqual([c["cpus"] for c in chosen], [[4, 12], [3, 11]])
+
+    def test_more_cores_than_the_host_has_is_an_error(self):
+        with self.assertRaisesRegex(lib.BenchError, "need 9 whole cores"):
+            lib.choose_cores(self.cores(), {}, 9)
+
+    def test_width_is_one_core_per_vcpu_plus_one(self):
+        self.assertEqual(lib.reserve_width(1), 2)
+        self.assertEqual(lib.reserve_width(4), 5)
+
+    def write_stat(self, path, rows):
+        with open(path, "w") as f:
+            f.write("cpu  0 0 0 0 0 0 0 0 0 0\n")
+            for cpu, (busy, idle) in sorted(rows.items()):
+                f.write(f"cpu{cpu} {busy} 0 0 {idle} 0 0 0 0 0 0\n")
+
+    def test_host_load_splits_reserved_and_other_cpus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stat = os.path.join(tmp, "stat")
+            self.write_stat(stat, {0: (0, 0), 1: (0, 0), 2: (0, 0)})
+            before = lib.read_cpu_times(stat)
+            self.write_stat(stat, {0: (100, 0), 1: (50, 50), 2: (25, 75)})
+            after = lib.read_cpu_times(stat)
+        load = lib.host_load(before, after, [0])
+        self.assertEqual(load, {"reserved_busy_cpus": 1.0, "other_busy_cpus": 0.75,
+                                "other_cpus": 2})
+
+    def test_reserve_records_whole_cores_and_their_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fake_sys(tmp)
+            stat = os.path.join(tmp, "stat")
+            self.write_stat(stat, {cpu: (0, 100) for cpu in range(16)})
+            with mock.patch.object(os, "sched_getaffinity", return_value=set(range(16))):
+                pin, record = lib.reserve_cores(1, root=root, stat=stat, sample_seconds=0)
+                over_pin, over = lib.reserve_cores(1, override="12-15", root=root,
+                                                   stat=stat, sample_seconds=0)
+        self.assertEqual(pin, "6-7,14-15")
+        self.assertEqual(record["cores"], [[7, 15], [6, 14]])
+        self.assertTrue(record["siblings_reserved"])
+        self.assertEqual(record["chosen"], "free")
+        self.assertEqual(sorted(record["busy_at_choice"]), ["14", "15", "6", "7"])
+        self.assertEqual(over_pin, "12-15")
+        self.assertEqual(over["chosen"], "override")
+        self.assertFalse(over["siblings_reserved"])
+        self.assertEqual(over["cores"], [[4, 12], [5, 13], [6, 14], [7, 15]])
+
+
 class CpuSamplingTests(unittest.TestCase):
     def test_self_cpu_seconds_grows(self):
         os.urandom(8 << 20)
