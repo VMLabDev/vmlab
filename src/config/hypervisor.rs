@@ -106,8 +106,8 @@ impl HypervisorDefaults {
         // the hypervisor for both, so what it refuses is an error, said by
         // validation and again by the daemon at up and start (PRD §22.4,
         // §22.5). Only an explicit setting puts an aarch64 VM on QEMU.
-        let no_fallback = x86_guest(&arch)
-            || (matches!(machine, MachineCfg::Vm(_)) && emulated_guest(&arch));
+        let no_fallback =
+            x86_guest(&arch) || (matches!(machine, MachineCfg::Vm(_)) && emulated_guest(&arch));
         if explicit.is_none() && existing == Some(HypervisorKind::Qemu) && no_fallback {
             return HypervisorSelection {
                 kind: HypervisorKind::Vmlab,
@@ -1438,10 +1438,7 @@ mod tests {
         // What vmlab-hv refuses of the VM it was put on is the error.
         let args = file.lab.machine("args").unwrap();
         let why = vmlab_refusals(args, &kvm_host(), None);
-        assert!(
-            why.len() == 1 && why[0].contains("`qemu_args`"),
-            "{why:?}"
-        );
+        assert!(why.len() == 1 && why[0].contains("`qemu_args`"), "{why:?}");
         let pinned = file.lab.machine("pinned").unwrap();
         for existing in [
             None,
@@ -1588,7 +1585,8 @@ mod tests {
         );
         assert_eq!(picked.kind, HypervisorKind::Vmlab);
         assert!(
-            why.iter().any(|w| w.contains("a TPM") && w.contains("`virt`")),
+            why.iter()
+                .any(|w| w.contains("a TPM") && w.contains("`virt`")),
             "{why:?}"
         );
     }

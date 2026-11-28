@@ -5579,9 +5579,8 @@ lab "l" {
         assert_eq!(es.len(), 2, "{es:#?}");
         for word in ["`usb = true`", "a TPM"] {
             assert!(
-                es.iter().any(|e| e.contains("vm \"arm\"")
-                    && e.contains(word)
-                    && e.contains("`virt`")),
+                es.iter()
+                    .any(|e| e.contains("vm \"arm\"") && e.contains(word) && e.contains("`virt`")),
                 "{word}: {es:#?}"
             );
         }
