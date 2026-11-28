@@ -355,7 +355,7 @@ mod tests {
         // page in the TLB.
         assert!(tlb.lookup(1, false, 0x1234_5001, 2).is_some());
         assert!(tlb.lookup(1, false, 0x1234_5ff7, 8).is_some());
-        assert!(tlb.lookup(1, false, 0x1234_5ff1, 16).is_some());
+        assert!(tlb.lookup(1, false, 0x1234_5fe9, 16).is_some());
         assert!(tlb.lookup(1, false, 0x1234_5fff, 1).is_some());
         tlb.fill(1, false, 0x1234_6000, 0x7000_1000, 0, 0x8000_6000, 12);
         for (va, bytes) in [(0x1234_5fff, 2), (0x1234_5ffc, 8), (0x1234_5ff8, 16)] {

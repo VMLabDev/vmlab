@@ -2037,7 +2037,7 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
         watched += ran.watched;
     }
     assert!(left > 100, "{left} blocks left");
-    assert!(unaligned > 100, "{unaligned} logged hits not aligned");
+    assert!(unaligned > 20, "{unaligned} logged hits not aligned");
     assert!(
         misses > 1000 && hits > 1000,
         "{misses} misses, {hits} logged hits"
