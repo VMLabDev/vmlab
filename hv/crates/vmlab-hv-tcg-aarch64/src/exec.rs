@@ -2883,21 +2883,25 @@ unsafe fn serve_next<M: Memory>(
     }
     let context = state.context;
     let user = context.el == 0;
-    if user != env.side.user {
-        env.side.user = user;
-        if jit.memory() != jit::Memory::Thunk
-            && let Some(fast) = env.side.mmu.fast()
-        {
-            let level = usize::from(!user);
-            // SAFETY: as above.
-            unsafe {
-                (*env.context).reads = fast.table(level, false);
-                (*env.context).writes = if env.side.exclusive.is_none() {
-                    fast.table(level, true)
-                } else {
-                    jit::tlb::EMPTY_TABLE.as_ptr()
-                };
-            }
+    env.side.user = user;
+    // The tables as `run_chained` sets them for a run that starts here:
+    // those of the level now, and the write table again once no exclusive
+    // mark is set. The thunk took the write table away at an exclusive
+    // load until the run ends, and a run that goes on past its last
+    // instructions can be thousands of instructions long: kept away, every
+    // store of the rest of the run missed (the first rows of card T3-D2).
+    if jit.memory() != jit::Memory::Thunk
+        && let Some(fast) = env.side.mmu.fast()
+    {
+        let level = usize::from(!user);
+        // SAFETY: as above.
+        unsafe {
+            (*env.context).reads = fast.table(level, false);
+            (*env.context).writes = if env.side.exclusive.is_none() {
+                fast.table(level, true)
+            } else {
+                jit::tlb::EMPTY_TABLE.as_ptr()
+            };
         }
     }
     let pc = state.pc();
