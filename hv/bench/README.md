@@ -253,9 +253,23 @@ fifteen runs of the loop image with one iteration, and its MIPS divide the
 instruction count of the interpreter on the same image by that time. QEMU is
 the yardstick only: no product path starts it.
 
-- **Pinning**: the VM process tree runs under `taskset -c` on a fixed window
-  of logical CPUs in the top half of the topology (smp1 → e.g. `16-19`, smp4 →
-  `16-23` on the 32-thread host this was written on; `--cpus` overrides).
+- **Pinning, TCG suites** (aarch64, riscv64): the VM process tree runs under
+  `taskset -c` on whole physical cores, both SMT threads of each, so that the
+  sibling of a VM thread is inside the pin and the bench puts nothing else
+  there. The topology comes from `/sys/devices/system/cpu`
+  (`thread_siblings_list`, the L3 of `cache/index3`), never from fixed CPU
+  numbers. smp1 gets two cores, smp4 five (one per vCPU plus one). Before it
+  pins, the bench samples `/proc/stat` for one second and takes cores whose
+  every thread was at most 10 % busy: on one L3 if one L3 has enough, the
+  group and the cores highest in the topology first; else free cores on any
+  L3; else the free ones plus the least busy, and the row says `loaded`. On
+  helios, an idle host gives smp1 cores 14 and 15, pin `14-15,30-31`.
+  `--cpus` overrides the choice and is recorded as given.
+  Affinity does not keep other host work off the reserved cores, so every
+  row records what that work did (below).
+- **Pinning, x86_64 suites**: a fixed window of logical CPUs in the top half
+  of the topology (smp1 → e.g. `16-19`, smp4 → `16-23` on the 32-thread host
+  this was written on; `--cpus` overrides).
   Every backend gets the same window. The g2g pair pins one VM per half
   (`16-19` + `20-23`) so they use disjoint logical CPUs.
   On helios, CPUs 16-23 are one SMT thread each on cores 0-7. Their siblings
@@ -270,6 +284,8 @@ the yardstick only: no product path starts it.
   each repeat), pin window, memory cap, template version, backend version,
   host CPU count, git commit (with dirty marker), and for x86_64 the APIC
   virtualisation fact, the NIC MTU and the block tool actually used.
+  A TCG row also has `env.cores` and `env.repeat_host_load`, described in
+  "Reading a row taken under load" below.
 - **Repeats**: N per configuration (default 3); the history stores the
   samples, the median, and the max-min spread.
 - **Safety**: at most two VMs at a time (only the g2g pair), always inside
@@ -293,6 +309,37 @@ survives. Fields:
 | `median`, `spread` | median and max-min of the samples |
 | `qemu_baseline` | on `vmlab-hv` lines: the newest same-config QEMU record (median, spread, commit, recorded); `null` on `qemu` lines |
 | `env` | the noise-control record above |
+
+### Reading a row taken under load
+
+A TCG row records the reserved cores in `env.cores`:
+
+| Field | Meaning |
+|---|---|
+| `pin` | the `taskset -c` list the VM ran under |
+| `cores` | the reserved physical cores, each the list of its SMT threads |
+| `siblings_reserved` | every sibling of a pinned CPU is inside the pin; `false` only for a `--cpus` that splits a core |
+| `chosen` | `free` (every thread of every core was idle), `loaded` (too few free cores, the least busy filled the rest) or `override` (`--cpus`) |
+| `busy_at_choice` | each pinned CPU's busy fraction over the one-second sample before the choice |
+
+and, one entry per repeat in sample order, `env.repeat_host_load`:
+
+| Field | Meaning |
+|---|---|
+| `reserved_busy_cpus` | busy CPUs (sum of busy fractions from `/proc/stat`) on the pinned CPUs over the repeat: the VM and any other work that ran there |
+| `other_busy_cpus`, `other_cpus` | busy CPUs on the rest of the host, and how many CPUs that is: other work only |
+| `loadavg_start`, `loadavg_end` | `/proc/loadavg` around the repeat |
+
+A row is comparable with another when both have `chosen: free`,
+`siblings_reserved: true`, and a `reserved_busy_cpus` close to the VM's own
+use. An idle one-vCPU TCG boot keeps about one CPU busy, plus a fraction for
+its I/O thread, so on a two-core reserve a value well above 1.5 says other
+work ran on the reserved threads during that repeat. `other_busy_cpus` does
+not touch the reserved cores, but a high value (a build on most of the
+host) still slows them through shared L3 capacity, memory bandwidth and a
+lower boost clock. Read such a repeat as an upper bound on the time, not as
+a regression: compare it only with rows of similar `other_busy_cpus`, or
+take it again on a quiet host. `bench-check` does not read these fields.
 
 `bench-check` compares, per configuration, the latest entry with the
 previous one **of the same backend**, and fails when the median moved by
