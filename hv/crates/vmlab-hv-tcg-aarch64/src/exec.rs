@@ -6557,19 +6557,21 @@ mod tests {
 
     #[test]
     fn a_machine_cpu_leaves_its_loop_when_its_timer_is_due() {
-        // The virtual timer is due 20 us from now on a 1 GHz clock, and the
+        // The virtual timer is due 200 us from now on a 1 GHz clock, and the
         // budget takes some milliseconds. A machine CPU leaves its loop
         // within `CLOCK_BLOCKS` blocks of the deadline, so that its owner
         // raises the line. A CPU without lines runs its budget. The budget
         // is ten times what the loop runs in 300 us at the speed of its
-        // superblock (J14), 9,000 MIPS.
+        // superblock (J14), 9,000 MIPS. A deadline of 20 us passed before
+        // the run began in 1 of 30 runs on a loaded host, and the CPU then
+        // had no deadline (#1217).
         let budget = 30_000_000;
         for machine in [true, false] {
             let mut cpu = cpu(&LOOP);
             cpu.state.set_x(1, budget);
             cpu.clock = Clock::host(0, 1_000_000_000);
             let timer = &mut cpu.state.system.timers[1];
-            timer.compare = cpu.clock.count() + 20_000;
+            timer.compare = cpu.clock.count() + 200_000;
             timer.set_control(1);
             if machine {
                 cpu.lines = Some(std::sync::Arc::new(Lines::default()));
