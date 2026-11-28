@@ -58,8 +58,13 @@
 //! page of RAM with the read permission of the level, a write entry also
 //! for a page with a watch word that is even, which no translated code of
 //! this CPU is in (H11a), and only while no exclusive mark is set. An
-//! unprivileged access, an exclusive one and one of 16 bytes never fill and
-//! never hit. A store through the fast TLB reads the watch word after its
+//! inlined access hits wherever its bytes are in the page of the entry,
+//! aligned or not (N10, card T3-D1). So while blocks are lifted without
+//! `Context::strict`, a page of Device memory gets no entry: only the
+//! paths above check the alignment that it asks (card S4). With the MMU
+//! off or SCTLR_EL1.A set, the guards of a strict block check at least
+//! that before every access. An unprivileged access, an exclusive one and one of
+//! 16 bytes into one register (`Access16`) never fill and never hit. A store through the fast TLB reads the watch word after its
 //! write and tells the memory when it is odd, as a store of the path above
 //! does. The dirty marking of the memory (H7e) is the stamps of card S3:
 //! a write that skips it is one that the path above makes straight too.
@@ -613,6 +618,18 @@ impl Side {
         if self.mmu.fast().is_none() || entry.host == 0 {
             return;
         }
+        // An inlined hit asks nothing of the low bits of the address (N10).
+        // With the MMU off or SCTLR_EL1.A set, every block is strict and
+        // its guards ask at least what Device memory asks. Otherwise only
+        // the Rust paths check that alignment, so a Device page gets no
+        // entry. A change of either bit flushes the TLB (`Mmu::sync`).
+        let controls = self.mmu.controls();
+        if entry.flags as u8 & mmu::flag::DEVICE != 0
+            && controls.enabled
+            && !controls.strict_alignment
+        {
+            return;
+        }
         if write
             && (self.exclusive.is_some()
                 || entry_watch(entry).is_none_or(|watch| watch.load(Ordering::Relaxed) & 1 != 0)
@@ -1099,11 +1116,13 @@ enum Access16 {
 const UNPRIVILEGED: u8 = 0x80;
 /// The bits of `Op::aux` of a load or a store that hold the alignment that
 /// Device memory asks of it, less one: a mask of the low bits of the
-/// address (card S4). An inlined access with one of them set in its
-/// address misses the fast TLB, so a Device page faults in the Rust path.
+/// address (card S4). The emitter does not read them: in a context
+/// without `Context::strict`, the only one that sets them, a Device page
+/// gets no entry in the fast TLB (`Side::fill_fast`), so an access of one
+/// always reaches the Rust path, which checks them.
 const DEVICE_MASK: u8 = 0x0f;
 const _: () =
-    assert!(UNPRIVILEGED == jit::emit::THUNK_ACCESS && DEVICE_MASK & !jit::emit::ALIGNMENT == 0);
+    assert!(UNPRIVILEGED == jit::emit::THUNK_ACCESS && DEVICE_MASK & !jit::emit::OWNER == 0);
 
 /// Where a block can leave before its end.
 #[derive(Clone, Debug)]
