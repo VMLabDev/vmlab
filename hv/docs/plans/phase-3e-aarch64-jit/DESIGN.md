@@ -3211,6 +3211,108 @@ A share is of the samples of the vCPU threads in user space. Kernel time
   are 2 to 5 % each, and the larger costs stay those of T3d2 and P5b: the
   round trips and the loop.
 
+### E1213, measured by card #1213: emitter quality
+
+Helios, 2026-11-28, *measured*, the release build, the full suite
+(`--suite full`, Debian 13: boot, `sha256`, `xz`) and the flat images,
+with the reserved-core pin of card #1205 (no `--cpus`). Before is
+`8db638ea` (`next`). After is `5c302745`, whose code is that of the card.
+Each side in a clone of its own with its own target directory, the full
+suite run from the after tree with `--hv-bin` of each side in turn, one
+VM at a time, three rounds of one run a side at each vCPU count. The rows
+are in `bench/history/aarch64.jsonl` with the note "card #1213", each
+with its host load. Other cards ran builds and VMs at the same time. No
+QEMU source was read (X1). Sources read: this document, `bench/README.md`,
+the code of `vmlab-hv-tcg-jit` and of `exec.rs` and `state.rs` of
+`vmlab-hv-tcg-aarch64`, and volume 2 of the Intel manual for `lea` and
+its SIB byte; no code of Cranelift or of another JIT.
+
+- **E1213a. What was built** (`emit.rs`; Cranelift is not used, as Q1
+  and B1 say).
+  - *Results in their registers.* An operation of one word computed its
+    result in RAX and moved it to the register that the allocator gave
+    its word. It now computes it in that register: the register of its
+    first operand where nothing reads that operand later (of its second,
+    for a commutative operation, where only that one is free), else a new
+    one with a copy of the operand. A comparison writes AL and keeps RAX.
+    A load of one word loads straight into the register of its result.
+  - *Folded addresses.* An `Add` of 64 bits whose result only the address
+    of one inline load or store reads, not its leave, and whose operands
+    no operation between them writes, is not emitted. The access computes
+    its address with one `lea`: a base and a displacement of 32 bits, or a
+    base and an index through a SIB byte (`Asm::lea`, `Asm::lea_index`,
+    tested against `llvm-mc`). A stub that the thunk follows (a miss, a
+    store into a watched page, a logged access) puts the address into the
+    word of the frame first. The check of the last byte of the page is a
+    `lea` too, in place of a `mov` and an `add`.
+  - *Dead stores to guest registers.* Each output of one word wrote 0 to
+    the high half of its 16-byte slot at every exit. A new field
+    `Shape::narrow` names the slots that hold one word, whose high half
+    is 0 in every state (aarch64: every slot but V0 to V31,
+    `state::slot::NARROW`); an output of one word to one of them makes no
+    store to the high half. A snapshot whose narrow slot has a high half is
+    refused at restore, so the invariant holds for a loaded state too.
+  - *Side exits from registers* (J14). The stub of a side exit put every
+    output word into the frame and copied it to the state through RAX. It
+    now writes each one straight from its register, its constant or its
+    slot, as the end of the block does, and only an input that an output
+    would write over goes through the frame (`write_state`).
+  - Not built: R14 stays the frame, the statistics counters of the block
+    head (`accesses`, `chained`, `hits`) stay, and the budget stays in the
+    context. The counters are read by the JIT lines and by tests of
+    `chain.rs` and `emulated_tests.rs`, and the budget in a register needs
+    the kick proof of J7a again; each is a card of its own.
+- **E1213b. Code size and compile time**, from the last JIT line of every
+  vCPU of the twelve suite runs: 909 to 942 bytes of code per compiled
+  block before, 741 to 774 after (18 % less). The compile time per block
+  (the compile time of the JIT lines over the blocks compiled) was 2,884
+  to 3,147 ns before (median 2,950) and 3,076 to 3,321 ns after (median
+  3,180): the pass of `folds` and the register choice add about 8 %.
+  Cranelift took 24 to 160 us a block (B1, B3).
+- **E1213c. Proofs.** K2: the random blocks of `tests.rs`, with loads and
+  stores whose address an `Add` computes in every form (a base and a
+  displacement in either order, small, large and past 32 bits, a base and
+  an index, the sum or the base read by the leave), hit, miss, logged and
+  watched, against the interpreter (`access_rounds`); one defect that it
+  found on the way, a `Concat` of a word with itself computed in the
+  register that it read later, is fixed. A unit test for the narrow slots.
+  K3 on a Debian 13 boot at 1 vCPU (`VMLAB_HV_JIT_CHECK=1`,
+  `VMLAB_HV_JIT_CHECK_RUNS=1000`, the after build): agent ready after
+  62.3 s at a load of 6.9, no difference, 38.8 million blocks (283.9
+  million instructions) checked of 18.0e9 instructions. K1 with
+  `VMLAB_HV_JIT=1`, 100,000 per class, seed 1, no difference: `c1`
+  1,439,552 instructions, `loadstore` 5,227,939, `c8` (the MMU on)
+  4,403,165, `branch` 668,709.
+- **E1213d. The verdict.** The card estimated the boot at most 1.1 times,
+  the lead 1.02 to 1.04 times for the boot and 1.05 to 1.10 times for
+  CoreMark. Measured: the flat CoreMark mix 1.10 times and the scalar loop
+  1.21 times, `xz` 1.15 times at one vCPU and 1.07 at four, the boot 1.00
+  times at one vCPU and 1.02 at four (boot MIPS 1.00 and 1.03), `sha256`
+  inside its spread (one sample of each side at 3.3 s). The boot gains
+  least because compiled code is a minority of it. No bar applies (Q4).
+
+The rows, the median of 3 (the samples in brackets, in round order), s,
+and the share of QEMU's speed from the baseline in each row:
+
+| Row | Before | After | After / before | After, % of QEMU |
+|---|---|---|---|---|
+| Boot to agent ready, 1 vCPU | 44.31 (44.31, 44.24, 50.21) | 44.33 (40.35, 44.33, 54.63) | 1.00 | 94 % |
+| `sha256`, 1 vCPU | 2.10 (2.10, 1.79, 3.30) | 2.32 (2.21, 3.29, 2.32) | 0.91 | 91 % |
+| `xz`, 1 vCPU | 2.52 (2.52, 2.43, 2.76) | 2.20 (2.18, 2.84, 2.20) | 1.15 | 131 % |
+| Boot MIPS, 1 vCPU | 407.3 (409.2, 407.3, 358.0) | 408.7 (450.4, 408.7, 329.0) | 1.00 | |
+| Load (1 min) at the starts, 1 vCPU | 5.2, 5.6, 10.1 | 5.0, 5.0, 8.0 | | |
+| Boot to agent ready, 4 vCPUs | 32.94 (32.94, 32.30, 36.28) | 32.22 (32.18, 46.92, 32.22) | 1.02 | 63 % |
+| `sha256`, 4 vCPUs | 1.79 (1.79, 1.79, 2.06) | 1.77 (1.74, 6.51, 1.77) | 1.01 | 119 % |
+| `xz`, 4 vCPUs | 2.59 (2.67, 2.52, 2.59) | 2.42 (2.15, 5.04, 2.42) | 1.07 | 116 % |
+| Boot MIPS, 4 vCPUs | 579.9 (579.9, 598.1, 533.4) | 599.6 (599.6, 414.7, 605.5) | 1.03 | |
+| Load (1 min) at the starts, 4 vCPUs | 6.2, 10.5, 7.9 | 5.7, 8.3, 8.0 | | |
+| CoreMark mix, flat, 1 CPU, MIPS | 2,763 (2,758, 2,766, 2,763) | 3,046 (2,927, 3,046, 3,067) | 1.10 | |
+| Scalar loop, flat, 1 CPU, MIPS | 9,544 (9,602, 9,544, 9,511) | 11,566 (11,471, 11,566, 11,682) | 1.21 | |
+
+The QEMU baselines are those of the history (card #1208): boot 41.6 and
+20.18 s, `sha256` 2.12 and 2.11 s, `xz` 2.89 and 2.81 s.
+
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -3446,6 +3548,23 @@ VMLAB_HV_JIT_TERMINAL=0 python3 bench/run.py ... --hv-bin <after>/release/vmlab-
 # T3-D2j: K3 at one and two vCPUs
 VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv \
   --arch aarch64 --vcpus 2 --repeats 1 --guest debian-13 --suite boot --timeout-scale 4 --hv-bin <after>
+```
+
+Card #1213, the same firmware, one clone and one target directory a side, the bench run
+from the after tree with the reserved cores of #1205 (no `--cpus`):
+
+```sh
+# E1213: the flat rows in each tree, then the full suite, before and after in turn, three rounds
+python3 bench/run.py --backend jit --arch aarch64 --vcpus 1 --repeats 3      # in each tree
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 --guest debian-13 \
+  --suite full --keep --hv-bin <side>/target/release/vmlab-hv          # and --vcpus 4
+# bytes and compile time per block: "bytes of code" and "ms of compiling" over "blocks compiled"
+# in the last JIT line of every vCPU, or code_bytes and compile_ms in env.jit_reports of each row
+# K2, K1 and K3
+cargo test --release -p vmlab-hv-tcg-jit
+VMLAB_HV_JIT=1 just tcg-a64-lockstep c1 100000 1          # and loadstore, c8, branch
+VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv --arch aarch64 \
+  --vcpus 1 --repeats 1 --guest debian-13 --suite boot --keep --timeout-scale 4 --hv-bin <after>
 ```
 
 T3-D1 (card #1208), the same firmware, one tree and one target directory a side:

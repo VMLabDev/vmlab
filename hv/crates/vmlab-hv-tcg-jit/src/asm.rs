@@ -480,6 +480,35 @@ impl Asm {
         self.op(None, false, &[0x85], b.0, Rm::Reg(a));
     }
 
+    /// `lea dst, [base + displacement]`: the sum in 64 bits, with no flags
+    /// written.
+    pub fn lea(&mut self, dst: Reg, base: Reg, displacement: i32) {
+        self.op(None, true, &[0x8d], dst.0, Rm::Mem(base, displacement));
+    }
+
+    /// `lea dst, [base + index + displacement]`, through a SIB byte with a
+    /// scale of 1. `index` is not RSP, which a SIB byte cannot name.
+    pub fn lea_index(&mut self, dst: Reg, base: Reg, index: Reg, displacement: i32) {
+        debug_assert!(index != RSP, "RSP is no index");
+        self.byte(0x48 | ((dst.0 >> 3) << 2) | ((index.0 >> 3) << 1) | (base.0 >> 3));
+        self.byte(0x8d);
+        let low = base.0 & 7;
+        let mode = if displacement == 0 && low != 5 {
+            0
+        } else if fits_i8(displacement.into()) {
+            1
+        } else {
+            2
+        };
+        self.byte((mode << 6) | ((dst.0 & 7) << 3) | 4);
+        self.byte(((index.0 & 7) << 3) | low);
+        match mode {
+            1 => self.byte(displacement as u8),
+            2 => self.bytes(&displacement.to_le_bytes()),
+            _ => {}
+        }
+    }
+
     /// `imul dst, src`: the low 64 bits of the product.
     pub fn imul(&mut self, dst: Reg, src: Rm) {
         self.op(None, true, &[0x0f, 0xaf], dst.0, src);
@@ -711,6 +740,26 @@ mod tests {
             }
             for mem in &mems {
                 let text = rm_text(*mem);
+                if let Rm::Mem(base, displacement) = *mem {
+                    let address = text.replacen("qword ptr ", "", 1);
+                    add(format!("lea {name}, {address}"), &|a| {
+                        a.lea(dst, base, displacement)
+                    });
+                    for index in [RAX, RBX, RBP, R12, R13, R15] {
+                        let sum = address.replacen(
+                            NAMES[usize::from(base.0)],
+                            &format!(
+                                "{} + {}",
+                                NAMES[usize::from(base.0)],
+                                NAMES[usize::from(index.0)]
+                            ),
+                            1,
+                        );
+                        add(format!("lea {name}, {sum}"), &|a| {
+                            a.lea_index(dst, base, index, displacement)
+                        });
+                    }
+                }
                 add(format!("mov {name}, {text}"), &|a| a.mov(dst, *mem));
                 add(format!("mov {text}, {name}"), &|a| a.store(*mem, dst));
                 add(format!("add {name}, {text}"), &|a| {
