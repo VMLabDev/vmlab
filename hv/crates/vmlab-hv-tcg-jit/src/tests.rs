@@ -601,10 +601,10 @@ fn random_block(random: &mut Random, count: usize) -> Block {
 /// outside.
 fn address(random: &mut Random, bytes: u8) -> u64 {
     let page = RAM + 4096 * random.below(PAGES as u64);
-    // A pair hits inline at a multiple of 8 in its page, and misses at the
-    // last 8 bytes of it.
+    // A pair hits inline where its 16 bytes are in its page, aligned or
+    // not (N10), and misses where it crosses into the next.
     if bytes == 16 && random.below(3) == 0 {
-        return page + random.below(512) * 8;
+        return page + random.below(512) * 8 + random.below(2) * random.below(8);
     }
     match random.below(16) {
         0 => page + 4096 - u64::from(bytes) / 2 - 1 + u64::from(bytes == 1),
@@ -1974,6 +1974,7 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
     let mut jit = Jit::with_capacity(16 << 20).expect("a code region");
     let mut random = Random(0x3e_0003);
     let (mut hits, mut misses, mut watched, mut left) = (0u64, 0u64, 0u64, 0);
+    let mut unaligned = 0u64;
     for round in 0..3000 {
         let count = 1 + random.below(if round % 10 == 0 { 300 } else { 60 }) as usize;
         let memory = if round % 4 == 0 {
@@ -2027,9 +2028,16 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
         }
         misses += ran.misses;
         hits += ran.logged.len() as u64;
+        // Hits at an address that is not a multiple of the size (N10).
+        unaligned += ran
+            .logged
+            .iter()
+            .filter(|&&(va, bytes, ..)| va % u64::from(bytes.min(8)) != 0)
+            .count() as u64;
         watched += ran.watched;
     }
     assert!(left > 100, "{left} blocks left");
+    assert!(unaligned > 20, "{unaligned} logged hits not aligned");
     assert!(
         misses > 1000 && hits > 1000,
         "{misses} misses, {hits} logged hits"
@@ -2174,10 +2182,13 @@ fn a_hit_asks_nothing_and_a_miss_runs_the_access_in_the_thunk() {
     // The write table of nothing: the store misses alone.
     let empty = tlb::EMPTY_TABLE.as_ptr();
     assert_eq!(run(&mut jit, &block, &mut ram, empty), (DONE, 1, 1, 0));
-    // A load that is not aligned misses also in a page that the TLB holds,
-    // and one outside the memory leaves the block.
+    // A load that is not aligned hits in a page that the TLB holds (N10),
+    // one that crosses into a page that it does not hold misses, and one
+    // outside the memory leaves the block.
     for (load_at, calls, code) in [
-        (RAM + 9, 1, DONE),
+        (RAM + 9, 0, DONE),
+        (RAM + 0xff8, 0, DONE),
+        (RAM + 0xffc, 1, DONE),
         (RAM + 0x1ff8, 1, DONE),
         (RAM - 8, 1, LEFT),
     ] {
@@ -2232,10 +2243,15 @@ fn an_unprivileged_access_and_a_block_without_inlining_take_the_thunk() {
         run_on_tables(&mut jit, &block, &[load], &mut ram, reads, writes),
         (DONE, 0, 0, 0)
     );
-    // An alignment of 16 in `aux`: an address aligned to 16 hits, one
-    // aligned to 8 only misses.
+    // The owner's bits of `aux` (an alignment of 16 here) do not change
+    // what hits: every address whose bytes are in the page (N10).
     let aligned = Op { aux: 0x0f, ..load };
-    for (address, misses) in [(RAM + 16, 0), (RAM + 24, 1)] {
+    for (address, misses) in [
+        (RAM + 16, 0),
+        (RAM + 24, 0),
+        (RAM + 0xffc, 0),
+        (RAM + 0xffd, 1),
+    ] {
         let block = access_block(vec![aligned], vec![0, address, 0], 2, Memory::Inline);
         assert_eq!(
             run_on_tables(&mut jit, &block, &[load], &mut ram, reads, writes),

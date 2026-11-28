@@ -2242,6 +2242,120 @@ estimates are *est.*, from the shares above.
   verdict on the boot after these cards needs more than three runs or a
   quieter host.
 
+### T3-D1, measured by card #1208
+
+N10 of J12e, drafted as T3-D1 in T3e. Helios, 2026-11-28, *measured*.
+Before: vmlab-hv of `next` at `ecdda53f`. After: the card at `faf0ea2e`,
+whose later commits change tests and this document only. A release build
+of each in its own tree and target directory, the firmware of J12. QEMU
+11.1.3 is a black box: no QEMU source was read (X1 to X3). Sources read:
+this document, `bench/README.md` and the code of the crates
+`vmlab-hv-tcg-jit` and `vmlab-hv-tcg-aarch64`.
+
+- **N10a. The lookup.** The inlined sequence takes the entry at the place
+  of the page of the first byte and compares the page of the last byte,
+  `(va + size - 1) & !0xfff`, with the tag (`emit.rs`, `access`). That is
+  one `add` more than the mask of before for an access of 2 to 8 bytes,
+  and a pair loses its separate check of the last 8 bytes of a page. An
+  access that crosses into the next page misses: the page of its last byte
+  has another place, so no tag at the place of the first page equals it,
+  also where the address wraps at 2^64. `FastTlb::lookup` is the same rule
+  for the tests.
+- **N10b. Device memory, not as the draft says.** The draft keeps the bits
+  of `Op::aux` in the compare. In a block lifted without `Context::strict`
+  (the MMU on and SCTLR_EL1.A clear) the lifter puts into `Op::aux` the
+  Device alignment of every access of 2 bytes or more, and that is the size
+  of the access (`device_alignment`). Kept in the compare, it makes every
+  access that is not aligned miss as before, and the card gains nothing.
+  So the emitter reads no alignment bits (the constant `ALIGNMENT` is now
+  `OWNER`: bits that only the owner's thunk reads), and `Side::fill_fast`
+  gives a Device page no entry while the MMU is on and SCTLR_EL1.A is
+  clear: the Rust paths check its alignment, as before. With the MMU off
+  or SCTLR_EL1.A set, every block is strict and its guards check at least
+  the Device alignment before the access, so Device pages fill as before
+  and the flat images (the MMU off, all data Device memory) keep their
+  hits. A change of either bit flushes the TLB (`Mmu::sync`). The cost: a
+  page of RAM that the guest maps as Device memory with the MMU on takes
+  the thunk at every access. Linux maps RAM as Normal memory.
+
+**N10c. The `xz` rows**, the D2 suite (`--suite full`), Debian 13, the
+reserved-core pin of card #1205 (no `--cpus`), one repeat a side in turn
+(before, after, QEMU), one VM of this card at a time. The rows are in
+`bench/history/aarch64.jsonl` with the notes "card #1208 T3-D1". The
+median of the samples, the samples in round order. A percentage of QEMU is
+QEMU's time over vmlab-hv's time.
+
+| Row | vCPUs | Before, s | After, s | QEMU, s | After over before | Before, of QEMU | After, of QEMU | T3 |
+|---|---|---|---|---|---|---|---|---|
+| `xz_9_32M` | 1 | 8.81 (9.21, 8.56, 8.81) | 3.29 (3.76, 3.32, 3.13, 3.26) | 2.86 (3.11, 2.82, 2.76, 2.89) | 2.68 times | 32 % | 87 % | met |
+| `xz_9_32M` | 4 | 9.01 (9.01, 9.55, 8.58) | 3.26 (3.26, 3.47, 3.03) | 2.81 (2.75, 2.88, 2.81) | 2.76 times | 31 % | 86 % | met |
+
+- **N10c1. Above the estimate.** T3e estimated 1.5 to 2.2 times, 47 to
+  69 % of QEMU at one vCPU and 43 to 63 % at four. The fast TLB misses of
+  the `xz` window (the counts of every vCPU around the run of `xz`, from
+  the JIT lines of the kept runs): before 30.0, 27.0 and 27.1 % of the
+  inlined accesses at one vCPU and 24.6, 26.6 and 30.9 % at four, after
+  0.4 to 1.1 % at one vCPU and 0.9 to 1.7 % at four. The miss path was
+  53 to 57 % of `xz` (T3d1), and almost all of it goes.
+- **N10c2. The host.** Round 1 at one vCPU ran beside the merge bar of
+  this card and a K1 lockstep of an earlier start of the card's script:
+  load average 13.6 to 16.9, the pin `loaded`. Rounds 2 to 4 at one vCPU:
+  load average 6.6 to 13.4, the pins `free`, 0.6 to 1.5 busy CPUs on the
+  reserved threads and 5.4 to 7.9 of the other 28. At four vCPUs: load
+  average 6.8 to 19.8, five of nine pins `loaded` (too few free cores),
+  1.6 to 3.7 busy CPUs reserved, 5.6 to 7.7 of the other 22. The verdict
+  does not depend on round 1: rounds 2 to 4 alone give `xz` medians of
+  3.26 s after, 2.82 s for QEMU (87 %) and 8.69 s before (two samples).
+- **N10c3. A boot that hung.** The before boot of round 2 at one vCPU went
+  idle in its apparmor profiles 363 s into the guest and waited 25 minutes
+  for the agent: the hang that J12d saw on both binaries. It was killed,
+  and a fourth round at one vCPU, all three sides, took its place.
+- **N10c4. The other rows of the same runs** move within their noise, as
+  T3e estimated (a boot 1 to 2 %):
+
+  | Row | vCPUs | Before, s | After, s | QEMU, s |
+  |---|---|---|---|---|
+  | Boot to agent ready | 1 | 69.96 (124.73, 69.96, 66.45) | 68.25 (88.28, 69.43, 61.19, 67.07) | 35.97 (90.30, 30.34, 28.29, 41.60) |
+  | `sha256_256M` | 1 | 3.44 (4.21, 3.44, 3.44) | 3.15 (7.62, 2.85, 2.81, 3.45) | 2.13 (2.92, 2.13, 2.12, 2.12) |
+  | Boot to agent ready | 4 | 52.26 (52.26, 46.12, 178.11) | 47.13 (47.13, 52.55, 44.35) | 20.18 (18.16, 54.46, 20.18) |
+  | `sha256_256M` | 4 | 2.10 (2.10, 2.05, 2.44) | 2.10 (2.13, 2.10, 1.95) | 2.11 (2.05, 2.16, 2.11) |
+
+  The fast TLB of a boot: the K3 boot below missed 96.9 million of 4.18e9
+  inlined accesses (2.3 %) at its line of 18.0e9 instructions, against
+  2.96 to 3.13 % for `next` at the same size in J12d. That is the 23 % of
+  the misses of a boot that J12b counted as not aligned.
+- **N10c5. The interpreter share (H2b)** is zero for a missing form in
+  every row: no block refused. At the budget: 50 to 222 blocks a run at
+  one vCPU and 1,587 to 2,186 at four, on both sides.
+
+**N10d. The proofs.**
+
+- **N10d1. K2 with unaligned addresses.** The block differential of the
+  emitter's loads and stores (`inlined_loads_and_stores_leave_what_the_interpreter_leaves`,
+  seed `0x3e0003`, 3,000 rounds) draws addresses that are not aligned to
+  their size, that cross a page and that are outside the memory, and pairs
+  at any offset in their page. It now also asks for logged hits at
+  addresses that are not aligned. The aarch64 K2 (`a64_jitdiff`, in
+  `just ci::check`) runs with the MMU off, where every block is strict.
+  Unit tests: `tlb.rs` (every byte of an access in the page, a pair, the
+  wrap at 2^64), the emitter's hit and miss tests, and `tests/fasttlb.rs`
+  on a CPU with the MMU on: a load that is not aligned hits after its
+  first miss, a store across two mapped pages misses every time and writes
+  4 bytes in each, and a Device page fills nothing while a load there that
+  is not aligned takes the alignment fault.
+- **N10d2. K1 for the loads and stores** (`VMLAB_HV_JIT=1`, release):
+  `just tcg-a64-lockstep loadstore 100000 1`, 5,227,965 instructions
+  verified in 2,980,846 rounds, no difference, 604,544 rounds ended by an
+  access not aligned to its size on both sides (the MMU off). `just
+  tcg-a64-lockstep c8 100000 1`, the MMU on: 4,403,165 instructions in
+  1,155 rounds, no difference.
+- **N10d3. K3 on a Debian boot** (`VMLAB_HV_JIT_CHECK=1`,
+  `VMLAB_HV_JIT_CHECK_RUNS=1000`, one vCPU, the after binary): agent ready
+  after 168.5 s, no difference, 120.4 million checked blocks (875.8 million
+  instructions) at the line of 18.0e9 instructions.
+- **N10e. T3 after this card.** `xz` meets T3 at 87 and 86 % of QEMU.
+  CoreMark and `sha256` met it in T3c. The boot is left (T3-D2 to T3-D4).
+
 ### T3-D4, measured by card #1211
 
 Helios, 2026-11-28, *measured*, the release build, the boot suite
@@ -2515,6 +2629,23 @@ grep -o "superblocks: .*" bench/run/*/stderr.log
 # J14i: K2 with joins, K1 for the branch group
 cargo test --release -p vmlab-hv-tcg-aarch64 --test jit -- superblocks
 VMLAB_HV_JIT=1 just tcg-a64-lockstep branch 100000 1
+```
+
+T3-D1 (card #1208), the same firmware, one tree and one target directory a side:
+
+```sh
+# N10c: the full suite, before, after and QEMU in turn, one repeat each, three rounds a vCPU count,
+# the reserved-core pin of #1205 (no --cpus), run from the tree of the card
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 --guest debian-13 \
+  --suite full --keep --hv-bin <side>/release/vmlab-hv          # before, after, then:
+python3 bench/run.py --backend qemu --arch aarch64 --vcpus 1 --repeats 1 --guest debian-13 --suite full
+# the xz window: the "fast TLB:" counts of every vCPU in the kept stderr.log, at the JIT lines
+# around [end - secs, end] of the "xz_9_32M: <s>s" line of the bench log
+# N10d: K1 and K3
+VMLAB_HV_JIT=1 just tcg-a64-lockstep loadstore 100000 1
+VMLAB_HV_JIT=1 just tcg-a64-lockstep c8 100000 1
+VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv --arch aarch64 \
+  --vcpus 1 --repeats 1 --guest debian-13 --suite boot --keep --timeout-scale 4 --hv-bin <after>
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the
