@@ -4651,6 +4651,13 @@ pub struct Cpu<M> {
     /// The seat of the compiled code of a CPU without `lines`, whose seat
     /// it is otherwise.
     seat: std::sync::Arc<jit::seat::Seat>,
+    /// The seat that the mailbox of `shootdown` was given last: `run` gives
+    /// it again only when it changed, and takes no lock otherwise (#1217).
+    seated: Option<std::sync::Arc<jit::seat::Seat>>,
+    /// The speed of the CPU in its run loop, in instructions per 1,024 ticks
+    /// of the counter, for the budget of a run of compiled code before the
+    /// deadline of its timer (`chain_budget`). 0: not measured yet.
+    rate: u64,
     blocks: Cache,
     /// Blocks of one instruction, for `step` and for the end of a budget.
     singles: Cache,
@@ -4698,9 +4705,51 @@ const SIDE_EXITS: usize = jit::SITES - 2;
 pub const ZERO_BLOCK: usize = 64;
 
 /// The most instructions of one run of compiled code on a CPU of a machine
-/// (3e DESIGN.md H10): it reads its interrupt lines, its mail and its clock
-/// at least this often. 20 to 40 us at the speeds of J1.
-const CHAIN_SLICE: u64 = 4096;
+/// (3e DESIGN.md H10, card #1217). A line that rises, mail and a pause kick
+/// the run, which leaves at its next block head: this bounds only a kick
+/// that was lost (`vmlab_hv_tcg_jit::seat`). 30 to 130 us at the speeds of
+/// T3.
+const CHAIN_SLICE: u64 = 1 << 16;
+
+/// The least instructions of one run of compiled code on a CPU of a machine
+/// whose timer is armed: the run near the deadline, and every run before
+/// the CPU has measured its speed (#1217). 4,096 was the slice of every run
+/// before.
+const CHAIN_NEAR: u64 = 4096;
+
+/// The budget of one run of compiled code on a CPU of a machine (#1217):
+/// half of the instructions that `rate` (instructions per 1,024 ticks of
+/// the counter) runs in the `ticks` up to the deadline of its timer, at
+/// least `CHAIN_NEAR` and at most `CHAIN_SLICE`. Without a deadline only a
+/// write of a timer register arms one, and that ends the run. Half: the
+/// speed of a run is not that of the runs before it, so the loop reads the
+/// clock again before the deadline and a run past it is at most
+/// `CHAIN_NEAR` long.
+fn chain_budget(ticks: Option<u64>, rate: u64) -> u64 {
+    let Some(ticks) = ticks else {
+        return CHAIN_SLICE;
+    };
+    if rate == 0 {
+        return CHAIN_NEAR;
+    }
+    let instructions = u128::from(ticks) * u128::from(rate) / 1024 / 2;
+    instructions.clamp(u128::from(CHAIN_NEAR), u128::from(CHAIN_SLICE)) as u64
+}
+
+/// The speed of a CPU, in instructions per 1,024 ticks of the counter, after
+/// `instructions` ran in `ticks` and the speed before was `rate` (0: none
+/// yet). The mean moves a quarter of the way to each new measure.
+fn learn_rate(rate: u64, instructions: u64, ticks: u64) -> u64 {
+    if ticks == 0 {
+        return rate;
+    }
+    let measured = (u128::from(instructions) * 1024 / u128::from(ticks)).min(u128::from(u64::MAX >> 2)) as u64;
+    if rate == 0 {
+        measured
+    } else {
+        (rate * 3 + measured) / 4
+    }
+}
 
 /// The most entries of `Cpu::unknown`. A guest that walks an encoding space
 /// must not fill the memory of the host.
@@ -4730,6 +4779,8 @@ impl<M: Memory> Cpu<M> {
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
             seat: Default::default(),
+            seated: None,
+            rate: 0,
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
@@ -5781,11 +5832,12 @@ impl<M: Memory> Cpu<M> {
     }
 
     /// The budget of one run of compiled code, of `left` instructions: a
-    /// CPU of a machine leaves its runs often enough to see its interrupt
-    /// lines, its timer and the mail of the other CPUs (3e DESIGN.md H10).
-    fn slice(&self, left: u64) -> u64 {
+    /// CPU of a machine leaves its runs at `chain` (`chain_budget`), often
+    /// enough to see its timer and a kick that was lost (3e DESIGN.md H10,
+    /// #1217).
+    fn slice(&self, left: u64, chain: u64) -> u64 {
         if self.lines.is_some() || self.shootdown.is_some() {
-            left.min(CHAIN_SLICE)
+            left.min(chain)
         } else {
             left
         }
@@ -5836,12 +5888,25 @@ impl<M: Memory> Cpu<M> {
         if !same {
             self.side.shootdown = self.shootdown.clone();
         }
+        // The mailbox keeps its seat behind a lock that a post takes: the
+        // seat is given again only when it, or the mailbox, changed
+        // (#1217), not at every run.
         if let Some((shootdown, id)) = &self.shootdown {
             let seat = match &self.lines {
                 Some(lines) => &lines.seat,
                 None => &self.seat,
             };
-            shootdown.seat(*id, seat);
+            let seated = same
+                && self
+                    .seated
+                    .as_ref()
+                    .is_some_and(|now| std::sync::Arc::ptr_eq(now, seat));
+            if !seated {
+                shootdown.seat(*id, seat);
+                self.seated = Some(seat.clone());
+            }
+        } else {
+            self.seated = None;
         }
     }
 
@@ -5867,12 +5932,16 @@ impl<M: Memory> Cpu<M> {
         // so that its owner raises the interrupt then and not at the end of
         // the budget: a guest that spins until the interrupt comes waited
         // a whole budget for each (kvm-unit-tests `timer`, card C13). The
-        // clock is read every `CLOCK_BLOCKS` blocks, not before each.
+        // clock is read every `CLOCK_BLOCKS` blocks, not before each, and
+        // after each run of compiled code, whose budget ends before the
+        // deadline (`chain_budget`, #1217).
+        let mut clocked = self.clock.count();
         let deadline = if self.lines.is_some() {
-            self.timer_deadline()
+            timer::deadline(&self.state.system.timers, clocked)
         } else {
             None
         };
+        let mut chain = chain_budget(deadline.map(|d| d - clocked), self.rate);
         let mut blocks = 0u32;
         // Instructions since the clock was read: a run of compiled code
         // that chains is many blocks.
@@ -5880,11 +5949,15 @@ impl<M: Memory> Cpu<M> {
         while left > 0 {
             if let Some(deadline) = deadline {
                 blocks += 1;
-                if blocks.is_multiple_of(CLOCK_BLOCKS) || unclocked >= CHAIN_SLICE {
+                if blocks.is_multiple_of(CLOCK_BLOCKS) || unclocked >= chain {
+                    let now = self.clock.count();
+                    self.rate = learn_rate(self.rate, unclocked, now.saturating_sub(clocked));
+                    clocked = now;
                     unclocked = 0;
-                    if self.clock.count() >= deadline {
+                    if now >= deadline {
                         break;
                     }
+                    chain = chain_budget(Some(deadline - now), self.rate);
                 }
             }
             // The link that the run before left, for the block that runs
@@ -5916,7 +5989,7 @@ impl<M: Memory> Cpu<M> {
             let index = fetched.map_or(0, Cache::index);
             // The common case: the TLB holds the page of the code, and the
             // block is translated and fits the budget.
-            let budget = self.slice(left);
+            let budget = self.slice(left, chain);
             let outcome = if let Some(phys) = fetched
                 && self.usable(false, index, phys, context)
                 && let Some(block) = self.blocks.entries[index].as_mut()
@@ -7317,5 +7390,135 @@ mod tests {
         assert_eq!(cpu.run(4), Stop::Budget);
         assert_eq!(cpu.state.x(2), 0x8000_0000);
         assert_eq!(cpu.state.x(3), 0x8000_0000);
+    }
+
+    /// Card #1217: the budget of a run of compiled code on a machine CPU is
+    /// half of what the measured speed runs up to the deadline of its timer,
+    /// between `CHAIN_NEAR` and `CHAIN_SLICE`, and `CHAIN_SLICE` without a
+    /// deadline.
+    #[test]
+    fn a_run_of_compiled_code_ends_before_the_deadline_of_the_timer() {
+        // No deadline: the most, which bounds only a lost kick.
+        assert_eq!(chain_budget(None, 0), CHAIN_SLICE);
+        assert_eq!(chain_budget(None, 4096), CHAIN_SLICE);
+        // No speed measured yet: the slice of every run before #1217.
+        assert_eq!(chain_budget(Some(1_000_000), 0), CHAIN_NEAR);
+        // 8 instructions a tick (8,192 per 1,024): 10,000 ticks are 80,000
+        // instructions, and the run takes half.
+        assert_eq!(chain_budget(Some(10_000), 8192), 40_000);
+        // Near the deadline the least, far from it the most.
+        assert_eq!(chain_budget(Some(10), 8192), CHAIN_NEAR);
+        assert_eq!(chain_budget(Some(0), 8192), CHAIN_NEAR);
+        assert_eq!(chain_budget(Some(10_000_000), 8192), CHAIN_SLICE);
+        assert_eq!(chain_budget(Some(u64::MAX), u64::MAX >> 2), CHAIN_SLICE);
+        // The speed: the first measure, then a quarter of the way to each.
+        assert_eq!(learn_rate(0, 8000, 1000), 8192);
+        assert_eq!(learn_rate(8192, 0, 1000), 6144);
+        assert_eq!(learn_rate(8192, 8000, 0), 8192);
+        assert_eq!(learn_rate(0, u64::MAX, 1), u64::MAX >> 2);
+        // A run that follows the budget meets the deadline: each run takes
+        // half of what is left, until the least.
+        let mut left = 1_000_000u64;
+        let mut runs = 0;
+        while left > 0 {
+            let ticks = left.div_ceil(8);
+            let run = chain_budget(Some(ticks), 8192).min(left);
+            left -= run;
+            runs += 1;
+        }
+        assert!(runs < 40, "{runs}");
+    }
+
+    /// Card #1217: with the JIT and chaining on, a machine CPU whose budget
+    /// is many times what runs up to the deadline of its timer leaves its
+    /// loop near the deadline, and its speed is measured on the way.
+    #[test]
+    fn a_machine_cpu_in_chained_code_leaves_its_loop_when_its_timer_is_due() {
+        let budget = 300_000_000;
+        let mut cpu = cpu(&LOOP);
+        cpu.set_jit(true).unwrap();
+        cpu.set_chaining(true).unwrap();
+        cpu.state.set_x(1, budget);
+        cpu.clock = Clock::host(0, 1_000_000_000);
+        cpu.lines = Some(std::sync::Arc::new(Lines::default()));
+        let timer = &mut cpu.state.system.timers[1];
+        timer.compare = cpu.clock.count() + 200_000;
+        timer.set_control(1);
+        assert_eq!(cpu.run(budget), Stop::Budget);
+        assert!(cpu.instructions < budget / 10, "{}", cpu.instructions);
+        assert!(cpu.clock.count() >= cpu.state.system.timers[1].compare);
+        assert!(cpu.rate > 0);
+        assert!(cpu.jit_counts().compiled_runs > 0);
+    }
+
+    /// Card #1217: an interrupt line that another thread raises while a
+    /// machine CPU runs chained code whose budget does not end is taken in
+    /// that run: the kick ends the compiled code at its next block head,
+    /// and the loop reads the line.
+    #[test]
+    fn a_line_raised_by_another_thread_ends_a_chained_run_without_an_end() {
+        use std::sync::Arc;
+        let mut cpu = with_vectors(&LOOP);
+        cpu.memory
+            .write(VECTORS + 0x280, &HVC_0.to_le_bytes())
+            .unwrap();
+        cpu.set_jit(true).unwrap();
+        cpu.set_chaining(true).unwrap();
+        cpu.state.set_x(1, u64::MAX);
+        // IRQ unmasked at EL1.
+        cpu.state.daif = 0b1101;
+        let lines = Arc::new(Lines::default());
+        cpu.lines = Some(lines.clone());
+        let raiser = std::thread::spawn({
+            let lines = lines.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                lines.irq.store(true, Ordering::SeqCst);
+                lines.kick();
+            }
+        });
+        let budget = 1u64 << 40;
+        let stop = cpu.run(budget);
+        raiser.join().unwrap();
+        assert!(matches!(stop, Stop::Hypercall { .. }), "{stop:?}");
+        assert_eq!(
+            cpu.taken.map(|taken| taken.cause),
+            Some(Cause::Interrupt(exception::Interrupt::Irq))
+        );
+        assert!(cpu.instructions < budget);
+        assert!(cpu.jit_counts().compiled_runs > 0);
+    }
+
+    /// Card #1217: `run` gives the mailbox its seat once, not at every run,
+    /// and again when the machine gives the CPU other mailboxes: a post on
+    /// the new ones kicks the seat of the CPU.
+    #[test]
+    fn the_mailbox_gets_the_seat_again_when_the_mailboxes_change() {
+        use crate::shootdown::{Invalidation, Shootdown};
+        use std::sync::Arc;
+        let mut cpu = cpu(&LOOP);
+        cpu.state.set_x(1, 1_000_000);
+        let lines = Arc::new(Lines::default());
+        cpu.lines = Some(lines.clone());
+        let first = Arc::new(Shootdown::new(2));
+        cpu.shootdown = Some((first.clone(), 1));
+        assert_eq!(cpu.run(100), Stop::Budget);
+        assert!(cpu.seated.as_ref().is_some_and(|seat| Arc::ptr_eq(seat, &lines.seat)));
+        assert_eq!(cpu.run(100), Stop::Budget);
+        let second = Arc::new(Shootdown::new(2));
+        cpu.shootdown = Some((second.clone(), 1));
+        assert_eq!(cpu.run(100), Stop::Budget);
+        // The seat is in the mailbox of the new machine: a post kicks it.
+        // SAFETY: the seat lives in `lines`, and no code runs on it.
+        unsafe {
+            (*lines.seat.context()).budget = 100;
+        }
+        second.post(0, Invalidation::All);
+        // SAFETY: the seat lives in `lines`, and no code runs on it.
+        assert!(unsafe { jit::seat::kicked(lines.seat.context()) });
+        // Alone again, the CPU drops the seat that it gave.
+        cpu.shootdown = None;
+        assert_eq!(cpu.run(100), Stop::Budget);
+        assert!(cpu.seated.is_none());
     }
 }

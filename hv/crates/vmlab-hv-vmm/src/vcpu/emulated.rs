@@ -27,9 +27,12 @@ use super::guest_bus::GuestBus;
 use super::{Conduit, Exit, Hypercall, HypercallOutcome, Kick, VcpuBackend, VcpuState, Waker};
 use crate::vm::ExitReason;
 
-/// The instructions of one slice. A kick, and an interrupt that another
-/// thread raised, wait for the end of a slice.
-const SLICE: u64 = 1 << 16;
+/// The most instructions of one slice (#1217). A slice ends sooner at the
+/// deadline of the timer of the CPU, after a write of a timer register, and
+/// at a kick: an interrupt that another thread raises, mail of another vCPU
+/// and a pause kick the core, which leaves its compiled code at the next
+/// block head and takes them there, inside the slice.
+const SLICE: u64 = 1 << 20;
 /// The slice while the trace log is on.
 const DEBUG_SLICE: u64 = 64;
 /// With the JIT on, a line of its counts after this many instructions.
@@ -450,7 +453,15 @@ impl VcpuBackend for EmulatedVcpu {
         // what the stderr log writes, not what the recorder keeps.
         let short = crate::diagnostics::report::stderr_enabled(log::Level::Trace, module_path!());
         let before = self.cpu.exceptions;
-        let stop = self.cpu.run(if short { DEBUG_SLICE } else { SLICE });
+        let mut slice = if short { DEBUG_SLICE } else { SLICE };
+        // The windows of the lockstep are written at the end of a slice: one
+        // ends where the next window is due.
+        if let Some(windows) = &self.windows
+            && let Some(left) = windows.left(self.cpu.instructions)
+        {
+            slice = slice.min(left.max(1));
+        }
+        let stop = self.cpu.run(slice);
         if debug
             && self.cpu.exceptions != before
             && let Some(taken) = self.cpu.taken

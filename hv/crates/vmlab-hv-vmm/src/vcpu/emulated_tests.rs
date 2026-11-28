@@ -1116,6 +1116,49 @@ fn a_halted_vcpu_parks_for_a_pause_and_wakes_for_an_interrupt() {
     assert_eq!(state.x(6), 34);
 }
 
+/// Card #1217: a slice is up to a million instructions, and an interrupt
+/// that another thread raises while the vCPU spins in compiled code is taken
+/// inside the slice: the line kicks the core, which leaves its chained run
+/// at the next block head. The guest spins with no timer armed, so nothing
+/// else ends its slices early.
+#[test]
+fn an_interrupt_raised_by_another_thread_is_taken_inside_a_slice_of_a_spinning_vcpu() {
+    let mut program = interrupt_setup();
+    program.extend([
+        // SPI 2: a line that the test drives.
+        asm::movz(3, 1 << 2, 0),
+        str32(3, 0, 0x104),
+        IRQ_ON,
+        asm::movz(3, u16::from(b's'), 0),
+        strb(3, 4),
+        // A loop of two instructions, which compiles and chains.
+        asm::add(7, 7, 1),
+        asm::b(-1),
+    ]);
+    // INTID 34, plus 0x20, is 'B'.
+    let handler = report_interrupt(0x20, &[]);
+    let mut vm = TestVm::start(&program, &[], &handler, &[]);
+    vm.wait_output("s");
+    Gic::spi_line(&vm.gic, 2).set_level(true);
+    assert_eq!(
+        vm.host.wait_exit(),
+        ExitReason::Shutdown(ShutdownReason::GuestShutdown)
+    );
+    vm.join();
+    assert_eq!(vm.output.text(), "sB");
+    let VcpuState::Aarch64(state) = vm.vcpu.lock().state().unwrap() else {
+        panic!("an emulated vCPU has aarch64 registers");
+    };
+    // The loop ran, and the interrupt came from inside it.
+    assert!(state.x(7) > 0);
+    let looped = RAM + 4 * (program.len() as u64 - 2);
+    assert!(
+        (looped..=looped + 4).contains(&state.system.regs[vmlab_hv_tcg_aarch64::sysreg::reg::ELR_EL1]),
+        "ELR_EL1 {:#x}",
+        state.system.regs[vmlab_hv_tcg_aarch64::sysreg::reg::ELR_EL1]
+    );
+}
+
 #[test]
 fn the_virtual_timer_wakes_a_halted_vcpu_through_ppi_27() {
     let mut program = interrupt_setup();
