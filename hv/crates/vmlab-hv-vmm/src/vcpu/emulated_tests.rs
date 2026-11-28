@@ -706,18 +706,18 @@ fn count_atomically_on_four_cpus(jit: bool) {
         CPUS as usize,
     ));
     let program = [
-        ldaxr64(5, 1),        // 0 x5 = [x1]
-        asm::add(5, 5, 1),    // 1
-        stlxr64(6, 5, 1),     // 2 [x1] = x5
-        cbnz32(6, -3),        // 3 lost: again
-        ldxp64(7, 8, 3),      // 4 x7, x8 = [x3]
-        asm::add(7, 7, 1),    // 5
-        asm::add(8, 8, 2),    // 6
-        stxp64(6, 7, 8, 3),   // 7 [x3] = x7, x8
-        cbnz32(6, -4),        // 8 lost: again from 4
-        sub64(2, 2, 1),       // 9
-        asm::cbnz(2, -10),    // 10
-        asm::hvc(0),          // 11
+        ldaxr64(5, 1),      // 0 x5 = [x1]
+        asm::add(5, 5, 1),  // 1
+        stlxr64(6, 5, 1),   // 2 [x1] = x5
+        cbnz32(6, -3),      // 3 lost: again
+        ldxp64(7, 8, 3),    // 4 x7, x8 = [x3]
+        asm::add(7, 7, 1),  // 5
+        asm::add(8, 8, 2),  // 6
+        stxp64(6, 7, 8, 3), // 7 [x3] = x7, x8
+        cbnz32(6, -4),      // 8 lost: again from 4
+        sub64(2, 2, 1),     // 9
+        asm::cbnz(2, -10),  // 10
+        asm::hvc(0),        // 11
     ];
     memory
         .write_slice(&asm::bytes(&program), GuestAddress(CODE))
@@ -754,8 +754,16 @@ fn count_atomically_on_four_cpus(jit: bool) {
         u64::from_le_bytes(bytes)
     };
     assert_eq!(double(DATA), CPUS * ROUNDS, "the word, jit {jit}");
-    assert_eq!(double(DATA + 0x40), CPUS * ROUNDS, "the pair's low, jit {jit}");
-    assert_eq!(double(DATA + 0x48), 2 * CPUS * ROUNDS, "the pair's high, jit {jit}");
+    assert_eq!(
+        double(DATA + 0x40),
+        CPUS * ROUNDS,
+        "the pair's low, jit {jit}"
+    );
+    assert_eq!(
+        double(DATA + 0x48),
+        2 * CPUS * ROUNDS,
+        "the pair's high, jit {jit}"
+    );
 }
 
 /// `LDR Xt, [Xn]`.

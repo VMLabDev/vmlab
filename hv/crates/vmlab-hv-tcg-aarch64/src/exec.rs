@@ -1077,11 +1077,16 @@ impl Side {
         // and the exchange, is taken as one made before the load, as QEMU's
         // compare and exchange does. That is the ABA case, which the
         // architecture forbids and the operator accepted.
-        let intact = memory.reservation_generation(reservation.phys, usize::from(reservation.bytes))
+        let intact = memory
+            .reservation_generation(reservation.phys, usize::from(reservation.bytes))
             == reservation.generation;
         let wrote = intact
             && memory
-                .compare_and_store(phys, &(expected & mask).to_le_bytes()[..usize::from(bytes)], part)
+                .compare_and_store(
+                    phys,
+                    &(expected & mask).to_le_bytes()[..usize::from(bytes)],
+                    part,
+                )
                 .map_err(|error| Fault::memory(error, address))?;
         // The store completed, written or not: the mark ends.
         self.exclusive = None;
