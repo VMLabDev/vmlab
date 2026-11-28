@@ -5,6 +5,13 @@
 //! argv of the leader as a value, its records with the device reads, and
 //! which results of an instruction the follower takes from the leader.
 //!
+//! With a guest disk (K4 of 3e, card #1187) the leader boots a template to
+//! agent ready: it gets the disk on virtio-blk and the agent port on
+//! virtio-serial, and its stream carries every load from RAM. The follower
+//! has none of those devices. What a device of the leader wrote into RAM
+//! reaches the follower through the loads, and through the encodings of the
+//! instructions that the guest runs from such memory.
+//!
 //! QEMU is a black box here (S6). Nothing in this module is part of a
 //! product path.
 
@@ -32,6 +39,8 @@ pub struct DeviceRead {
 pub enum Record {
     Trace(Trace),
     Read(DeviceRead),
+    /// A load from RAM, with its physical address (`reads=all`).
+    Load(DeviceRead),
 }
 
 /// Parse the record at the start of `bytes`, as `oracle::parse` does, with
@@ -41,20 +50,25 @@ pub fn parse_record(
     vectors: bool,
     system: usize,
 ) -> Result<Option<(Record, usize)>, String> {
-    if bytes.len() >= 4 && bytes[..4] == 4u32.to_le_bytes() {
+    let device = bytes.len() >= 4 && bytes[..4] == 4u32.to_le_bytes();
+    let load = bytes.len() >= 4 && bytes[..4] == 5u32.to_le_bytes();
+    if device || load {
         if bytes.len() < 32 {
             return Ok(None);
         }
         let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        return Ok(Some((
-            Record::Read(DeviceRead {
-                address: word(8),
-                size,
-                value: u128::from(word(16)) | u128::from(word(24)) << 64,
-            }),
-            32,
-        )));
+        let read = DeviceRead {
+            address: word(8),
+            size,
+            value: u128::from(word(16)) | u128::from(word(24)) << 64,
+        };
+        let record = if device {
+            Record::Read(read)
+        } else {
+            Record::Load(read)
+        };
+        return Ok(Some((record, 32)));
     }
     Ok(parse(bytes, vectors, system)?.map(|(trace, len)| (Record::Trace(trace), len)))
 }
@@ -78,6 +92,16 @@ pub struct Options {
     /// of our machine and not from the firmware. `code` and `vars` are then
     /// not used.
     pub window: Option<WindowImage>,
+    /// The disk of a guest that the leader boots to agent ready (K4).
+    pub guest: Option<GuestDisk>,
+}
+
+/// The guest of a K4 run: a qcow2 disk that the leader may write (an
+/// overlay over a template), on virtio-blk, and the agent port
+/// `vmlab.agent.0` on virtio-serial, as the bench boots a template.
+#[derive(Clone, Debug)]
+pub struct GuestDisk {
+    pub disk: PathBuf,
 }
 
 /// What the leader of a window starts from: the RAM of our machine at the
@@ -95,8 +119,26 @@ impl Options {
     /// device that the user did not name, the random seed of its device
     /// tree off, and a clock that counts instructions (DESIGN.md M4).
     fn machine(&self) -> Vec<String> {
+        self.machine_with(false)
+    }
+
+    /// The machine, with its guest devices. A QEMU that runs no guest (the
+    /// dump of the device tree, the fw_cfg files) opens the disk read-only
+    /// and its agent port on no socket.
+    fn machine_with(&self, leader: bool) -> Vec<String> {
         // A window starts the CPU at EL2, so that its prelude can write every
         // register of EL1 and leave with `ERET` (`oracle::window`).
+        // A guest boot waits for its disk, which QEMU serves in host time.
+        // With `sleep=off` the clock of an idle CPU jumps to its next timer
+        // at once, so every wait for the disk ends a timeout of the guest
+        // (systemd killed journald after 6,000 guest seconds, card #1187).
+        // With `sleep=on` an idle CPU waits in host time, and a guest second
+        // is still 1e9 instructions while it runs.
+        let icount = if self.guest.is_some() {
+            "shift=0,sleep=on"
+        } else {
+            "shift=0,sleep=off"
+        };
         let machine = if self.window.is_some() {
             "virt,dtb-randomness=off,virtualization=on"
         } else {
@@ -135,7 +177,7 @@ impl Options {
             "-m",
             &self.ram_mib.to_string(),
             "-icount",
-            "shift=0,sleep=off",
+            icount,
             "-rtc",
             "base=2020-01-01T00:00:00,clock=vm",
             "-nodefaults",
@@ -147,7 +189,43 @@ impl Options {
         .into_iter()
         .map(String::from)
         .chain(flash)
+        .chain(self.guest_devices(leader))
         .collect()
+    }
+
+    fn guest_devices(&self, leader: bool) -> Vec<String> {
+        let Some(guest) = &self.guest else {
+            return Vec::new();
+        };
+        let agent = if leader {
+            format!(
+                "socket,id=agent,path={},server=on,wait=off",
+                self.agent_socket().display()
+            )
+        } else {
+            "null,id=agent".into()
+        };
+        vec![
+            "-blockdev".into(),
+            format!(
+                "driver=qcow2,node-name=disk0,file.driver=file,file.filename={}{}",
+                guest.disk.display(),
+                if leader { "" } else { ",read-only=on" }
+            ),
+            "-device".into(),
+            "virtio-blk-pci,drive=disk0".into(),
+            "-chardev".into(),
+            agent,
+            "-device".into(),
+            "virtio-serial-pci".into(),
+            "-device".into(),
+            "virtserialport,chardev=agent,name=vmlab.agent.0".into(),
+        ]
+    }
+
+    /// The socket of the agent port of the leader (with a guest disk).
+    pub fn agent_socket(&self) -> PathBuf {
+        self.directory.join("leader-agent.sock")
     }
 
     pub fn fifo(&self) -> PathBuf {
@@ -166,7 +244,7 @@ impl Options {
 
     /// The argv of the leader, after the name of the program.
     pub fn argv(&self) -> Vec<String> {
-        let mut argv = self.machine();
+        let mut argv = self.machine_with(true);
         argv.extend([
             "-chardev".into(),
             format!(
@@ -178,9 +256,10 @@ impl Options {
             "chardev:serial".into(),
             "-plugin".into(),
             format!(
-                "{},out={},vectors=on,reads=io,pipe=1048576{}",
+                "{},out={},vectors=on,reads={},pipe=1048576{}",
                 self.plugin.display(),
                 self.fifo().display(),
+                if self.guest.is_some() { "all" } else { "io" },
                 if self.system.is_empty() {
                     String::new()
                 } else {
@@ -501,6 +580,11 @@ impl Leader {
         }
     }
 
+    /// The exit status of the QEMU of the leader, `None` while it runs.
+    pub fn exited(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
     /// Put a record back: the next `next` gives it again.
     pub fn unread(&mut self, record: Record) {
         self.ahead.push_front(record);
@@ -621,6 +705,63 @@ mod tests {
     }
 
     #[test]
+    fn a_load_from_ram_is_a_record_of_its_own() {
+        let mut bytes = Vec::new();
+        bytes.extend(5u32.to_le_bytes());
+        bytes.extend(16u32.to_le_bytes());
+        bytes.extend(0x4123_4560u64.to_le_bytes());
+        bytes.extend(0x1122u64.to_le_bytes());
+        bytes.extend(0x3344u64.to_le_bytes());
+        assert_eq!(parse_record(&bytes[..31], true, 0), Ok(None));
+        assert_eq!(
+            parse_record(&bytes, true, 0),
+            Ok(Some((
+                Record::Load(DeviceRead {
+                    address: 0x4123_4560,
+                    size: 16,
+                    value: 0x1122 | 0x3344u128 << 64
+                }),
+                32
+            )))
+        );
+    }
+
+    #[test]
+    fn the_leader_of_a_guest_boot_has_its_disk_and_agent_port_and_every_load() {
+        let options = Options {
+            qemu: "qemu-system-aarch64".into(),
+            plugin: "/p/a64lock.so".into(),
+            directory: "/d".into(),
+            cpu: "cortex-a53".into(),
+            ram_mib: 2048,
+            code: "/f/code.fd".into(),
+            vars: "/d/vars.fd".into(),
+            system: vec![],
+            window: None,
+            guest: Some(GuestDisk {
+                disk: "/d/disk.qcow2".into(),
+            }),
+        };
+        let argv = options.argv().join(" ");
+        assert!(argv.contains("-icount shift=0,sleep=on"));
+        assert!(argv.contains(
+            "-blockdev driver=qcow2,node-name=disk0,file.driver=file,file.filename=/d/disk.qcow2 \
+             -device virtio-blk-pci,drive=disk0 \
+             -chardev socket,id=agent,path=/d/leader-agent.sock,server=on,wait=off \
+             -device virtio-serial-pci -device virtserialport,chardev=agent,name=vmlab.agent.0"
+        ));
+        assert!(argv.ends_with(
+            "-plugin /p/a64lock.so,out=/d/a64boot.fifo,vectors=on,reads=all,pipe=1048576"
+        ));
+        // The QEMU that writes the device tree has the same devices, runs
+        // no guest, and so neither writes the disk nor opens the socket.
+        let dump = options.dump_argv(Path::new("/d/x.dtb")).join(" ");
+        assert!(dump.contains("file.filename=/d/disk.qcow2,read-only=on"));
+        assert!(dump.contains("-chardev null,id=agent"));
+        assert!(!dump.contains("leader-agent.sock"));
+    }
+
+    #[test]
     fn a_fw_cfg_directory_names_its_files() {
         let mut directory = Vec::new();
         for (name, selector, size) in [("bootorder", 0x21u16, 0u32), ("etc/acpi/rsdp", 0x22, 36)] {
@@ -677,6 +818,7 @@ mod tests {
             vars: "/d/vars.fd".into(),
             system: vec!["ESR_EL1".into(), "FAR_EL1".into()],
             window: None,
+            guest: None,
         };
         let argv = options.argv().join(" ");
         assert!(argv.starts_with(
@@ -711,6 +853,7 @@ mod tests {
                 ram: "/w/window-3.ram".into(),
                 prelude: "/d/prelude.bin".into(),
             }),
+            guest: None,
         };
         let argv = options.argv().join(" ");
         assert!(argv.starts_with(
