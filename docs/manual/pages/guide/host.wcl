@@ -524,17 +524,20 @@ headless: read its serial console with `vmlab logs`, and reach it with
 `vmlab exec` and `vmlab shell`. `vm screenshot`, the other screen and input
 verbs, and `vmlab record` say the machine has no display. `vmlab up` warns
 about it for a VM whose profile names a display device, because the same VM
-had a screen on QEMU. The install CD-ROM is a read-only virtio disk, which
+had a screen on QEMU. The display and input devices are the only ones left
+out with a warning rather than refused, until virtio-gpu and input arrive on
+the `virt` machine. The install CD-ROM is a read-only virtio disk, which
 cannot be ejected. Shares go over SMB,
 because the machine has no virtio-fs, and NICs take the stream socket, not
 the kernel fast path.
 
 vmlab-hv refuses, for an aarch64 VM, a `gpu {}` block, `usb = true`, a TPM,
 `audio`, a `cpu_model`, more than eight vCPUs, `accel = "kvm"` and
-`qemu_args`. Automatic selection then puts the VM on QEMU, with the reason in
-`status`. An aarch64 VM that ran on QEMU moves to vmlab-hv at its next start
-when vmlab-hv refuses nothing, by the same rules as the x86 move above;
-otherwise it stays on QEMU and `status` says why.
+`qemu_args`. There is no fallback to QEMU: `vmlab validate`, `vmlab up` and
+`vmlab vm start` fail with an error that names the VM and each device the
+`virt` machine lacks. An aarch64 VM that ran on QEMU moves to vmlab-hv at its
+next start, by the same rules as the x86 move above, and fails its start the
+same way when vmlab-hv refuses it.
 
 QEMU stays available for aarch64 to troubleshoot: set `hypervisor = "qemu"`
 on the VM, or `hypervisor { vm = "qemu" }` in the host config.
@@ -550,7 +553,7 @@ DOC
   p <<'DOC'
 vmlab-hv is the only hypervisor for x86 and x86_64 guests, and it runs
 aarch64 guests on its own emulator (see below). QEMU runs riscv64 guests, and
-an aarch64 guest when a setting puts it there. Each way an x86 machine used to reach QEMU is now an
+an aarch64 guest only when a setting puts it there. Each way an x86 machine used to reach QEMU is now an
 error, from `vmlab validate` and again from `vmlab up` and `vmlab vm start`,
 naming the machine and the fix:
 DOC
@@ -577,8 +580,8 @@ an offline snapshot. Offline snapshots restore under either hypervisor.
 DOC
 
   p <<'DOC'
-Every new x86 VM and every container on an x86_64 host selects vmlab-hv, and
-so does a new aarch64 VM that vmlab-hv refuses nothing. Any other VM falls
+Every new x86 or aarch64 VM and every container on an x86_64 host selects
+vmlab-hv, and what vmlab-hv refuses of them is an error. Any other VM falls
 back to QEMU, with the reason in `status`, `status --json`, and an info line
 at `up`. Containers require KVM and never
 fall back to TCG.

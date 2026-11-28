@@ -5562,6 +5562,31 @@ lab "l" {
         assert_eq!(es, ["w: no virtiofsd"], "{es:#?}");
     }
 
+    /// An aarch64 VM vmlab-hv refuses is an error at `up` naming each
+    /// device the `virt` machine lacks, with no QEMU fallback (§22.5); one
+    /// whose only gap is the display validates, and an explicit QEMU stays.
+    #[test]
+    fn an_aarch64_vm_vmlab_hv_refuses_is_an_error_naming_the_device() {
+        let base = r#"template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 10GiB"#;
+        let es = hv_errs(
+            &HvHost::kvm(),
+            &format!(
+                r#"vm "arm" {{ {base} usb = true tpm = true }}
+  vm "plain" {{ {base} }}
+  vm "pinned" {{ {base} hypervisor = "qemu" usb = true }}"#
+            ),
+        );
+        assert_eq!(es.len(), 2, "{es:#?}");
+        for word in ["`usb = true`", "a TPM"] {
+            assert!(
+                es.iter().any(|e| e.contains("vm \"arm\"")
+                    && e.contains(word)
+                    && e.contains("`virt`")),
+                "{word}: {es:#?}"
+            );
+        }
+    }
+
     #[test]
     fn qemu_args_on_vmlab_are_refused() {
         let es = hv_errs(
