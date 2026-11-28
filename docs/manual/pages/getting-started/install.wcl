@@ -230,7 +230,7 @@ SRC
   table {
     rows:
       | "Package" | "Provides" | "Needed for" |
-      | "`qemu-system-arm`, `qemu-system-misc`" | "`qemu-system-aarch64`, `qemu-system-riscv64`" | "Running aarch64 and riscv64 guests. Install only the architectures you use." |
+      | "`qemu-system-arm`, `qemu-system-misc`" | "`qemu-system-aarch64`, `qemu-system-riscv64`" | "Running riscv64 guests, and aarch64 guests on QEMU to troubleshoot: vmlab-hv runs aarch64 guests. Install only the architectures you use." |
       | "`qemu-utils`" | "`qemu-img`" | "Optional. vmlab makes clones, snapshots and template disks itself; `qemu-img` runs them only when `VMLAB_IMAGE_TOOL=qemu-img` selects it as a fallback" |
       | "`seabios`" | "BIOS firmware" | "Booting `firmware = \"seabios\"` guests; usually pulled in by QEMU itself" |
       | "`qemu-efi-riscv64`" | "UEFI firmware for riscv64" | "riscv64 guests; vmlab bundles no riscv64 firmware" |

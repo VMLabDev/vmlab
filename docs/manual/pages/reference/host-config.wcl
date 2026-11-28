@@ -211,9 +211,9 @@ SRC
   list {
     li "Each field is `qemu` or `vmlab`. Any other value is rejected with a parse error that names it."
     li "A machine's own `hypervisor` wins over this block. The field never resolves through a template or a profile."
-    li "Explicit `vmlab` settings are validated against the refusal list. A new x86 machine without a hypervisor setting selects vmlab-hv and is validated the same way; a new machine of another architecture selects QEMU with a reason."
-    li "QEMU runs no x86 guest: `vm = \"qemu\"` or `container = \"qemu\"` is a validation error for every x86 machine it reaches, naming the fix. It stays valid for aarch64 and riscv64 machines."
-    li "With neither setting, an existing x86 QEMU identity selects vmlab-hv. A hardware refusal fails the start and keeps the old identity. After the checks pass, vmlab saves the switch before boot and `up` reports it once."
+    li "Explicit `vmlab` settings are validated against the refusal list. A new x86 machine without a hypervisor setting selects vmlab-hv and is validated the same way. A new aarch64 VM selects vmlab-hv when it refuses nothing, else QEMU with a reason; a new riscv64 VM selects QEMU with a reason."
+    li "QEMU runs no x86 guest: `vm = \"qemu\"` or `container = \"qemu\"` is a validation error for every x86 machine it reaches, naming the fix. It stays valid for aarch64 and riscv64 machines: `vm = \"qemu\"` is how a host runs its aarch64 VMs on QEMU to troubleshoot."
+    li "With neither setting, an existing x86 QEMU identity selects vmlab-hv, and so does an aarch64 one that vmlab-hv refuses nothing. A hardware refusal fails the start and keeps the old identity. After the checks pass, vmlab saves the switch before boot and `up` reports it once."
     li "Other existing identities survive stops and daemon restarts until destroy or an explicit setting. For older disks, the newest snapshot supplies the identity where recorded. Otherwise vmlab infers QEMU."
     li "Changing an explicit default can move an existing VM. Online snapshots still require the hypervisor that captured them; offline snapshots restore under either."
   }

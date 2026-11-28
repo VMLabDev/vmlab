@@ -256,9 +256,8 @@ class Harness:
     def host_config(self, vms: bool = False) -> str:
         """The `host {}` lines that put this run's machines on its hypervisor.
         A vmlab run leaves both kinds to automatic selection, which puts every
-        x86 machine on vmlab-hv and a guest of another architecture on QEMU; a
-        QEMU run pins both kinds to QEMU, which then runs its aarch64 guest
-        alone."""
+        x86 machine and an aarch64 one on vmlab-hv; a QEMU run pins both kinds
+        to QEMU, which then runs its aarch64 guest alone."""
         if self.hypervisor == "qemu":
             return '  hypervisor { container = "qemu" vm = "qemu" }\n'
         return ""

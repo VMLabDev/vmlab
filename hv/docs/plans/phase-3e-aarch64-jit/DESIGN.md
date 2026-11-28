@@ -2356,6 +2356,87 @@ QEMU's time over vmlab-hv's time.
 - **N10e. T3 after this card.** `xz` meets T3 at 87 and 86 % of QEMU.
   CoreMark and `sha256` met it in T3c. The boot is left (T3-D2 to T3-D4).
 
+### T3-D4, measured by card #1211
+
+Helios, 2026-11-28, *measured*, the release build, the boot suite
+(`--suite boot`, Debian 13) with the pin of card #1205 (whole cores, the
+SMT siblings inside the pin: two cores at one vCPU, five at four). Before
+is `4a6d4e6b`, `next` at `9c76ac07` with only the counters below added.
+After is `eff69836`. The rows are in `bench/history/aarch64.jsonl` with
+the note "card #1211 T3-D4", each repeat with its host load. Other cards
+ran builds and VMs at the same time. No QEMU source was read (X1).
+
+- **T3-D4a. The counters.** Each CPU counts its broadcasts by kind (a
+  `TLBI ... IS` of everything, of a page, of an ASID; a code page of H11c;
+  code mail of J7c), how many found another CPU to wait for, how many
+  waited longer than 100 us, the time, and the longest wait
+  (`exec::BroadcastWaits`). The `GuestBus` of each CPU times its device
+  accesses. A line `vcpu N: broadcasts: ...` follows each JIT line of the
+  log.
+- **T3-D4b. The broadcasts of a boot at four vCPUs**, before, at a host
+  load of 13 to 22: vCPU 0 posts 110,000 to 119,000 TLBIs of a page and the
+  others 19,000 to 31,000 each; 13,000 to 21,000 of them per CPU wait, about
+  4 us each, 55 to 119 ms a CPU. Code pages: 3,200 to 6,200 per CPU, 13 to
+  24 ms. TLBIs of everything and of an ASID, and code mail: under 5 ms a
+  CPU. vCPU 0 waited 96 to 146 ms in a boot, not the 2.4 to 3.1 s of T3d4,
+  and the CPU code is the same as at `ebdbfd08`. The difference is the pin:
+  T3 ran four vCPUs on four logical CPUs (20 to 23) whose siblings other
+  work used, with the threads of the VMM on the same four.
+- **T3-D4c. The long waits are device accesses.** One boot of the before
+  set had one CPU wait 1.63 s for 16 code pages. A boot at a host load of
+  16 to 86 (the counters of the device accesses added, stopped before
+  agent ready): device accesses of 1.2 to 3.5 s on the vCPU threads, 8 to
+  13 a CPU over 1 ms, and broadcast waits of up to 3.06 s, the length of
+  the longest device access. A CPU inside a device access was inside its
+  run loop, so every CPU that posted waited for the device. At a load of 6
+  to 10 the longest device access is 5 ms.
+- **T3-D4d. What was built.** A CPU leaves its run loop for the time of a
+  device access of a block (`Memory::read_device` and `write_device`, the
+  `Quiesce` that `shootdown::Away` is), as a CPU in `WFI` is out of it, and
+  takes its mail when the device returns, before the block uses a
+  translation again; the thunk then ends a chained run as after a wait of
+  J7c. It holds no translation that it uses while the device runs, so the
+  guarantee of the TLBI after its `DSB ISH`, and those of H11c and J7c for
+  code, stay. Only an access inside one page leaves: the second page of an
+  access over two was translated before the first was read. Pairs,
+  exclusives, page walks and the accesses of the Rust loop (`DC ZVA`, `AT`)
+  stay in the loop. The mailboxes are on cache lines of their own
+  (`Shootdown::take` reads one before each block, and another CPU writes
+  its own at every run).
+- **T3-D4e. Posting TLBIs without a wait was not built.** The TLBIs of a
+  page that wait cost 0.1 to 0.2 s a CPU in a boot of 40 to 50 s, 0.1 to
+  0.3 %. A wait deferred to the next `DSB` needs `DSB` to leave compiled
+  code when a wait is owed, for that share.
+- **T3-D4f. The proof.**
+
+| Proof | Result |
+|---|---|
+| A unit test: a device posts a TLBI from CPU 0 while it serves a load of CPU 1, in the interpreter and in compiled code (`a_cpu_inside_a_device_access_is_not_waited_for_and_takes_its_mail_after`) | CPU 0 finds no CPU to wait for, and CPU 1 has taken the mail when its run ends, with no block head after the load. Not run against the old path: there CPU 1 stays in its loop through the plain `read`, and CPU 0 finds it. |
+| The stress tests of J7 at 10 million rounds | Both pass at `VMLAB_HV_J7_ROUNDS=10000000`, the release build (`a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored` and `two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing`, 27.5 s together). |
+| K3 on a Debian 13 boot at 2 vCPUs (`VMLAB_HV_JIT_CHECK=1`, `VMLAB_HV_JIT_CHECK_RUNS=1000`) | Agent ready after 122.3 s at a load of 10 to 13, no difference: 130.3 million checked runs (957.2 million instructions) over both vCPUs up to their last JIT lines, at 12.0e9 and 6.0e9 instructions, with 316,178 device accesses of the block paths. |
+
+The rows, two rounds of each side in turn (before, after, before, after),
+the median of 3, s:
+
+| Row | Before 1 | After 1 | Before 2 | After 2 |
+|---|---|---|---|---|
+| Boot to agent ready, 1 vCPU | 77.50 (65.03, 77.50, 112.19) | 54.89 (53.82, 54.89, 58.56) | 66.05 (61.37, 66.05, 70.85) | 68.28 (68.28, 64.88, 72.17) |
+| Boot to agent ready, 4 vCPUs | 82.08 (82.08, 48.86, 105.86) | 48.21 (48.96, 46.67, 48.21) | 44.19 (44.19, 44.25, 42.42) | 41.41 (42.49, 41.39, 41.41) |
+| Boot MIPS, 4 vCPUs | 242.2 | 399.4 | 442.4 | 467.3 |
+| Load (1 min) at the starts, 4 vCPUs | 15.3 to 22.2 | 5.8 to 7.8 | 7.5 to 9.0 | 7.0 to 7.3 |
+| Busy CPUs on the reserved cores, 4 vCPUs | 2.90 to 4.91 | 2.82 to 2.88 | 3.26 to 3.44 | 2.27 to 2.29 |
+
+- **T3-D4g. The verdict.** The estimate of T3-D4 (a boot at four vCPUs
+  1.03 to 1.06 times) does not hold as a gain of the change: with the pin
+  of #1205 the broadcasts wait 0.1 to 0.2 s a CPU in a boot, and at a load
+  of 6 to 10 the change has nothing to remove. The pairs at that load give
+  0.92 (after 1 to before 2) and 1.07 (before 2 to after 2) at four vCPUs,
+  and the one-vCPU rows, which the change does not touch, move as much
+  (0.83 and 1.03): that is the noise of the host. Before 1 ran at a load
+  of 15 to 22 and is not comparable. What the change removes is the wait
+  for a device on a loaded host: seconds a boot in T3-D4c, where a broadcast
+  waited as long as the slowest device access of another CPU.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -2416,7 +2497,7 @@ texts on the card quote the first spike run (Cranelift 0.123.23: 25 to 160 µs,
   readable and executable for the vCPU (H13d). The option not taken: one
   mapping with read, write and execute.
 
-Proposed by card J9, open (Q15 of the MAP):
+Proposed by card J9 (Q15 of the MAP), answered for Q4 below:
 
 - **Q4. How D1 is treated.** Measured (J9b): CoreMark at 79 % of QEMU's
   speed, the Debian boot at 34 to 42 % at one vCPU and 36 % at four,
@@ -2440,6 +2521,10 @@ Proposed by card J9, open (Q15 of the MAP):
     estimate that they reach it.
   - **O3.** D1 for CPU work only (CoreMark, `sha256`, `xz`), and a boot
     bar of its own (for example at most twice QEMU's time).
+  - **Operator answer, 2026-11-28 (thread 1, post 32): NO STRICT BAR.**
+    No percentage of QEMU gates 3e: neither D1 nor T3 is a bar that a card
+    or the phase must meet. The rows stay measured against QEMU and
+    recorded as above.
 
 ## How to measure again
 

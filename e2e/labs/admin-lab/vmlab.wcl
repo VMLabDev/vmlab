@@ -1,7 +1,7 @@
-// One aarch64 VM with no template: a blank disk under TCG emulation on an
-// x86_64 host. Nothing boots from the disk, but the firmware draws a screen,
-// which is all `vm screenshot` needs — and the lab gives the `vmlab lab`
-// verbs something running to list, stop, restart and destroy.
+// One aarch64 VM with no template: a blank disk under emulation on an x86_64
+// host — vmlab-hv's emulated `virt` machine on a vmlab run, QEMU's TCG on a
+// QEMU run. Nothing boots from the disk, but the firmware reaches its UEFI
+// banner on the serial console, which is what `arch.emulated` waits for.
 import <vmlab.wcl>
 
 lab "e2e-admin" {
