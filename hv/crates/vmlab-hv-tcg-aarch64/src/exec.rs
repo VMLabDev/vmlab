@@ -2693,6 +2693,11 @@ struct Env<'a, M> {
     /// The context of the run. The thunk spends its budget, and takes its
     /// write table away when an exclusive load sets a mark (H7a).
     context: *mut jit::Context,
+    /// The write table of the fast TLB for the level of the run, which the
+    /// thunk gives back to the context when the mark ends (card #1216),
+    /// or null when the run has none (a replay of K3, memory through the
+    /// thunk, no fast TLB).
+    writes: *const jit::tlb::Entry,
     /// The inlined loads and stores that missed the fast TLB.
     misses: u64,
     /// Why the block left, when an effect did not complete.
@@ -2909,12 +2914,21 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
         compiled.instructions == 1,
     );
     // A store with a mark set must carry it (`Side::store`), so the
-    // compiled code writes through the thunk until the run ends.
-    if env.side.exclusive.is_some() {
+    // compiled code writes through the thunk while the mark is set. When
+    // the operation ended the mark (an exclusive store, `CLREX`), the
+    // inlined stores take the write table again at once, as the next run
+    // would (card #1216): `fill_fast` kept it current meanwhile, filling
+    // no write entry while the mark was set.
+    let writes = if env.side.exclusive.is_some() {
+        jit::tlb::EMPTY_TABLE.as_ptr()
+    } else {
+        env.writes
+    };
+    if !writes.is_null() {
         // SAFETY: the context of the run, which compiled code reads its
         // tables from again at each access, and does not hold while it
         // calls.
-        unsafe { (*env.context).writes = jit::tlb::EMPTY_TABLE.as_ptr() };
+        unsafe { (*env.context).writes = writes };
     }
     match done {
         Ok(()) => {
@@ -3566,6 +3580,7 @@ unsafe fn run_chained<M: Memory>(
         memory,
         side,
         context: std::ptr::null_mut(),
+        writes: std::ptr::null(),
         misses: 0,
         failed: None,
         stop: None,
@@ -3589,8 +3604,9 @@ unsafe fn run_chained<M: Memory>(
     {
         let level = usize::from(context_el != 0);
         fresh.reads = fast.table(level, false);
+        env.writes = fast.table(level, true);
         if env.side.exclusive.is_none() {
-            fresh.writes = fast.table(level, true);
+            fresh.writes = env.writes;
         }
     }
     // The context of a CPU of a machine is in its seat, where the other

@@ -137,6 +137,10 @@ fn ldxr(rt: u32, rn: u32) -> u32 {
     0xc85f_7c00 | rn << 5 | rt
 }
 
+fn stxr(rs: u32, rt: u32, rn: u32) -> u32 {
+    0xc800_7c00 | rs << 16 | rn << 5 | rt
+}
+
 #[test]
 fn a_load_and_a_store_of_ram_fill_the_tables_of_their_level_and_then_hit() {
     let mut machine = Machine::new(&[ldr(1, 0), str(1, 2), HVC]);
@@ -301,6 +305,30 @@ fn an_exclusive_mark_keeps_stores_away_from_the_write_table() {
     let misses = machine.misses();
     machine.run();
     assert_eq!(machine.misses(), misses + 1);
+}
+
+#[test]
+fn the_store_after_an_exclusive_store_takes_the_write_table_again_in_the_same_run() {
+    // ldxr x2, [x0] ; stxr w5, x1, [x0] ; str x1, [x4]
+    let mut machine = Machine::new(&[ldxr(2, 0), stxr(5, 1, 0), str(1, 4), HVC]);
+    machine.map(VA, DATA | AF | NO_EXECUTE);
+    machine.map(VA + 0x1000, OTHER | AF | NO_EXECUTE);
+    machine.cpu.state.set_x(0, VA);
+    machine.cpu.state.set_x(1, 0x1234);
+    machine.cpu.state.set_x(4, VA + 0x1008);
+    // The write entry of the plain store is there before the run.
+    machine.cpu.state.set_pc(CODE + 8);
+    machine.cpu.step().unwrap();
+    assert!(machine.holds(EL1, true, VA + 0x1000));
+    let misses = machine.misses();
+    machine.run();
+    assert_eq!(machine.cpu.taken, None);
+    assert_eq!(machine.cpu.state.x(5), 0, "the exclusive store wrote");
+    assert_eq!(machine.word(DATA), 0x1234);
+    assert_eq!(machine.word(OTHER + 8), 0x1234);
+    // The exclusive store ended the mark, so the plain store after it hit
+    // the write table and did not come to the thunk (card #1216).
+    assert_eq!(machine.misses(), misses);
 }
 
 #[test]
