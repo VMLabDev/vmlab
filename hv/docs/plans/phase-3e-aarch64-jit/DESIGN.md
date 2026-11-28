@@ -2383,7 +2383,7 @@ texts on the card quote the first spike run (Cranelift 0.123.23: 25 to 160 µs,
   readable and executable for the vCPU (H13d). The option not taken: one
   mapping with read, write and execute.
 
-Proposed by card J9, open (Q15 of the MAP):
+Proposed by card J9 (Q15 of the MAP), answered for Q4 below:
 
 - **Q4. How D1 is treated.** Measured (J9b): CoreMark at 79 % of QEMU's
   speed, the Debian boot at 34 to 42 % at one vCPU and 36 % at four,
@@ -2407,6 +2407,10 @@ Proposed by card J9, open (Q15 of the MAP):
     estimate that they reach it.
   - **O3.** D1 for CPU work only (CoreMark, `sha256`, `xz`), and a boot
     bar of its own (for example at most twice QEMU's time).
+  - **Operator answer, 2026-11-28 (thread 1, post 32): NO STRICT BAR.**
+    No percentage of QEMU gates 3e: neither D1 nor T3 is a bar that a card
+    or the phase must meet. The rows stay measured against QEMU and
+    recorded as above.
 
 ## How to measure again
 
