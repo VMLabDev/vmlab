@@ -580,6 +580,11 @@ impl Leader {
         }
     }
 
+    /// The exit status of the QEMU of the leader, `None` while it runs.
+    pub fn exited(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
     /// Put a record back: the next `next` gives it again.
     pub fn unread(&mut self, record: Record) {
         self.ahead.push_front(record);

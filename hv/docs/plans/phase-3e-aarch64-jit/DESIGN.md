@@ -1143,6 +1143,7 @@ to 27, the two columns side by side.
   agent at its end. The leader runs at 0.53 million instructions a second
   with the plugin, so the 18e9 instructions of a Debian boot are about 9.4
   hours. Neither the follower for that boot nor its nightly run was built.
+  Card #1187 built both: "K4, measured by card #1187" below.
 
 ### C13b, measured by card C13b (#1144)
 
@@ -1275,6 +1276,50 @@ minutes, inside the two hours of the card.
 - **C13b-O3. What O4w does not prove** is in 3d O4w (W1 to W5): interrupts,
   devices and DMA, the instructions between the windows, and a defect of
   ours earlier in the boot that left a state that is consistent.
+
+### K4, measured by card #1187
+
+Helios, *measured*. `just tcg-a64-k4` (hv/README.md, "The K4 nightly
+run") boots the `debian-13` template 13.20261001.0 with AAVMF 2026.08+ds-2
+on QEMU 11.1.3 (`cortex-a53`, `-smp 1`, 2048 MiB, `-icount
+shift=0,sleep=on`) with the plugin, and our whole `virt` machine follows its
+stream with the JIT on. The leader has the disk and the agent port, and the
+follower takes what their DMA wrote into RAM from the stream (RAM
+adoptions). A plain QEMU of the same command line reaches agent ready at
+18.14e9 instructions; with `sleep=off` the boot breaks (an idle CPU jumps
+to its next timer while the disk is served in host time).
+
+**The first nightly run.** The timer job `vmlab-k4-nightly` of the account
+`vmlab`, 2026-11-28 06:30 to 09:53 AEST, commit `93bb0752`, `--resync 16`.
+Results in `/home/vmlab/src/stc/k4/results/20261128-063018-93bb0752276b/`.
+It ran 7,061,818,448 instructions in 12,061 s (0.59 million a second), all
+of them compiled, and did not reach agent ready: exit code 1.
+
+- **The first CPU difference**, after 6,807,101,923 instructions, at
+  `0xbd49093c` (MMU off, EL1h): `MSR PMUSERENR_EL0, XZR` (`d51b9e1f`).
+  The leader ran it, and our CPU took an Undefined Instruction exception
+  (ours / leader: PC `0x469f2200` / `0xbd490940`, ESR_EL1 `0x2000000` /
+  `0`, ELR_EL1 `0xbd49093c` / `0xbd490150`, and SPSR_EL1 and PSTATE.N
+  with it). The instructions before it read `ID_AA64DFR0_EL1`, take
+  PMUVer (bits 8 to 11) and skip the write when it is 0 or 15: the
+  kernel's CPU setup after `MSR CPACR_EL1` and `MSR MDSCR_EL1`. Our
+  `ID_AA64DFR0_EL1` is the leader's (no ID register on the allow-list),
+  so our CPU says it has a PMU and does not have `PMUSERENR_EL0`. The fix
+  is a card of its own: the register, or a PMUVer of 0.
+- After the resync the run went on with no second difference. 30 of 1,179
+  interrupts that the leader took were not pending in our GIC, all after
+  the difference. RAM adoptions: 42,074,183 loads (44.6 MB in 8,160
+  pages), 0 fetches. 5,141 device reads taken from the leader, with
+  findings on 4 pages: `GICC_IAR` at `0x801000c` (61 reads, the first
+  ours 27 and the leader's 1023), the PCI I/O window at `0x3eff0000`, and
+  the ECAM pages of the leader's two virtio functions, which our machine
+  does not have.
+- **The end** was the leader's: it wrote nothing for 60 s, after the
+  kernel's first lines on the serial port (both serial logs hold the same
+  976 bytes). That run did not say whether its QEMU had exited or was
+  waiting with an idle CPU, which `sleep=on` makes wait in host time. The
+  run now says which, and K4 waits 900 s (`--silence 900`) before it gives
+  up on a leader that still runs.
 
 ### G5 and D1, measured by card J9
 

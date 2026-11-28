@@ -7,7 +7,7 @@
 //!       [--qemu <binary>] [--ram-mib N] [--until <text>]
 //!       [--max-instructions N] [--resync N] [--ignore <register>]...
 //!       [--system core|all] [--key <text>=<bytes>]...
-//!       [--disk <template disk.qcow2>]
+//!       [--disk <template disk.qcow2>] [--silence <seconds>]
 //!
 //! QEMU boots the firmware at `-smp 1` with the plugin, and our whole `virt`
 //! machine follows its stream from the reset. Both start from the same
@@ -47,6 +47,12 @@
 //! the leader, and the run goes on until N differences: one run then shows
 //! more than the first defect. The last instructions before a difference go
 //! to `last-instructions.txt` in the scratch directory.
+//!
+//! The run also ends when the leader writes nothing for `--silence` seconds
+//! (default 60), or when its QEMU exits. The report says which of the two:
+//! the QEMU's exit status, or that it still ran. A guest that waits for a
+//! timer with an idle CPU waits in host time (`-icount sleep=on`), so a
+//! guest boot needs a longer silence than a firmware boot.
 //!
 //! The CPU runs the JIT, as the CPU of every machine does unless
 //! `VMLAB_HV_JIT=0` (3e DESIGN.md K4): each instruction is a compiled block
@@ -143,7 +149,8 @@ const KEY_REPEAT: u64 = 1 << 24;
 
 /// The instructions that the follower keeps for the report of a difference.
 const KEPT: usize = 4096;
-/// How long the leader may write nothing before the run gives up.
+/// How long the leader may write nothing before the run gives up, unless
+/// `--silence` says.
 const SILENCE: Duration = Duration::from_secs(60);
 
 /// What our devices answered differently from those of the leader, by the
@@ -278,6 +285,20 @@ struct Arguments {
     keys: Vec<(String, Vec<u8>)>,
     /// The template disk of a K4 run (`--disk`).
     disk: Option<PathBuf>,
+    /// How long the leader may write nothing (`--silence`).
+    silence: Duration,
+}
+
+/// Why the stream of the leader ended: its QEMU exited, or it still runs
+/// and wrote nothing for `silence`.
+fn leader_end(leader: &mut Leader, silence: Duration) -> Result<String, Error> {
+    Ok(match leader.exited()? {
+        Some(status) => format!("the QEMU of the leader exited ({status})"),
+        None => format!(
+            "the QEMU of the leader still ran and wrote nothing for {} s",
+            silence.as_secs()
+        ),
+    })
 }
 
 /// The bytes of a key argument: `\e` is escape and `\r` return.
@@ -303,6 +324,7 @@ fn arguments() -> Result<Arguments, Error> {
         leader_only: false,
         keys: Vec::new(),
         disk: None,
+        silence: SILENCE,
     };
     let mut keys_given = false;
     let mut until_given = false;
@@ -323,6 +345,7 @@ fn arguments() -> Result<Arguments, Error> {
             "--disk" => parsed.disk = Some(value.into()),
             "--max-instructions" => parsed.max_instructions = value.parse()?,
             "--resync" => parsed.resync = value.parse()?,
+            "--silence" => parsed.silence = Duration::from_secs(value.parse()?),
             "--ignore" => parsed.ignore.push(value),
             "--system" => parsed.all = value == "all",
             "--leader-only" => parsed.leader_only = value == "1",
@@ -643,6 +666,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     vcpu.cpu().lines = None;
 
     let mut leader = Leader::start(&options)?;
+    let silence = arguments.silence;
     // The serial port of the leader, for its keys.
     let mut keyboard = {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -664,7 +688,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
                             discontinuities: &mut Vec<(u32, u64, u64)>|
      -> Result<Option<Before>, Error> {
         loop {
-            match leader.next(SILENCE)? {
+            match leader.next(silence)? {
                 None => return Ok(None),
                 Some(Record::Read(read)) => reads.push(read),
                 Some(Record::Load(load)) => loads.push(load),
@@ -759,8 +783,9 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             discontinuities.clear();
         }
         println!(
-            "the leader alone: {instructions} instructions, {:.2} million a second",
-            instructions as f64 / start.elapsed().as_secs_f64() / 1e6
+            "the leader alone: {instructions} instructions, {:.2} million a second; {}",
+            instructions as f64 / start.elapsed().as_secs_f64() / 1e6,
+            leader_end(&mut leader, silence)?
         );
         return Ok(true);
     }
@@ -779,6 +804,8 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     let mut last_write_check = true;
     let mut reached = false;
     let mut ended = "the stream of the leader ended";
+    // Why the stream ended: the QEMU of the leader exited, or went silent.
+    let mut stream_end = String::new();
 
     'run: loop {
         // The state before the instruction.
@@ -1007,6 +1034,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         }
 
         let Some(next) = next else {
+            stream_end = format!("; {}", leader_end(&mut leader, silence)?);
             break 'run;
         };
 
@@ -1126,7 +1154,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
 
     let seconds = start.elapsed().as_secs_f64();
     println!(
-        "ended: {ended}, after {instructions} instructions in {seconds:.0} s ({:.2} million a second)",
+        "ended: {ended}, after {instructions} instructions in {seconds:.0} s ({:.2} million a second){stream_end}",
         instructions as f64 / seconds / 1e6
     );
     println!(

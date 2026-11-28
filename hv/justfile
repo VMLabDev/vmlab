@@ -157,7 +157,8 @@ tcg-a64-k4 keep template='' firmware='../guest/dist/firmware/aarch64' ram_mib='2
 		rm -rf -- "$dir"
 	}
 	trap finish EXIT
-	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --code "{{firmware}}/AAVMF_CODE.fd" --vars "{{firmware}}/AAVMF_VARS.fd" --disk "$template" --ram-mib "{{ram_mib}}" --resync "{{resync}}")
+	# An idle guest waits in host time (-icount sleep=on): the leader may write nothing for minutes.
+	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --code "{{firmware}}/AAVMF_CODE.fd" --vars "{{firmware}}/AAVMF_VARS.fd" --disk "$template" --ram-mib "{{ram_mib}}" --resync "{{resync}}" --silence 900)
 	if [ "{{max}}" != 0 ]; then args+=(--max-instructions "{{max}}"); fi
 	cargo build --release -p vmlab-hv-vmm --example a64_boot_lockstep
 	{
