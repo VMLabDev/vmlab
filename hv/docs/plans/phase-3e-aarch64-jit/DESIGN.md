@@ -2242,6 +2242,190 @@ estimates are *est.*, from the shares above.
   verdict on the boot after these cards needs more than three runs or a
   quieter host.
 
+### T3-D2, measured by card #1209
+
+What card #1209 built:
+
+- **T3-D2a. The end of a block that the loop ends itself calls the thunk.**
+  A block whose last instruction is one that the loop runs (H5c) writes its
+  outputs and the PC of that instruction as before, then calls the thunk
+  with `jit::TERMINAL` (`Chain::terminal`). The thunk returns 0, and the
+  block leaves with `DONE` as before; or `jit::TRAPPED`, when it ran the
+  instruction and the run cannot go on; or the code of the next block, which
+  the block jumps to. The call keeps no host register: every output is
+  written, as at the call of `jit::JUMP` (J10b).
+- **T3-D2b. What the thunk runs** (`serve_terminal`): what `Cpu::trap` runs
+  for each kind, through the functions that the loop runs too
+  (`access_register`, `pstate`, `operation`), but not what needs the loop: an
+  unknown word and a register that a machine claims through its hooks, `HVC`
+  and `SMC`, `WFI`, a write of a timer register (`Cpu::timer_written`), and
+  a register that the CPU notes as missing. Those leave with `DONE`. An
+  exception and an exception return settle the caches first in the loop
+  (`Cpu::settle`): every kind runs only where that would start no new epoch,
+  that is no store went into translated code and the write generation of the
+  memory moved by the stores of this CPU alone. `Cpu::exceptions` and
+  `Cpu::taken` move as in the loop.
+- **T3-D2c. Going on** (`serve_next`): what the loop does before the next
+  block, then the block as `serve_jump` finds it, in the context of the state
+  now. The thunk takes the mail of the CPU, and leaves after a store into
+  translated code, with an interrupt that is pending and not masked (the
+  lines of a machine read again), with the illegal state, and when the owner
+  asked the run to leave. A change of the translation empties the jump cache
+  or moves its address space as `execute` does before a run
+  (`Jit::clear_jumps_shared`, `Jit::set_jump_space_shared`, the generation
+  of the context of the run), and the thunk serves misses of the jump cache
+  again after it. The tables of the fast TLB are set again for the level of
+  the new context, and the write table again once no exclusive mark is set.
+- **T3-D2d. The register accesses read the system counter only when the
+  register reads it** (`counted`): the loop and the thunk read the host clock
+  and made a division of 128 bits at every `MRS` and `MSR`, also of `SP_EL0`
+  and `DAIF`. That was about 4 % of the samples of a boot (*est.*, T3-D2g).
+- **T3-D2e. Counts and the switch.** The JIT line of the debug log ends with
+  the last instructions served in code, those served after which the run
+  left, and both counts for each of 15 kinds (`TERMINAL_KIND_NAMES`).
+  `bench/lib.py` reads the first two. `VMLAB_HV_JIT_TERMINAL=0` turns the
+  serving off.
+
+Proof, helios, 2026-11-28, *measured*. Before is `next` (`ecdda53f`), after
+is `3366bd11`. One release build of each, in a tree and a target directory of
+its own. QEMU 11.1.3 is a black box (X1 to X3). No source but this
+repository's was read. The boot rows are the boot suite of Debian 13 to agent
+ready, before, after and QEMU in turn, one VM at a time, with the reserved
+cores of #1205 (`bench/run.py` without `--cpus`). The rows are in
+`bench/history/aarch64.jsonl` with the note "card #1209 T3-D2". Other cards
+ran builds and boots at the same time.
+
+**T3-D2f. The last instructions by kind.** The boot of the after build with
+the serving off (`VMLAB_HV_JIT_TERMINAL=0`, 66.2 s), the counts of its last
+JIT line (17.0e9 instructions), and the last JIT line of the boot of the
+after build in round 1 (18.0e9 instructions):
+
+| Kind | Off: returns to the loop | After: served in code | After: returns to the loop |
+|---|---|---|---|
+| `MRS` of a register that is not a stored word | 45,680,118 | 44,564,158 | 1,862,458 |
+| `DC ZVA` | 23,487,616 | 26,109,161 | 13,544 |
+| `MSR` of another register | 6,309,760 | 6,875,973 | 195,148 |
+| `MSR` of a PSTATE field (`DAIFSet`, `DAIFClr`, `SPSel`) | 3,548,418 | 3,744,063 | 204,946 |
+| Another `SYS` (cache operations, `AT`) | 2,846,267 | 2,899,491 | 2,097 |
+| `MSR TTBR1_EL1` | 830,717 | 910,099 | 22,742 |
+| `ERET` | 426,940 | 396,544 | 80,923 |
+| `SVC` | 331,047 | 352,846 | 14,252 |
+| `TLBI` | 231,205 | 239,925 | 7,301 |
+| `MSR TTBR0_EL1` | 26,255 | 24,317 | 2,186 |
+| `WFI` | 586 | none | 661 |
+| `HVC`, `SMC`, an unknown word | 8 | none | 8 |
+| Another exception, `WFE`, `CLREX` | none | none | none |
+| All | 83,718,937 (17.0e9 instructions) | 86,116,577 (18.0e9) | 2,406,266, of which 2,295,227 ran in the thunk |
+
+The draft expected the writes of the table bases first. They are 1 % of these
+returns. 55 % are `MRS` of a register that is not a stored word: `SP_EL0`,
+the `current` of a Linux kernel, and `DAIF`, which every
+`local_irq_save` reads (*est.*: the kinds of register are not counted apart).
+28 % are `DC ZVA`, one every 64 bytes that the kernel zeroes.
+
+**T3-D2g. Why the round trips did not fall by their share.** The profile of
+one boot of each side at one vCPU, the W1 builds with `measure/ipraw.c` and
+`measure/ipclass.py` as T3d (64.4 s before, 65.1 s after):
+
+| Share of the samples | Before | After |
+|---|---|---|
+| Samples | 58,349 | 59,441 |
+| Compiled code (anonymous memory) | 26.4 % | 27.9 % |
+| Entering and leaving compiled code in the Rust loop | 16.1 % | 11.0 % |
+| The block lookup and the checks of the loop | 8.7 % | 11.1 % |
+| The thunk and the pure calls (with `serve_terminal` 1.2 % and `serve_next` 1.3 %) | 5.3 % | 6.5 % |
+| Library calls from the vCPU loop (*est.*: the host clock of `Clock::count`, inlined there) | 4.8 % | 0.6 % |
+| Runs of compiled code entered (the last JIT line, 17.0e9 instructions) | 115.0 million | 37.9 million |
+
+The loop's two classes fell from 24.8 % to 22.1 % while the runs fell by
+two thirds. A return at a block that the loop ends itself is the cheap kind:
+the loop runs the instruction and enters the next block, which is cached, in
+about 23 ns (2.7 % of 65 s over the 77 million runs that went), as J10g
+measured on the flat images (26 ns). Serving it in code costs about as much:
+21 ns (2.5 % for 78.4 million). The 37.9 million runs that are left carry the
+cost of the round-trip share: a first link (12.5 million, with the hash map
+of the incoming jumps), a miss of the jump cache that the thunk does not
+serve (10.5 million), the budget (8.6 million), a block with nothing to chain
+to (4.1 million) and a last instruction after which the run left (2.0
+million). The basis of the draft, 70 % of the returns at 27 to 30 % of a boot,
+counted every return at the average cost. The first build lost 5 to 15 % of
+boot MIPS: the thunk takes the write table of the fast TLB away at an
+exclusive load until the run ends, and runs now go on for up to 4,096
+instructions, so the fast TLB misses rose from 151 to 276 million. T3-D2c
+sets the tables again at every served instruction (153 million).
+
+**T3-D2h. The rows.** The boot to agent ready in seconds, with the load
+average at the start and the busy CPUs beside the reserved ones:
+
+| Round | vCPUs | Before, s (load) | After, s (load) | QEMU, s (load) |
+|---|---|---|---|---|
+| 1 | 1 | 74.91 (10.5) | 64.65 (13.8) | 32.24 (11.9) |
+| 1 | 4 | 37.54 (12.4) | 36.25 (10.7) | 17.65 (10.2) |
+| 2 | 1 | 84.61 (9.3) | 53.53 (16.2) | 56.35 (12.1) |
+| 2 | 4 | 42.49 (22.7) | 72.85 (17.5) | 18.34 (17.9) |
+| 3 | 1 | 60.91 (15.0) | 70.79 (11.3) | emergency mode, stopped |
+| 3 | 4 | 40.42 (7.0) | 40.30 (7.9) | 20.15 (7.8) |
+| 4 | 1 | 52.93 (8.9) | hung (T3-D2l), stopped | not run |
+| 4 | 4 | 77.60 (11.1) | 63.02 (19.7) | not run |
+| 5 | 1 | 100.58 (13.1) | 133.92 (11.6) | not run |
+| 5 | 4 | 40.22 (11.9) | 38.66 (9.1) | not run |
+| 6 | 1 | 92.17 (8.2) | 60.39 (15.3) | not run |
+| 6 | 4 | 94.84 (12.2) | 40.74 (19.1) | not run |
+| Median | 1 | 79.76, 226.7 MIPS | 64.65, 281.1 MIPS | 44.30 |
+| Median | 4 | 41.46, 464.7 MIPS | 40.52, 481.8 MIPS | 18.34 |
+
+The load is the load average (1 min) at the start of the row. The CPUs busy
+beside the reserved ones were 1.8 to 10.5 of 26 to 28, and the reserved
+cores were the VM's own in every row (0.6 to 1.6 busy for one vCPU, 1.9 to
+2.8 for four). Rounds 4 to 6 ran without QEMU. The rows of each side spread by a
+factor of 1.9 to 2.5 while the host load moved.
+
+- **T3-D2i. The verdict.** The estimate of 1.1 to 1.25 times does not hold, for the
+  reason of T3-D2g. The medians of the rows give 1.23 times at one vCPU and
+  1.02 at four, but the ratio of the two sides within a round goes from 0.75
+  to 1.58 at one vCPU and from 0.58 to 2.33 at four, so the rows do not
+  decide it. The measurements with less noise put the gain at 0 to 4 %: the
+  profile pair of T3-D2g (64.4 s before, 65.1 s after), two pairs of single
+  boots at one vCPU in turn (271.5 and 269.0 MIPS with `03a77392`, before
+  T3-D2d; 130.8 and 138.0 MIPS with `3366bd11`, on a host that ran both at
+  half speed), and the account of T3-D2g, in which the loop's share fell by
+  2.7 points and the serving took 2.5. The boot stays where T3c measured it:
+  T3 for the boot is not reached by this card. Against the QEMU rows of this
+  card (32.2 s at one vCPU in round 1, 18.3 s at four), the medians are 50 %
+  and 45 % of QEMU after and 40 % and 44 % before, inside the spread.
+- **T3-D2j. K3** on a Debian 13 boot with the after build,
+  `VMLAB_HV_JIT_CHECK=1` and `VMLAB_HV_JIT_CHECK_RUNS=1000`: agent ready after 321.9 s at one vCPU,
+  121.6 million checked runs (882.8 million instructions) at its last JIT
+  line, 78.5 million last instructions served in code between them, no
+  difference; agent ready after 94.8 s at two vCPUs (the first try hung as
+  T3-D2l says), 70.0 and 58.9 million checked runs (511.9 and 431.9 million
+  instructions) on vCPU 0 and 1 at their last lines, 44.7 and 23.5 million
+  served, no difference.
+- **T3-D2k. K2, K6 and the stress tests of J7** run in `just ci::check`
+  (two new tests: a system call, a table base write, an `MRS` of the counter
+  and an `ERET` at every round give the interpreter's state with the serving
+  on and off; an interrupt that a served `MSR DAIFClr` unmasks is taken by the
+  loop at the instruction after it). `a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored`
+  also ran alone at 2,000,000 rounds (`VMLAB_HV_J7_ROUNDS=2000000`) with
+  the after build: passed, no stale execution. `just ci::check` exits 0 on
+  `3366bd11`. `exec::tests::a_machine_cpu_leaves_its_loop_when_its_timer_is_due`
+  failed once in a run of the crate's tests at a load average of 14, and
+  passed three times alone: it runs a loop with no last instruction to serve
+  and bounds it by host time.
+- **T3-D2l. Boots that hang.** Four boots of the day stopped at the
+  `apparmor_parser` stage of the Debian 13 guest with the vCPU threads asleep
+  and no serial output after it: one on QEMU at one vCPU, one of `next` in
+  card #1208, and two of this card's build (the build with the serving off,
+  and K3 at two vCPUs). A watchdog stopped them, and their rows ran again.
+  Not measured further: QEMU hangs there too.
+- **T3-D2m. What is left.** The round trips are now the 40 million returns
+  of T3-D2g, and T3-D3 is about the first links after a drop of the region.
+  The last instructions themselves stay: 55 % of them are an `MRS` of
+  `SP_EL0` or `DAIF` that ends its block, which the lifter could read inside
+  the block as it reads a stored word (R10), and 28 % are `DC ZVA`, which
+  could be an inline store of 64 bytes over the fast TLB. Neither is
+  drafted here: their share of a boot is not measured.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -2430,6 +2614,24 @@ grep -o "superblocks: .*" bench/run/*/stderr.log
 # J14i: K2 with joins, K1 for the branch group
 cargo test --release -p vmlab-hv-tcg-aarch64 --test jit -- superblocks
 VMLAB_HV_JIT=1 just tcg-a64-lockstep branch 100000 1
+```
+
+T3-D2, one tree and one target directory a side, the bench run from the after tree with the
+reserved cores of #1205 (no `--cpus`):
+
+```sh
+# T3-D2h: the boot rows, before, after and QEMU in turn, one VM at a time; the rows of the
+# before build carry the commit of the after tree, and are set to that of next by hand
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 --guest debian-13 \
+  --suite boot --keep --hv-bin <side>/release/vmlab-hv          # and --vcpus 4, and --backend qemu
+# T3-D2f: the last instructions by kind, served and returned, in the last JIT line of a kept run;
+# the serving off for the counts of before
+grep -o "terminals: .*" bench/run/<run>/stderr.log | tail -1
+VMLAB_HV_JIT_TERMINAL=0 python3 bench/run.py ... --hv-bin <after>/release/vmlab-hv
+# T3-D2g: the W1 build of each side and one boot each, sampled as J9a, classified by ipclass.py
+# T3-D2j: K3 at one and two vCPUs
+VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv \
+  --arch aarch64 --vcpus 2 --repeats 1 --guest debian-13 --suite boot --timeout-scale 4 --hv-bin <after>
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the
