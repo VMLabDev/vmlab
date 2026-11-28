@@ -51,8 +51,12 @@ impl KvmStats {
         let mut header = [0u8; HEADER_LEN];
         file.read_exact_at(&mut header, 0)?;
         let word = |i: usize| u32::from_le_bytes(header[i * 4..i * 4 + 4].try_into().unwrap());
-        let (name_size, count, desc_offset, data_offset) =
-            (word(1) as usize, word(2) as usize, word(4) as u64, word(5) as u64);
+        let (name_size, count, desc_offset, data_offset) = (
+            word(1) as usize,
+            word(2) as usize,
+            word(4) as u64,
+            word(5) as u64,
+        );
         if count > 4096 || name_size > 4096 {
             return Err(invalid("KVM statistics header out of range"));
         }
@@ -67,7 +71,10 @@ impl KvmStats {
             let name = &raw[DESCRIPTOR_LEN..];
             let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
             if size == 1
-                && matches!(flags & TYPE_MASK, TYPE_CUMULATIVE | TYPE_INSTANT | TYPE_PEAK)
+                && matches!(
+                    flags & TYPE_MASK,
+                    TYPE_CUMULATIVE | TYPE_INSTANT | TYPE_PEAK
+                )
             {
                 counters.push(Counter {
                     name: String::from_utf8_lossy(name).into_owned(),
@@ -84,7 +91,12 @@ impl KvmStats {
 
     /// The current value of every scalar counter, by name.
     pub(crate) fn read(&self) -> std::io::Result<BTreeMap<String, u64>> {
-        let end = self.counters.iter().map(|c| c.offset + 8).max().unwrap_or(0);
+        let end = self
+            .counters
+            .iter()
+            .map(|c| c.offset + 8)
+            .max()
+            .unwrap_or(0);
         let mut data = vec![0u8; end as usize];
         self.file.read_exact_at(&mut data, self.data_offset)?;
         Ok(self
@@ -147,7 +159,11 @@ mod tests {
         assert_ne!(host, libc::MAP_FAILED);
         // SAFETY: 0x1003 lies inside the mapping made above.
         unsafe {
-            std::ptr::copy_nonoverlapping([0xe6u8, 0x80, 0xf4].as_ptr(), host.cast::<u8>().add(0x1000), 3);
+            std::ptr::copy_nonoverlapping(
+                [0xe6u8, 0x80, 0xf4].as_ptr(),
+                host.cast::<u8>().add(0x1000),
+                3,
+            );
             vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
                 slot: 0,
                 guest_phys_addr: 0,
