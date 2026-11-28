@@ -2760,12 +2760,8 @@ unsafe fn serve_terminal<M: Memory>(env: &mut Env<M>, tag: *mut std::ffi::c_void
             match sysreg::check(row, write, state) {
                 Ok(()) if write && timer_row(row) => return 0,
                 Ok(()) => {
-                    let environment = Environment {
-                        count: terminal.clock.count(),
-                        irq,
-                        fiq,
-                    };
-                    access_register(state, env.side, &environment, row, rt, write);
+                    let clock = terminal.clock;
+                    access_register(state, env.side, (&clock, irq, fiq), row, rt, write);
                     Ok(Some(next))
                 }
                 Err(Denied::Undefined) => return 0,
@@ -5358,14 +5354,13 @@ impl<M: Memory> Cpu<M> {
             }
             Err(Denied::Fp) => return Err(Exception::FpAccess),
         }
-        let environment = self.environment();
         if write && timer_row(row) {
             self.timer_written = true;
         }
         access_register(
             &mut self.state,
             &mut self.side,
-            &environment,
+            (&self.clock, self.irq, self.fiq),
             row,
             rt,
             write,
@@ -6193,16 +6188,37 @@ fn timer_row(row: usize) -> bool {
     )
 }
 
+/// Whether an access of the register of `row` reads the system counter.
+fn counted(row: usize) -> bool {
+    matches!(
+        sysreg::ROWS[row].kind,
+        sysreg::Kind::Special(
+            sysreg::Special::Counter
+                | sysreg::Special::TimerControl(_)
+                | sysreg::Special::TimerValue(_)
+        )
+    )
+}
+
 /// `MSR` (`write`) or `MRS` of the register of `row`, which `sysreg::check`
-/// let through: what the loop and the thunk (card T3-D2) both run.
+/// let through, with the system counter of `clock` and the interrupt lines
+/// `irq` and `fiq`: what the loop and the thunk (card T3-D2) both run. The
+/// counter is read only for a register that reads it: a read of the host
+/// clock and a division of 128 bits, at every `MRS` of `SP_EL0` or `DAIF`
+/// of a kernel otherwise (card T3-D2).
 fn access_register(
     state: &mut State,
     side: &mut Side,
-    environment: &Environment,
+    (clock, irq, fiq): (&Clock, bool, bool),
     row: usize,
     rt: u8,
     write: bool,
 ) {
+    let environment = &Environment {
+        count: if counted(row) { clock.count() } else { 0 },
+        irq,
+        fiq,
+    };
     if write {
         let value = match rt {
             31 => 0,
