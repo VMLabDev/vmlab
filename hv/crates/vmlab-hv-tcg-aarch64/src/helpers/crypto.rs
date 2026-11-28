@@ -1,6 +1,8 @@
 //! The crypto instructions of the 3d set (card C7): one round step of AES,
 //! and the four-round and schedule steps of SHA-1 and SHA-256, each a pure
-//! function of up to three 128-bit values.
+//! function of up to three 128-bit values. Each operation is a helper of
+//! its own (3e DESIGN.md J13), which compiled code calls with the six words
+//! of its three values in the argument registers.
 //!
 //! The byte `i` of a vector is the byte `i` of the AES state, which runs down
 //! the columns. The lane `i` of 32 bits is the word `i` of a SHA value.
@@ -13,6 +15,7 @@
 //! QEMU's source, Arm's ASL or pseudocode (X1, X2).
 
 use vmlab_hv_tcg_ir::native::{Effects, Helper, HelperFn};
+use vmlab_hv_tcg_jit::{RegisterFn, Words};
 
 /// One crypto instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,19 +269,96 @@ pub fn crypto(operation: Crypto, d: u128, n: u128, m: u128) -> u128 {
     }
 }
 
-fn helper_crypto(args: &[u128]) -> u128 {
-    let operation = Crypto::ALL[args[0] as usize % Crypto::ALL.len()];
-    crypto(operation, args[1], args[2], args[3])
+/// The pure function of the helper of `crypto::<OP>`: `(d, n, m)`.
+fn pure<const OP: u8>(args: &[u128]) -> u128 {
+    crypto(Crypto::ALL[usize::from(OP)], args[0], args[1], args[2])
 }
 
-/// `(operation, d, n, m)`.
-pub static CRYPTO: Helper = Helper {
-    name: "crypto",
-    args: 4,
-    results: 1,
-    effects: Effects::NONE,
-    function: HelperFn::Pure(helper_crypto),
-};
+/// The same with the words of `d`, `n` and `m` in the argument registers,
+/// low word first, and the result in RAX and RDX: what compiled code calls
+/// (3e DESIGN.md J13).
+extern "sysv64" fn in_registers<const OP: u8>(
+    d_low: u64,
+    d_high: u64,
+    n_low: u64,
+    n_high: u64,
+    m_low: u64,
+    m_high: u64,
+) -> Words {
+    let value = |low: u64, high: u64| u128::from(low) | u128::from(high) << 64;
+    let result = crypto(
+        Crypto::ALL[usize::from(OP)],
+        value(d_low, d_high),
+        value(n_low, n_high),
+        value(m_low, m_high),
+    );
+    Words {
+        low: result as u64,
+        high: (result >> 64) as u64,
+    }
+}
+
+const fn helper(name: &'static str, function: fn(&[u128]) -> u128) -> Helper {
+    Helper {
+        name,
+        args: 3,
+        results: 1,
+        effects: Effects::NONE,
+        function: HelperFn::Pure(function),
+    }
+}
+
+/// One helper for each operation, in the order of `Crypto::ALL`: `(d, n,
+/// m)`, the registers of the instruction, with no operation to dispatch on
+/// (3e DESIGN.md J13).
+pub static HELPERS: [Helper; 14] = [
+    helper("aese", pure::<0>),
+    helper("aesd", pure::<1>),
+    helper("aesmc", pure::<2>),
+    helper("aesimc", pure::<3>),
+    helper("sha1c", pure::<4>),
+    helper("sha1p", pure::<5>),
+    helper("sha1m", pure::<6>),
+    helper("sha1h", pure::<7>),
+    helper("sha1su0", pure::<8>),
+    helper("sha1su1", pure::<9>),
+    helper("sha256h", pure::<10>),
+    helper("sha256h2", pure::<11>),
+    helper("sha256su0", pure::<12>),
+    helper("sha256su1", pure::<13>),
+];
+
+/// The functions with their words in registers, as `HELPERS`.
+static IN_REGISTERS: [RegisterFn; 14] = [
+    in_registers::<0>,
+    in_registers::<1>,
+    in_registers::<2>,
+    in_registers::<3>,
+    in_registers::<4>,
+    in_registers::<5>,
+    in_registers::<6>,
+    in_registers::<7>,
+    in_registers::<8>,
+    in_registers::<9>,
+    in_registers::<10>,
+    in_registers::<11>,
+    in_registers::<12>,
+    in_registers::<13>,
+];
+
+/// The helper of `operation`.
+pub fn helper_of(operation: Crypto) -> &'static Helper {
+    &HELPERS[operation as usize]
+}
+
+/// The function that compiled code calls with the words of `helper` in
+/// registers, when it is one of `HELPERS`.
+pub fn in_registers_of(helper: &Helper) -> Option<RegisterFn> {
+    HELPERS
+        .iter()
+        .position(|own| std::ptr::eq(own, helper))
+        .map(|index| IN_REGISTERS[index])
+}
 
 #[cfg(test)]
 mod tests {

@@ -261,6 +261,10 @@ def run_interpreter_backend(args, commit, dirty, host, log, pin):
             noise["chaining"] = bool(raw[0].get("chaining"))
             for key in ("chained", "jump_hits", "unlinked", "lookups", "entered"):
                 noise[key] = raw[0][key]
+        # The superblocks of card J14: their joins and side exits.
+        for key in ("joins", "side_exits"):
+            if key in raw[0]:
+                noise[key] = raw[0][key]
         noise["loadavg_end"] = lib.read_loadavg()
         rec = record(args.backend, name, commit, dirty, host, samples, mips, noise, raw)
         rec["qemu_baseline"] = lib.latest_baseline(lib.read_history("aarch64"), "aarch64",

@@ -9,7 +9,9 @@
 //! a test holds each against the name of its record.
 //!
 //! Bitwise operations, moves of lanes between registers and immediates are
-//! scalar operations of the graph. Everything else is one call of the lane
+//! scalar operations of the graph, and so are the integer `ADD`, `SUB`,
+//! `CMEQ`, `CMTST` and `REV` of whole vectors (3e DESIGN.md J13), as
+//! operations on words of 64 bits. Everything else is one call of the lane
 //! helper `helpers::simd::eval` (DESIGN.md G3d): a code that names the
 //! operation, the lane size and the lane count, three 128-bit operands and
 //! FPCR. An operation that accumulates into its destination is two calls.
@@ -30,7 +32,7 @@ use crate::generated::decode::{FormatClass, Record};
 use crate::helpers::fp::{self, DOUBLE, SINGLE, ToInteger};
 use crate::helpers::simd::{Code, Op, QC, SIMD, SIMD_FLAGS, SIMD_LOW, SIMD_TABLE, table_code};
 use crate::state::slot;
-use vmlab_hv_tcg_ir::native::{Binary, ScalarId};
+use vmlab_hv_tcg_ir::native::{Binary, ScalarId, Unary};
 
 fn bit(word: u32, index: u32) -> bool {
     word >> index & 1 != 0
@@ -179,9 +181,159 @@ fn raise(b: &mut Builder, flags: ScalarId) {
     b.write(slot::FPSR, new);
 }
 
+// --- inline forms (3e DESIGN.md J13) ------------------------------------------------
+
+/// Each lane of `bits` bits in a word of 64 with only its top bit set.
+const fn top_bits(bits: u32) -> u64 {
+    let mut value = 0u64;
+    let mut at = bits - 1;
+    while at < 64 {
+        value |= 1 << at;
+        at += bits;
+    }
+    value
+}
+
+/// Each block of `2 * half` bits in a word of 64 with its low `half` bits
+/// set.
+const fn low_halves(half: u32) -> u64 {
+    let mut value = 0u64;
+    let mut at = 0;
+    while at < 64 {
+        value |= ((1u64 << half) - 1) << at;
+        at += 2 * half;
+    }
+    value
+}
+
+/// One word of 64 bits of an inline lane operation: lanes of `bits` bits,
+/// computed with operations on the whole word that carry nothing from one
+/// lane into the next.
+fn inline_word(b: &mut Builder, code: Code, bits: u32, x: ScalarId, y: ScalarId) -> ScalarId {
+    let top = top_bits(bits);
+    let rest = b.imm(64, !top);
+    let tops = b.imm(64, top);
+    match code.op {
+        Op::Add | Op::Sub if bits == 64 => {
+            let operation = if code.op == Op::Add {
+                Binary::Add
+            } else {
+                Binary::Sub
+            };
+            b.binary(64, operation, x, y)
+        }
+        // The lanes without their top bits, which cannot carry out of the
+        // lane, then the top bits put back with an exclusive or.
+        Op::Add => {
+            let low_x = b.binary(64, Binary::And, x, rest);
+            let low_y = b.binary(64, Binary::And, y, rest);
+            let sum = b.binary(64, Binary::Add, low_x, low_y);
+            let differ = b.binary(64, Binary::Xor, x, y);
+            let carry = b.binary(64, Binary::And, differ, tops);
+            b.binary(64, Binary::Xor, sum, carry)
+        }
+        // Each lane of `x` with its top bit set, which a lane of `y` without
+        // its top bit cannot borrow past.
+        Op::Sub => {
+            let high_x = b.binary(64, Binary::Or, x, tops);
+            let low_y = b.binary(64, Binary::And, y, rest);
+            let difference = b.binary(64, Binary::Sub, high_x, low_y);
+            let not_y = b.not(64, y);
+            let same = b.binary(64, Binary::Xor, x, not_y);
+            let borrow = b.binary(64, Binary::And, same, tops);
+            b.binary(64, Binary::Xor, difference, borrow)
+        }
+        Op::CmEq | Op::CmTst => {
+            let operation = if code.op == Op::CmEq {
+                Binary::Xor
+            } else {
+                Binary::And
+            };
+            let t = b.binary(64, operation, x, y);
+            // The top bit of a lane: set when some bit of the lane is.
+            let low = b.binary(64, Binary::And, t, rest);
+            let carried = b.binary(64, Binary::Add, low, rest);
+            let any = b.binary(64, Binary::Or, carried, t);
+            let mut chosen = b.binary(64, Binary::And, any, tops);
+            if code.op == Op::CmEq {
+                chosen = b.binary(64, Binary::Xor, chosen, tops);
+            }
+            // A lane whose top bit alone is set, shifted up by one, less
+            // its top bit shifted down to bit 0: every bit of the lane. The
+            // top lane wraps around 2^64, which gives the same.
+            let above = b.shl(64, chosen, 1);
+            let below = b.lsr(64, chosen, bits - 1);
+            b.binary(64, Binary::Sub, above, below)
+        }
+        Op::Rev => {
+            let container = u32::from(code.imm);
+            let mut value = x;
+            let mut half = bits;
+            if bits == 8 && container >= 32 {
+                // The bytes of the word in the other order, then the two
+                // containers of 32 bits back in their places.
+                value = b.unary(64, Unary::ReverseBytes(64), value);
+                if container == 32 {
+                    value = b.ror(64, value, 32);
+                }
+                half = container;
+            }
+            // Neighbouring blocks of `half` bits swapped, up to the
+            // container.
+            while half < container {
+                let mask = low_halves(half);
+                let keep = b.imm(64, mask);
+                let other = b.imm(64, !mask);
+                let down = b.lsr(64, value, half);
+                let down = b.binary(64, Binary::And, down, keep);
+                let up = b.shl(64, value, half);
+                let up = b.binary(64, Binary::And, up, other);
+                value = b.binary(64, Binary::Or, down, up);
+                half *= 2;
+            }
+            value
+        }
+        _ => unreachable!("{} has no inline form", code.op.name()),
+    }
+}
+
+/// `code` on `x` and `y` as operations of the graph, which compiled code
+/// runs inline (3e DESIGN.md J13), for the integer lane operations of the
+/// `sha256` loop and of the string functions of a boot: `ADD`, `SUB`,
+/// `CMEQ`, `CMTST` and `REV16`, `REV32`, `REV64` over 64 or 128 bits.
+/// `None`: the lane helper runs it.
+fn inline_lanes(b: &mut Builder, code: Code, x: ScalarId, y: ScalarId) -> Option<ScalarId> {
+    let bits = 8u32 << code.size;
+    let width = bits * u32::from(code.lanes);
+    let known = match code.op {
+        Op::Add | Op::Sub | Op::CmEq | Op::CmTst => true,
+        Op::Rev => {
+            let container = u32::from(code.imm);
+            container > bits && container <= 64 && container.is_power_of_two()
+        }
+        _ => false,
+    };
+    if !known || code.pairwise || !(width == 64 || width == 128) {
+        return None;
+    }
+    let low_x = b.slice(x, 0, 64);
+    let low_y = b.slice(y, 0, 64);
+    let low = inline_word(b, code, bits, low_x, low_y);
+    if width == 64 {
+        return Some(b.zero_extend(low, 128));
+    }
+    let high_x = b.slice(x, 64, 64);
+    let high_y = b.slice(y, 64, 64);
+    let high = inline_word(b, code, bits, high_x, high_y);
+    Some(b.concat(high, low, 64, 128))
+}
+
 /// Run `code` on three vectors. Gives the result as 128 bits, with zeros
 /// above its lanes, and puts the bits that it raises into FPSR.
 fn apply(b: &mut Builder, code: Code, x: ScalarId, y: ScalarId, z: ScalarId) -> ScalarId {
+    if let Some(value) = inline_lanes(b, code, x, y) {
+        return value;
+    }
     let control = if code.op.is_fp() {
         b.fpcr()
     } else {

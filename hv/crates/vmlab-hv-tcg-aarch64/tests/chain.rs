@@ -19,6 +19,10 @@ fn flat(words: &[u32], jit: bool) -> Cpu<FlatMemory> {
     let mut cpu = Cpu::new(FlatMemory::new(BASE, data), State::reset(BASE));
     cpu.set_jit(jit).expect("a code region");
     cpu.set_chaining(true).expect("a code region");
+    // These tests count the exits of blocks that chain one to another: a
+    // superblock (J14) would hold a loop in one block. `superblocks` runs
+    // the programs with them.
+    cpu.set_superblocks(false);
     cpu
 }
 
@@ -327,4 +331,54 @@ fn a_context_change_is_never_chained() {
         results.push(machine.cpu.state.slots);
     }
     assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn superblocks_run_the_programs_as_blocks_do() {
+    // J14: the loop of the switch test above is one superblock that goes
+    // round it as many times as fit, and leaves at its end through a side
+    // exit. The pair of the first test joins B into A, and the store into
+    // B still drops the code of A, which holds B now.
+    const ADD_X6: u32 = 0x9100_04c6;
+    let pair = vec![
+        0x9100_0400,
+        0x1400_0003,
+        0xd503_201f,
+        0xd503_201f,
+        0xf100_0421,
+        0x54ff_ff61,
+        0xb500_0087,
+        0xd280_0027,
+        0xb900_0083,
+        0x17ff_fff7,
+        HVC,
+    ];
+    let looped = vec![0x9100_0400, 0xf100_0421, 0x54ff_ffc1, HVC];
+    for (program, rounds) in [(pair, 1000u64), (looped, 5000)] {
+        let mut results = Vec::new();
+        let mut chained = Vec::new();
+        for (jit, superblocks) in [(false, false), (true, false), (true, true)] {
+            let mut cpu = flat(&program, jit);
+            cpu.set_superblocks(superblocks);
+            cpu.state.set_x(1, rounds);
+            cpu.state.set_x(3, u64::from(ADD_X6));
+            cpu.state.set_x(4, BASE + 0x10);
+            assert!(
+                matches!(cpu.run(1_000_000), Stop::Hypercall { .. }),
+                "jit {jit} superblocks {superblocks}: {:?}",
+                cpu.state
+            );
+            if superblocks {
+                assert!(cpu.joins > 0 && cpu.side_exits > 0, "{}", cpu.joins);
+            } else {
+                assert_eq!((cpu.joins, cpu.side_exits), (0, 0));
+            }
+            chained.push(cpu.jit_counts().chained);
+            results.push((cpu.state.slots, cpu.instructions));
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], results[2]);
+        // Fewer block heads: the loop runs inside its superblock.
+        assert!(chained[2] * 4 < chained[1], "{chained:?}");
+    }
 }

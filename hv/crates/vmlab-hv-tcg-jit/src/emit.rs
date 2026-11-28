@@ -66,9 +66,9 @@ use crate::asm::{
 use crate::tlb::{ADDEND, ENTRIES, ENTRY_BITS, TAG, WATCH};
 use crate::{
     BUDGET, CHAIN, CONTEXT_ACCESSES, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV,
-    CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_THUNK,
-    CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
-    WATCHED,
+    CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_REFUND,
+    CONTEXT_THUNK, CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS,
+    SITES, VERIFY, WATCHED,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Kind as GenericKind, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::{Binary, ScalarType, Unary};
@@ -92,7 +92,41 @@ pub struct Effect {
     /// A helper call that is a condition of a lazy flag record, with the
     /// inline forms of its kinds (H8c).
     pub condition: Option<LazyCondition>,
+    /// A pure helper that compiled code calls with its arguments in
+    /// registers, in place of `direct` and of the thunk (3e DESIGN.md J13).
+    pub registers: Option<Registers>,
 }
+
+/// A pure helper call whose words go to the function in the argument
+/// registers of the System V convention and come back in RAX and RDX
+/// (3e DESIGN.md J13): no thunk, and no Rust code that finds the call and
+/// reads its arguments from the frame. It never leaves the block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registers {
+    /// The address of an `extern "sysv64"` function of the type
+    /// `crate::RegisterFn`.
+    pub function: u64,
+    /// The words of its arguments, in the order RDI, RSI, RDX, RCX, R8 and
+    /// R9: at most six, each one that the effect reads. The registers past
+    /// them hold no value that the function may read.
+    pub args: Vec<Slot>,
+    /// The words that RAX and then RDX fill: at most two, and the words that
+    /// the effect writes, in that order.
+    pub results: Vec<Slot>,
+}
+
+impl Registers {
+    /// Whether the call fits the effect that holds it.
+    fn fits(&self, reads: &[Slot], writes: &[Slot]) -> bool {
+        self.args.len() <= ARGUMENT_REGISTERS.len()
+            && self.results.len() <= 2
+            && self.args.iter().all(|word| reads.contains(word))
+            && self.results == writes
+    }
+}
+
+/// The argument registers of the System V convention, in order.
+const ARGUMENT_REGISTERS: [Reg; 6] = [RDI, RSI, RDX, RCX, R8, R9];
 
 /// A helper call whose result is whether a condition holds for a lazy flag
 /// record of the guest: a kind and two operands (DESIGN.md H8c). The caller
@@ -280,6 +314,22 @@ pub struct Next {
     pub kind: NextPc,
 }
 
+/// A side exit of a superblock (DESIGN.md J14): the guard of the leave
+/// `leave` ends the block there as its end does. The stub of the guard
+/// writes `outputs` to the state, moves the PC of the state by `distance`
+/// (a target in the page of the block), counts the `skipped` instructions
+/// that the head took for the rest of the block in `Context::refund`, and
+/// leaves through a jump that its owner links, as an exit of the end does.
+/// The leave has no operations of its own: the block computes every word
+/// that the outputs read before the guard.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Side {
+    pub leave: u32,
+    pub outputs: Vec<(u32, Place)>,
+    pub distance: u64,
+    pub skipped: u32,
+}
+
 /// A block as the emitter sees it.
 pub struct Shape<'a> {
     pub ops: &'a [Op],
@@ -306,6 +356,9 @@ pub struct Shape<'a> {
     pub next: Option<Next>,
     /// How its loads and stores of 1 to 8 bytes reach memory (H7).
     pub memory: Memory,
+    /// The side exits of a superblock (J14). A guard of a leave that is not
+    /// here, or of one that cannot be linked, calls the thunk.
+    pub sides: &'a [Side],
 }
 
 /// A defect that the emitter puts into its code on purpose, for the tests
@@ -1002,18 +1055,51 @@ impl Emitter<'_> {
         }
     }
 
+    /// Call the pure helper of `registers` with the words of its arguments,
+    /// which are in the frame, in the argument registers, keeping `saved`,
+    /// and store what it gives in RAX and RDX into the words of its
+    /// results (3e DESIGN.md J13).
+    fn call_registers(asm: &mut Asm, registers: &Registers, saved: &[Reg]) {
+        for reg in saved {
+            asm.push(*reg);
+        }
+        let pad = saved.len() % 2 == 1;
+        if pad {
+            asm.alu_imm(Alu::Sub, Rm::Reg(RSP), 8);
+        }
+        // R14, the frame, is no argument register: every load reads the
+        // frame as it was before the first.
+        for (word, reg) in registers.args.iter().zip(ARGUMENT_REGISTERS) {
+            asm.mov(reg, Self::frame(*word));
+        }
+        asm.mov_imm(RAX, registers.function);
+        asm.call_indirect(Rm::Reg(RAX));
+        if pad {
+            asm.alu_imm(Alu::Add, Rm::Reg(RSP), 8);
+        }
+        for reg in saved.iter().rev() {
+            asm.pop(*reg);
+        }
+        // RAX and RDX are scratch: the pops above do not touch them.
+        for (word, reg) in registers.results.iter().zip([RAX, RDX]) {
+            asm.store(Self::frame(*word), reg);
+        }
+    }
+
     /// An operation that runs through the thunk, or through the function
     /// that its `Effect` names.
     fn effect(&mut self, index: usize, reads: &[Slot], writes: &[Slot]) {
         let op = self.shape.ops[index];
-        let direct = if op.code == Code::Call {
-            self.shape
-                .calls
-                .get(op.imm as usize)
-                .and_then(|call| call.direct)
+        let shape = self.shape;
+        let call = if op.code == Code::Call {
+            shape.calls.get(op.imm as usize)
         } else {
             None
         };
+        let direct = call.and_then(|call| call.direct);
+        let registers = call
+            .and_then(|call| call.registers.as_ref())
+            .filter(|registers| registers.fits(reads, writes));
         let at = index as u32;
         for word in reads {
             self.materialize(*word);
@@ -1024,6 +1110,10 @@ impl Emitter<'_> {
             self.words[usize::from(*word)].home = Home::Frame;
         }
         let saved = self.live_caller_saved();
+        if let Some(registers) = registers {
+            Self::call_registers(&mut self.asm, registers, saved.as_slice());
+            return;
+        }
         match direct {
             Some((function, argument)) => {
                 Self::call_function(&mut self.asm, Some(function), argument, saved.as_slice());
@@ -1205,6 +1295,14 @@ impl Emitter<'_> {
         // The stub, with the places of the words as they are here.
         self.asm.cold(true);
         self.asm.bind(stub);
+        if let Some(index) = self.native_side(op) {
+            let shape = self.shape;
+            self.side_exit(&shape.sides[index], at as usize);
+            self.asm.cold(false);
+            self.release(&all, at);
+            self.all = all;
+            return;
+        }
         for word in reads {
             let w = self.words[usize::from(*word)];
             Self::home_code(&mut self.asm, *word, w);
@@ -1222,6 +1320,80 @@ impl Emitter<'_> {
         self.asm.cold(false);
         self.release(&all, at);
         self.all = all;
+    }
+
+    /// The side exit (J14) that the guard `op` leaves through, when its
+    /// stub can leave to the next block itself: the block chains, its PC
+    /// has a slot, the target is in its page, and a jump that can be
+    /// linked is left for it and for the two of the end.
+    fn native_side(&self, op: &Op) -> Option<usize> {
+        let shape = self.shape;
+        let chain = shape.chain.filter(|chain| chain.sites)?;
+        shape.next?;
+        let index = shape
+            .sides
+            .iter()
+            .position(|side| u64::from(side.leave) == op.imm)?;
+        let target = i64::from(chain.page_offset) + shape.sides[index].distance as i64;
+        ((0..4096).contains(&target) && self.sites.len() + 2 < SITES).then_some(index)
+    }
+
+    /// The stub of a side exit (J14): the outputs from where their words
+    /// are, the PC, the instructions that did not run, and a jump that the
+    /// owner links. Every word goes to the frame first, so that an output
+    /// cannot write over the slot of an input that a later one reads.
+    fn side_exit(&mut self, side: &Side, at: usize) {
+        let Some(next) = self.shape.next else {
+            return;
+        };
+        // The head counted the inlined accesses of the whole block (H7).
+        let memory = self.shape.memory;
+        let after = self.shape.ops[at + 1..]
+            .iter()
+            .filter(|op| inline_access(op, memory).is_some())
+            .count();
+        if after != 0 {
+            self.asm
+                .alu_imm(Alu::Sub, Rm::Mem(R13, CONTEXT_ACCESSES), after as i32);
+        }
+        for (_, place) in &side.outputs {
+            for word in [place.slot, place.slot + 1]
+                .into_iter()
+                .take(1 + usize::from(place.wide))
+            {
+                let w = self.words[usize::from(word)];
+                Self::home_code(&mut self.asm, word, w);
+            }
+        }
+        for (register, place) in &side.outputs {
+            let base = *register as i32 * 16;
+            self.asm.mov(RAX, Self::frame(place.slot));
+            self.asm.store(Rm::Mem(R15, base), RAX);
+            if place.wide {
+                self.asm.mov(RAX, Self::frame(place.slot + 1));
+                self.asm.store(Rm::Mem(R15, base + 8), RAX);
+            } else {
+                self.asm.store_imm(Rm::Mem(R15, base + 8), 0);
+            }
+        }
+        let pc = i32::try_from(u64::from(next.pc) * 16).unwrap_or(i32::MAX);
+        let distance = side.distance as i64 as i32;
+        if distance != 0 {
+            self.asm.alu_imm(Alu::Add, Rm::Mem(R15, pc), distance);
+        }
+        if side.skipped != 0 {
+            self.asm
+                .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_REFUND), side.skipped as i32);
+        }
+        let jump = self.asm.label();
+        let stub = self.asm.label();
+        self.asm.alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_CHAINED), 1);
+        self.asm.bind(jump);
+        self.asm.jmp(stub);
+        self.asm.bind(stub);
+        self.asm.mov_imm(RAX, CHAIN + self.sites.len() as u64);
+        self.asm.jmp_absolute(self.exit);
+        self.sites.push((jump, stub));
     }
 
     /// The test of a guard on the word of its condition.
@@ -2095,7 +2267,6 @@ impl Emitter<'_> {
     /// exit. The exits that chain go into `sites`: the label of each jump
     /// and of its stub. `slots` and `spans` are the words of each operation.
     fn outputs(&mut self, slots: &[Slot], spans: &[Span]) {
-        self.sites.clear();
         // The word of the next PC goes into RCX before an output can write
         // over the slot that it is still in.
         let next = self.shape.next;
@@ -2156,7 +2327,7 @@ impl Emitter<'_> {
                 .flatten()
             {
                 let target = i64::from(chain.page_offset) + distance as i64;
-                if !(0..4096).contains(&target) || self.sites.len() == SITES {
+                if !(0..4096).contains(&target) || self.sites.len() >= SITES {
                     continue;
                 }
                 let Ok(immediate) = i32::try_from(distance as i64) else {
@@ -2506,6 +2677,7 @@ pub fn emit(
     }
     let mut asm = std::mem::take(&mut scratch.asm);
     asm.clear();
+    scratch.sites.clear();
     let initial = std::mem::take(&mut scratch.homes);
     let mut states = std::mem::take(&mut scratch.words);
     states.clear();

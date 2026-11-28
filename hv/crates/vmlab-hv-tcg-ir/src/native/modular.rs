@@ -1,9 +1,26 @@
 use super::{Binary, Graph, Operation, ScalarId, ScalarType, Unary};
 
+/// How many operations deep `modular` pushes a reduction. Each level goes
+/// into both operands, and an operand can be shared, so a chain of `x + x`
+/// takes two to the power of its length without a bound: a superblock that
+/// holds many turns of such a loop (3e DESIGN.md J14) took minutes to
+/// translate. Past the bound the reduction stays a truncation of its own.
+const MOST_DEPTH: u32 = 8;
+
 impl Graph {
     /// Push a final modular reduction through arithmetic and identity views.
     /// A narrower intermediate reduction must remain visible.
     pub(super) fn modular(&mut self, value: ScalarId, width: u16) -> Option<ScalarId> {
+        if self.modular_depth >= MOST_DEPTH {
+            return None;
+        }
+        self.modular_depth += 1;
+        let reduced = self.modular_within(value, width);
+        self.modular_depth -= 1;
+        reduced
+    }
+
+    fn modular_within(&mut self, value: ScalarId, width: u16) -> Option<ScalarId> {
         let ty = ScalarType::Bits(width);
         let mut source = value;
         while let Operation::Refine(previous) = self.scalars[source].operation {
@@ -59,5 +76,21 @@ mod tests {
         let ten = graph.constant(ty, 10);
         let expected = graph.binary(ty, Binary::Add, input, ten).unwrap();
         assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn a_reduction_of_a_long_chain_of_shared_operands_ends() {
+        // x = x + x a hundred times, then the low 32 bits: the reduction
+        // goes into both operands of each sum, which are one scalar.
+        let mut graph = Graph::default();
+        let ty = ScalarType::Bits(64);
+        let mut value = graph.input(0, ty, None);
+        for _ in 0..100 {
+            value = graph.binary(ty, Binary::Add, value, value).unwrap();
+        }
+        let low = graph
+            .unary(ScalarType::Bits(32), Unary::Truncate(32), value)
+            .unwrap();
+        assert_eq!(graph.scalars[low].ty, ScalarType::Bits(32));
     }
 }
