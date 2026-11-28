@@ -284,8 +284,11 @@ def counts_instructions(args, arch):
     return args.backend == "vmlab-hv" and arch == "aarch64"
 
 
-def run_config(args, arch, smp, pin, version, commit, dirty, host):
-    """N repeats of one configuration → one history line per workload."""
+def run_config(args, arch, smp, pin, version, commit, dirty, host, cores=None):
+    """N repeats of one configuration → one history line per workload.
+
+    `cores` is lib.reserve_cores's record; with it every row carries the
+    reserved cores and, per repeat, the host load (lib.host_load)."""
     workloads = ("boot_to_agent_ready",) if args.suite == "boot" else lib.TCG_WORKLOADS
     if counts_instructions(args, arch):
         workloads = (*workloads, "boot_mips")
@@ -299,6 +302,9 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         "template": version,
         "host_cpus": os.cpu_count(),
     }
+    if cores is not None:
+        env["cores"] = cores
+        env["repeat_host_load"] = []
     if args.backend == "vmlab-hv" and arch == "aarch64":
         # The JIT of 3e is on unless VMLAB_HV_JIT=0 turns it off (DESIGN.md T1, J8).
         env["jit"] = lib.jit_enabled()
@@ -310,10 +316,17 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         env["boot_block_counts_enabled"] = "VMLAB_HV_BOOT_BLOCK_COUNTS" in os.environ
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} {arch} smp={smp} {args.guest} repeat {i}/{args.repeats}")
+        times_start = lib.read_cpu_times()
+        loadavg_start = lib.read_loadavg()
         result, backend, session, agent, digest = one_repeat(
             args, arch, smp, pin, version, i
         )
         env["loadavg_end"] = lib.read_loadavg()
+        if cores is not None:
+            load = lib.host_load(times_start, lib.read_cpu_times(), lib.parse_cpu_list(pin))
+            load.update(loadavg_start=loadavg_start, loadavg_end=env["loadavg_end"])
+            env["repeat_host_load"].append(load)
+            log(f"repeat {i} host load: {load}")
         env["backend_version"] = backend.backend_version()
         if "jit_reports" in env:
             env["jit_reports"].append(lib.last_jit_report(result["run"]))
@@ -1339,13 +1352,17 @@ def main(argv=None):
         version = lib.latest_template(arch, args.guest)
         vcpu_spec = args.vcpus or "1,4"
         for smp in [int(v) for v in vcpu_spec.split(",") if v.strip()]:
-            pin = lib.pin_cpus(smp, args.cpus)
+            pin, cores = lib.reserve_cores(smp, args.cpus)
             log(f"### {args.backend} {arch} smp={smp} {args.guest}@{version} pin={pin} "
+                f"cores={cores['cores']} chosen={cores['chosen']} "
                 f"governor={lib.read_governor()} load={lib.read_loadavg()}")
+            if cores["chosen"] == "loaded":
+                log("warning: too few free whole cores; this row is taken under load")
             if args.dry_run:
                 continue
             try:
-                records = run_config(args, arch, smp, pin, version, commit, dirty, host)
+                records = run_config(args, arch, smp, pin, version, commit, dirty, host,
+                                     cores=cores)
                 for r in records:
                     log(f"history: {r['workload']} median={r['median']}{r['unit']} "
                         f"spread={r['spread']}{r['unit']}")
