@@ -930,9 +930,16 @@ mod tests {
                 for (n, word) in ram.iter().enumerate() {
                     bytes[n * 8..n * 8 + 8].copy_from_slice(&word.to_le_bytes());
                 }
-                assert_eq!(&bytes[offset..offset + len], &source[..len], "{offset} {len}");
+                assert_eq!(
+                    &bytes[offset..offset + len],
+                    &source[..len],
+                    "{offset} {len}"
+                );
                 assert!(bytes[..offset].iter().all(|&b| b == 0), "{offset} {len}");
-                assert!(bytes[offset + len..].iter().all(|&b| b == 0), "{offset} {len}");
+                assert!(
+                    bytes[offset + len..].iter().all(|&b| b == 0),
+                    "{offset} {len}"
+                );
                 let mut back = vec![0u8; len];
                 // SAFETY: as above.
                 unsafe { copy_in(base + offset, &mut back) };
