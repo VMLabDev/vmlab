@@ -1153,7 +1153,8 @@ fn an_interrupt_raised_by_another_thread_is_taken_inside_a_slice_of_a_spinning_v
     assert!(state.x(7) > 0);
     let looped = RAM + 4 * (program.len() as u64 - 2);
     assert!(
-        (looped..=looped + 4).contains(&state.system.regs[vmlab_hv_tcg_aarch64::sysreg::reg::ELR_EL1]),
+        (looped..=looped + 4)
+            .contains(&state.system.regs[vmlab_hv_tcg_aarch64::sysreg::reg::ELR_EL1]),
         "ELR_EL1 {:#x}",
         state.system.regs[vmlab_hv_tcg_aarch64::sysreg::reg::ELR_EL1]
     );

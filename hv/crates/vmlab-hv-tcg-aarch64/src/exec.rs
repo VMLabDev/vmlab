@@ -4743,7 +4743,8 @@ fn learn_rate(rate: u64, instructions: u64, ticks: u64) -> u64 {
     if ticks == 0 {
         return rate;
     }
-    let measured = (u128::from(instructions) * 1024 / u128::from(ticks)).min(u128::from(u64::MAX >> 2)) as u64;
+    let measured =
+        (u128::from(instructions) * 1024 / u128::from(ticks)).min(u128::from(u64::MAX >> 2)) as u64;
     if rate == 0 {
         measured
     } else {
@@ -7505,7 +7506,11 @@ mod tests {
         let first = Arc::new(Shootdown::new(2));
         cpu.shootdown = Some((first.clone(), 1));
         assert_eq!(cpu.run(100), Stop::Budget);
-        assert!(cpu.seated.as_ref().is_some_and(|seat| Arc::ptr_eq(seat, &lines.seat)));
+        assert!(
+            cpu.seated
+                .as_ref()
+                .is_some_and(|seat| Arc::ptr_eq(seat, &lines.seat))
+        );
         assert_eq!(cpu.run(100), Stop::Budget);
         let second = Arc::new(Shootdown::new(2));
         cpu.shootdown = Some((second.clone(), 1));
