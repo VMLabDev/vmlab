@@ -138,6 +138,33 @@ RUST_TEST_THREADS=1 just ci::hv-gate`. The verification records in
 `docs/memory-leak.md` and `crates/vmlab-hv-tcg-riscv64/VERIFICATION.md` use
 this shape.
 
+## The K4 nightly run
+
+K4 of the aarch64 JIT plan (`docs/plans/phase-3e-aarch64-jit/DESIGN.md`,
+card #1187) is the boot lockstep of the `debian-13` aarch64 template
+against QEMU, from the reset to agent ready, with the JIT on. QEMU is the
+leader and a black box: it boots the template with the lockstep plugin, and
+our whole `virt` machine follows its stream one instruction at a time. It
+runs for about ten hours, so it is not part of the merge bar.
+
+- `just tcg-a64-k4 <keep>` runs it once and writes `run.log`, `summary.txt`
+  (the end, the counts, and the first CPU difference with its instruction,
+  PC and registers, ours and the leader's), `last-instructions.txt` and both
+  serial logs into `<keep>`. The exit code is 0 when the run reached agent
+  ready with no CPU difference.
+- `scripts/k4-nightly.sh <results>` is one nightly run: a directory
+  `<results>/<date>-<commit>/` with those files, and a line in
+  `<results>/history.log`.
+- `just tcg-a64-k4-nightly-install <clone> <results>` installs the job as a
+  transient timer of the user's systemd (`vmlab-k4-nightly`, 20:00 each
+  day). Each run moves the clone, a vmlab clone of its own, to the newest
+  `next` and runs the script under a lock. Install it again after a reboot.
+
+On helios the job runs as the account `vmlab`, with the clone at
+`/home/vmlab/src/stc/k4/vmlab` and the results in
+`/home/vmlab/src/stc/k4/results`. The results of the runs are recorded in
+the 3e DESIGN.md under "K4, measured by card #1187".
+
 ## Clean room
 
 Everything here is implemented from specifications: the VIRTIO 1.2 spec, the

@@ -182,6 +182,8 @@ fn next_instruction(
         match leader.next(SILENCE)? {
             None => return Ok(None),
             Some(Record::Read(read)) => reads.push(read),
+            // The leader of a window has no guest disk, and writes none.
+            Some(Record::Load(_)) => {}
             Some(Record::Trace(Trace::Write {
                 address,
                 size,
@@ -312,6 +314,7 @@ fn run_window(
             ram: high.clone(),
             prelude,
         }),
+        guest: None,
     };
     let state = start.state().ok_or("the window has no state of our CPU")?;
     let mut cpu = Cpu::new(FlatMemory::new(RAM_BASE, data), state);
