@@ -955,9 +955,13 @@ pub fn assemble(
         functions.push(controller.clone());
         xhci = Some(controller);
     }
-    // The virtio-fs shares come last, as they do in QEMU's argv.
+    // The virtio-fs shares come last, as they do in QEMU's argv. virtio-fs
+    // has no transitional identity: the function is a modern one, as QEMU's
+    // `vhost-user-fs-pci` is, which the guest's kernel binds and AAVMF
+    // does not need.
     for share in &desc.shares {
-        let (slot, function, wiring) = place(share.pci, 2)?;
+        let (slot, function, mut wiring) = place(share.pci, 2)?;
+        wiring.transitional = false;
         let built = factory
             .fs_share(share, &ram.device_mem, wiring)
             .map_err(unavailable(format!("share `{}`", share.tag)))?;
