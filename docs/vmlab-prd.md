@@ -3149,10 +3149,14 @@ setting, and not as a product path. riscv64 stays on QEMU until phase 3b.
   other than UEFI; more than eight vCPUs or less than 64 MiB; a display
   device other than the virtio-gpu; a `gpu {}` block; `usb = true`; a TPM; `audio`; a `cpu_model`; a NIC model other than
   virtio-net; `agent_transport = "isa-serial"`; an Apple SMC; and a floppy.
-  `accel = "tcg"` is accepted and changes nothing. A share is never virtio-fs
-  on this machine: `transport = "auto"` places it on SMB, and an explicit
-  `transport = "virtiofs"` fails the start. A NIC takes the stream socket,
-  never the kernel fast path's TAP queues.
+  `accel = "tcg"` is accepted and changes nothing.
+- **Shares and NICs.** A share is virtio-fs served in process, as on an x86
+  VM, in the slot after the xHCI; `transport = "auto"` places it there. A
+  NIC takes the stream socket or the kernel fast path's TAP queues, which
+  vmlab-hv serves in userspace: the machine is handed no vhost-net file, and
+  vmlab-hv refuses one, because the kernel writes guest RAM past the
+  emulator's tracking of translated code (#1227). An external virtiofsd is
+  refused for the same reason.
 - **Selection.** Automatic selection puts every new aarch64 VM on vmlab-hv.
   There is no QEMU fallback: when `vmlab_refusals` names a reason,
   `vmlab validate`, `up` and `vm start` fail with the refusal, which names

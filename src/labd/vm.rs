@@ -710,7 +710,7 @@ impl VmInstance {
     }
 
     /// Whether this VM is vmlab-hv's emulated aarch64 `virt` machine (§22,
-    /// phase 3d), which has no virtio-fs yet.
+    /// phase 3d), whose RAM no vhost backend may write (#1227).
     fn emulated_virt(&self) -> bool {
         self.hypervisor() == HypervisorKind::Vmlab
             && crate::config::hypervisor::emulated_guest(&self.template().resolved.arch)
@@ -1359,9 +1359,17 @@ impl VmInstance {
                                 })
                                 .collect()
                         };
+                        // The kernel's vhost-net writes guest RAM past the
+                        // translated-code tracking of an emulated machine,
+                        // whose queues vmlab-hv serves in userspace (#1227).
+                        let vhost = if self.emulated_virt() {
+                            Vec::new()
+                        } else {
+                            tap.vhost_fds().context("cloning vhost-net queues")?
+                        };
                         qemu::NicBackend::TapQueues {
                             tap_fds: map(tap.queue_fds().context("cloning TAP queues")?),
-                            vhost_fds: map(tap.vhost_fds().context("cloning vhost-net queues")?),
+                            vhost_fds: map(vhost),
                         }
                     }
                 }
@@ -2370,14 +2378,11 @@ impl super::machine::Machine for VmInstance {
     }
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
-        if self.emulated_virt() {
-            return None;
-        }
         self.emulator().virtiofsd()
     }
 
     fn virtiofs_in_process(&self) -> bool {
-        self.emulated_virt() || self.emulator().virtiofs_in_process()
+        self.emulator().virtiofs_in_process()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {
@@ -2441,12 +2446,11 @@ impl super::machine::Machine for VmInstance {
     /// stream on vmlab-hv too (describe.rs), so it takes no TAP either.
     fn takes_tap_fds(&self) -> bool {
         let resolved = &self.template().resolved;
-        // vmlab-hv's emulated aarch64 machine takes the stream only: a vhost
-        // backend writes guest RAM past its translated-code tracking.
+        // vmlab-hv's emulated aarch64 machine takes TAP queues too, served in
+        // userspace: `nic_specs` hands it no vhost-net file (#1227).
         self.hypervisor() != HypervisorKind::Vmlab
             || (resolved.nic_model.starts_with("virtio-net")
-                && !crate::config::hypervisor::is_macos(resolved)
-                && !crate::config::hypervisor::emulated_guest(&resolved.arch))
+                && !crate::config::hypervisor::is_macos(resolved))
     }
 
     fn net_framing(&self) -> crate::net::framing::FramingMode {

@@ -873,11 +873,8 @@ fn virt(
     let Some(serial_log) = &paths.serial_log else {
         bail!("vm \"{name}\": vmlab-hv needs a serial log path");
     };
-    if paths.tpm_sock.is_some() || !paths.hypervisor_shares.is_empty() {
-        bail!(
-            "vm \"{name}\": vmlab-hv's aarch64 `virt` machine has no TPM and no virtio-fs yet \
-             (PRD §22)"
-        );
+    if paths.tpm_sock.is_some() {
+        bail!("vm \"{name}\": vmlab-hv's aarch64 `virt` machine has no TPM yet (PRD §22)");
     }
     let mut slots = Slots(1);
     let agent = resolved.agent_transport == AgentTransport::VirtioSerial;
@@ -929,12 +926,32 @@ fn virt(
     }
     let mut nics = Vec::new();
     for nic in &paths.nics {
-        // An emulated machine's NIC takes the stream: a vhost backend would
-        // write guest RAM past the emulator's translated-code tracking.
-        let NicBackend::Stream { sock } = &nic.backend else {
-            bail!(
-                "vm \"{name}\": vmlab-hv attaches an emulated machine's NIC by stream socket only, not a TAP"
-            );
+        let pairs = crate::net::framing::queue_pairs(resolved.cpus);
+        let attachment = match &nic.backend {
+            NicBackend::Stream { sock } => NicAttachment::StreamVnet {
+                socket: sock.clone(),
+                queue_pairs: pairs,
+            },
+            // TAP queues served in userspace (#1227): a vhost-net backend
+            // would write guest RAM past the emulator's translated-code
+            // tracking, so an emulated machine is handed none.
+            NicBackend::TapQueues { tap_fds, vhost_fds } => {
+                if !vhost_fds.is_empty() {
+                    bail!(
+                        "vm \"{name}\": vmlab-hv's emulated aarch64 machine takes TAP queues \
+                         without vhost-net"
+                    );
+                }
+                if tap_fds.len() != usize::from(pairs) {
+                    bail!(
+                        "vm \"{name}\": TAP queue count does not match its {pairs} virtio queue pairs"
+                    );
+                }
+                NicAttachment::TapRaw { queue_pairs: pairs }
+            }
+            NicBackend::Tap { .. } => {
+                bail!("vm \"{name}\": vmlab-hv requires typed TAP queue descriptors")
+            }
         };
         nics.push(Nic {
             model: NicModel::Virtio,
@@ -942,10 +959,7 @@ fn virt(
             pci: Some(slots.next()),
             mac: nic.mac.to_string(),
             mtu: nic.mtu.filter(|m| *m != 1500),
-            attachment: NicAttachment::StreamVnet {
-                socket: sock.clone(),
-                queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
-            },
+            attachment,
         });
     }
     let display = resolved.display_device.as_ref().map(|_| Display {
@@ -959,6 +973,19 @@ fn virt(
         vnc_socket: Some(paths.vnc_sock.clone()),
     });
     let tablet = Some(slots.next());
+    // virtio-fs shares last, as the argv's `vhost-user-fs-pci` devices, but
+    // served by vmlab-hv's own device on the host directory (#1227).
+    let shares = paths
+        .hypervisor_shares
+        .iter()
+        .map(|share| FsShare {
+            pci: Some(slots.next()),
+            tag: share.tag.clone(),
+            socket: None,
+            path: Some(share.host.clone()),
+            read_only: share.readonly,
+        })
+        .collect();
     if slots.0 > 32 {
         bail!("vm \"{name}\": more PCI devices than `virt`'s bus 0 has slots for under vmlab-hv");
     }
@@ -1003,7 +1030,7 @@ fn virt(
         serial_log: serial_log.clone(),
         serial_log_port: ComPort::Com1,
         ports,
-        shares: Vec::new(),
+        shares,
         audio: None,
         vfio: Vec::new(),
         usb: None,
@@ -1296,6 +1323,31 @@ mod tests {
         let h = vm("l", &headless, &aavmf_paths(), QemuAccel::Tcg, &roms()).unwrap();
         assert!(h.display.is_none());
         assert_eq!(h.tablet, at(6));
+        assert!(d.shares.is_empty());
+        // A share is the in-process virtio-fs device after the xHCI, and a
+        // TAP NIC takes its queues without vhost-net (#1227).
+        let mut attached = aavmf_paths();
+        attached.hypervisor_shares = vec![crate::qemu::HypervisorShare {
+            tag: "work".into(),
+            host: "/lab/work".into(),
+            readonly: true,
+        }];
+        attached.nics[0].backend = NicBackend::TapQueues {
+            tap_fds: vec![10, 11],
+            vhost_fds: vec![],
+        };
+        let a = vm("l", &r, &attached, QemuAccel::Tcg, &roms()).unwrap();
+        assert_eq!(a.shares.len(), 1);
+        let share = &a.shares[0];
+        assert_eq!((share.pci, share.tag.as_str()), (at(8), "work"));
+        assert_eq!(
+            (share.socket.as_deref(), share.path.as_deref(), share.read_only),
+            (None, Some(Path::new("/lab/work")), true)
+        );
+        assert_eq!(
+            a.nics[0].attachment,
+            NicAttachment::TapRaw { queue_pairs: 2 }
+        );
         assert_eq!(d.ports[0].name, vmlab_agent_proto::PORT_NAME);
         let Boot::Firmware {
             firmware,
@@ -1322,7 +1374,7 @@ mod tests {
     }
 
     /// What the emulated machine cannot take is refused before a spawn: KVM,
-    /// a TAP, a TPM, a missing VARS file.
+    /// a vhost-net backend of a TAP, a TPM, a missing VARS file.
     #[test]
     fn what_an_aarch64_launch_cannot_describe_is_refused() {
         let r = aarch64(r#"profile = "linux-modern""#);
@@ -1332,9 +1384,9 @@ mod tests {
         let mut tap = aavmf_paths();
         tap.nics[0].backend = NicBackend::TapQueues {
             tap_fds: vec![3],
-            vhost_fds: vec![],
+            vhost_fds: vec![4],
         };
-        assert!(refused(&tap, QemuAccel::Tcg).contains("stream socket only"));
+        assert!(refused(&tap, QemuAccel::Tcg).contains("without vhost-net"));
         let no_vars = VmPaths {
             ovmf_vars: None,
             ..aavmf_paths()
