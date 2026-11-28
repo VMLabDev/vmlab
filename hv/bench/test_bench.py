@@ -845,6 +845,80 @@ class X86WorkloadTests(unittest.TestCase):
         self.assertEqual(lib.workloads("x86_64", suite="g2g1500"), lib.X86_G2G1500_WORKLOADS)
         self.assertEqual(lib.workloads("x86_64", suite="g2g-multiflow"), lib.X86_G2G_MULTIFLOW_WORKLOADS)
 
+    def test_idle_suite_measures_cpu_and_kvm_exits_lower_is_better(self):
+        self.assertEqual(lib.workloads("x86_64", "windows-server-2025", "idle"),
+                         lib.X86_IDLE_WORKLOADS)
+        for name in lib.X86_IDLE_WORKLOADS[1:]:
+            self.assertEqual(lib.DIRECTION[name], "lower")
+            self.assertIn(name, lib.D28_BAR)
+        zero = dict.fromkeys(lib.KVM_STAT_NAMES, 0)
+        later = {"exits": 6000, "halt_exits": 1200, "irq_exits": 600,
+                 "hypercalls": 300, "io_exits": 60, "mmio_exits": 120}
+        self.assertEqual(lib.idle_rates(10.0, 13.0, zero, later, 60.0), {
+            "idle_cpu_pct": 5.0, "idle_exits_per_s": 100.0,
+            "idle_halt_exits_per_s": 20.0, "idle_irq_exits_per_s": 10.0,
+            "idle_hypercalls_per_s": 5.0, "idle_user_exits_per_s": 3.0,
+        })
+        self.assertEqual(lib.idle_rates(0.0, 0.6, None, later, 60.0), {"idle_cpu_pct": 1.0})
+
+    def serve_once(self, path, script):
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(path)
+        server.listen(1)
+        seen = []
+
+        def serve():
+            conn, _ = server.accept()
+            with conn, conn.makefile("rwb") as f:
+                for read_first, reply in script:
+                    if read_first:
+                        seen.append(json.loads(f.readline()))
+                    for line in reply:
+                        f.write((json.dumps(line) + "\n").encode())
+                    f.flush()
+            server.close()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return thread, seen
+
+    def test_hv_kvm_stats_sum_the_report_vcpus_and_remove_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = os.path.join(tmp, "crash-1.json")
+            with open(report, "w") as f:
+                json.dump({"vm": {"kvm_stats": {"vm": {}, "vcpus": [
+                    {"id": 0, "counters": {"exits": 5, "halt_exits": 2, "io_exits": 1}},
+                    {"id": 1, "counters": {"exits": 7, "halt_exits": 3, "hypercalls": 4}},
+                ]}}}, f)
+            hello = {"type": "hello", "proto_version": lib.HV_PROTO_VERSION, "hv_version": "t"}
+            thread, seen = self.serve_once(os.path.join(tmp, "c.sock"), [
+                (True, [hello]),
+                (True, [{"type": "reply", "id": 1, "outcome": "ok"},
+                        {"type": "event", "event": "diagnostics_dumped", "path": report}]),
+            ])
+            stats = lib.hv_kvm_stats(os.path.join(tmp, "c.sock"), timeout=5)
+            thread.join(5)
+            self.assertEqual(seen[1]["command"], {"command": "dump_diagnostics"})
+            self.assertEqual(stats, {"exits": 12, "halt_exits": 5, "irq_exits": 0,
+                                     "hypercalls": 4, "io_exits": 1, "mmio_exits": 0})
+            self.assertFalse(os.path.exists(report))
+
+    def test_qemu_kvm_stats_sum_query_stats_vcpus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = [{"provider": "kvm", "qom-path": f"/machine/cpu{i}",
+                      "stats": [{"name": "exits", "value": 10 * (i + 1)},
+                                {"name": "halt_exits", "value": i}]} for i in range(2)]
+            thread, seen = self.serve_once(os.path.join(tmp, "q.sock"), [
+                (False, [{"QMP": {"version": {}, "capabilities": []}}]),
+                (True, [{"return": {}, "id": 1}]),
+                (True, [{"return": stats, "id": 2}]),
+            ])
+            sums = lib.qemu_kvm_stats(os.path.join(tmp, "q.sock"), timeout=5)
+            thread.join(5)
+            self.assertEqual(seen[1]["execute"], "query-stats")
+            self.assertEqual(seen[1]["arguments"]["target"], "vcpu")
+            self.assertEqual(sums["exits"], 30)
+            self.assertEqual(sums["halt_exits"], 1)
+
     def test_new_network_suites_preserve_jumbo_samples_and_bars(self):
         self.assertEqual(lib.G2G_SUITES["g2g"]["mtu"], 65520)
         self.assertEqual(lib.G2G_SUITES["g2g"]["flows"], 1)
@@ -921,7 +995,8 @@ class X86WorkloadTests(unittest.TestCase):
         self.assertEqual(lib.DIRECTION["idle_cpu_pct"], "lower")
 
     def test_d28_bars_cover_the_x86_suite(self):
-        every = set(lib.X86_UBUNTU_WORKLOADS) | set(lib.X86_WINDOWS_WORKLOADS) | set(lib.X86_G2G_WORKLOADS)
+        every = (set(lib.X86_UBUNTU_WORKLOADS) | set(lib.X86_WINDOWS_WORKLOADS)
+                 | set(lib.X86_G2G_WORKLOADS) | set(lib.X86_IDLE_WORKLOADS))
         self.assertEqual(set(lib.D28_BAR), every)
         self.assertEqual(lib.D28_BAR["boot_to_agent_ready"], ("<=", 1.00))
         for name in lib.X86_UBUNTU_WORKLOADS + lib.X86_G2G_WORKLOADS:
