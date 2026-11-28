@@ -342,10 +342,14 @@ impl VirtioPciDevice {
         let device_id = MODERN_DEVICE_ID_BASE + device.device_type() as u16;
         config[0x00..0x02].copy_from_slice(&VIRTIO_VENDOR_ID.to_le_bytes());
         config[0x02..0x04].copy_from_slice(&device_id.to_le_bytes());
-        // Class 2 (network) for a NIC as the spec asks; the rest are
-        // unclassified, which is the modern default.
+        // Class 2 (network) for a NIC as the spec asks, and mass storage
+        // (other) for virtio-fs, as QEMU presents it: Linux assigns no BAR
+        // to a function without a class, which on a machine without
+        // firmware (`virt` with a kernel boot) leaves it unusable (#1227).
+        // The rest are unclassified, which is the modern default.
         let class_code: u32 = match device.device_type() {
             1 => 0x0200_0000,
+            26 => 0x0180_0000,
             _ => 0,
         };
         config[0x08..0x0C].copy_from_slice(&(class_code | MODERN_REVISION).to_le_bytes());

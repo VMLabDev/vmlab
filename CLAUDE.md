@@ -103,7 +103,8 @@ replacement; what vmlab-hv refuses is an error with no fallback; a host
 without usable `/dev/kvm` fails with `KVM is required`. **aarch64 VMs run on
 vmlab-hv's emulator** (§22.5, phase 3d): the `virt` machine on AAVMF, a 2D
 virtio-gpu (`virtio-gpu-pci`) and an xHCI with the USB tablet and keyboard
-(#1225), devices in QEMU's `virt` slots (`describe::virt`), existing QEMU
+(#1225), in-process virtio-fs shares and TAP queues served in userspace, never
+vhost-net (#1227), devices in QEMU's `virt` slots (`describe::virt`), existing QEMU
 identities migrating at the next start; QEMU runs one only to troubleshoot,
 and what vmlab-hv refuses of one fails `up` or `vm start` naming each device,
 with no fallback (#1224). QEMU keeps riscv64 on the `virt` machine

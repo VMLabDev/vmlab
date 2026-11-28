@@ -293,3 +293,121 @@ fn passed_tap_and_vhost_queues_exchange_traffic_and_restore() {
         guest.quit_and_exit_zero();
     }
 }
+
+/// A TAP NIC of the emulated aarch64 `virt` machine (#1227): its queues are
+/// served in userspace, whose writes into guest RAM the emulator sees, and a
+/// vhost-net backend, which writes guest RAM from the kernel, is refused.
+#[test]
+fn an_emulated_aarch64_guest_passes_traffic_on_tap_queues_and_refuses_vhost() {
+    if std::env::var("VMLAB_HV_TEST_TAP").as_deref() != Ok("1") {
+        eprintln!("skip aarch64 TAP S1: set VMLAB_HV_TEST_TAP=1 in a private network namespace");
+        return;
+    }
+    let assets = vmlab_hv_tests::probe_assets_aarch64();
+    if let Some(reason) = assets.skip_reason() {
+        eprintln!("skip aarch64 TAP S1: {reason}");
+        return;
+    }
+    let (name, fds) = match tap_queues(1) {
+        Ok(result) => result,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
+            eprintln!("skip aarch64 TAP S1: creating test-owned TAP needs CAP_NET_ADMIN: {error}");
+            return;
+        }
+        Err(error) => panic!("create test TAP: {error}"),
+    };
+    ip(&["addr", "add", "192.0.2.1/24", "dev", &name]);
+    ip(&["link", "set", "dev", &name, "mtu", "1500", "up"]);
+    let mut spec = MachineSpec::idle("s1-aarch64-tap").with_vnet_pairs(1);
+    spec.aarch64 = true;
+    spec.tap = true;
+    spec.tap_raw = true;
+    spec.paused = true;
+    let mut guest = vmlab_hv_tests::launch(&spec, &assets);
+    // Any descriptor stands for the vhost-net file: the refusal comes first.
+    let kernel: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    let vhost = Ctrl::NetAttach {
+        mac: mac_string(TEST_MAC),
+        queue_pairs: 1,
+        vhost: true,
+    };
+    let refused = guest
+        .control
+        .call_with_fds(vhost, &[fds[0].as_fd(), kernel.as_fd()])
+        .unwrap();
+    assert!(
+        matches!(&refused, Outcome::Error { code: ErrorCode::InvalidArgument, message }
+            if message.contains("vhost-net")),
+        "{refused:?}"
+    );
+    let command = Ctrl::NetAttach {
+        mac: mac_string(TEST_MAC),
+        queue_pairs: 1,
+        vhost: false,
+    };
+    let borrowed: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
+    let attached = guest.control.call_with_fds(command, &borrowed).unwrap();
+    assert!(matches!(attached, Outcome::Ok { .. }), "{attached:?}");
+    drop(borrowed);
+    drop(fds);
+    assert!(matches!(
+        guest.control.call(Ctrl::Resume).unwrap(),
+        Outcome::Ok { .. }
+    ));
+    let mut container = spec.container_spec();
+    container.nics = 0;
+    let mut ctl = CtlClient::connect(&guest.ctl_sock, Duration::from_secs(60)).unwrap();
+    ctl.send_spec(&container).unwrap();
+    ctl.wait_event(
+        &container,
+        Duration::from_secs(600),
+        |event| matches!(event, CtlEvent::Idle),
+        |_| {},
+        || guest.diagnostics("aarch64 TAP boot"),
+    );
+    let mut agent = AgentClient::connect(&guest.agent_sock, Duration::from_secs(600)).unwrap();
+    let output = agent
+        .exec(
+            &[
+                BUSYBOX,
+                "sh",
+                "-c",
+                "/.vmlab/busybox ip link set dev eth0 up && \
+                 /.vmlab/busybox ip addr add 192.0.2.2/24 dev eth0",
+            ],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(
+        output.exit_code, 0,
+        "aarch64 TAP guest configuration: {output:?}"
+    );
+    let echo = Echo::start();
+    let output = agent
+        .exec(
+            &[BUSYBOX, "ping", "-q", "-c", "10", "-W", "5", "192.0.2.1"],
+            Duration::from_secs(120),
+        )
+        .unwrap();
+    assert_eq!(
+        output.exit_code,
+        0,
+        "aarch64 TAP ping: {output:?}\n{}",
+        guest.diagnostics("aarch64 TAP ping")
+    );
+    let output = agent
+        .exec(
+            &[
+                BUSYBOX,
+                "sh",
+                "-c",
+                "printf 'tap-aarch64\\n' | /.vmlab/busybox nc -u -w 5 192.0.2.1 46000",
+            ],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(output.exit_code, 0, "aarch64 TAP UDP: {output:?}");
+    assert_eq!(output.stdout, b"tap-aarch64\n");
+    drop(echo);
+    guest.quit_and_exit_zero();
+}

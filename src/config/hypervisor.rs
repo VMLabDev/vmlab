@@ -337,9 +337,10 @@ fn vm_refusals(
 /// one to eight vCPUs on AAVMF, with virtio-blk disks and CD-ROMs, virtio-net
 /// NICs, the agent's virtio-serial port, a 2D virtio-gpu (QEMU's
 /// `virtio-gpu-pci`, which `virtio-vga` becomes on `virt`) and the xHCI of
-/// the USB tablet and keyboard. It has no other display device, no USB
-/// passthrough, TPM, sound or virtio-fs yet. A VM with no display device
-/// runs headless, on its serial console.
+/// the USB tablet and keyboard, its virtio-fs shares served in process and
+/// its NICs on a stream or on TAP queues served in userspace (#1227). It has
+/// no other display device, no USB passthrough, TPM or sound yet. A VM with
+/// no display device runs headless, on its serial console.
 fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
     use crate::profiles::AgentTransport;
     let mut refuse = |what: &str, fix: &str| {

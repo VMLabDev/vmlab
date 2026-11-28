@@ -429,6 +429,33 @@ fn a_description_that_is_not_a_virt_machine_is_refused_by_name() {
     refused(&|d| d.display = Some(rom.clone()), "no ROM");
     refused(&|d| d.usb_keyboard = true, "usb_keyboard");
     refused(&|d| d.usb = Some(at(7)), "`usb`");
+    // A TAP NIC and an in-process share are a part of virt (#1227); a
+    // share of an external virtiofsd is not.
+    let mut attached = good.clone();
+    attached.nics.push(vmlab_hv_proto::machine::Nic {
+        model: vmlab_hv_proto::machine::NicModel::Virtio,
+        rom: None,
+        pci: Some(at(3)),
+        mac: "52:54:00:00:00:01".into(),
+        mtu: None,
+        attachment: vmlab_hv_proto::machine::NicAttachment::TapRaw { queue_pairs: 1 },
+    });
+    attached.shares.push(vmlab_hv_proto::machine::FsShare {
+        pci: Some(at(4)),
+        tag: "work".into(),
+        socket: None,
+        path: Some(dir.path().to_path_buf()),
+        read_only: false,
+    });
+    assert!(crate::validate(&attached).is_ok());
+    let external = vmlab_hv_proto::machine::FsShare {
+        pci: Some(at(4)),
+        tag: "work".into(),
+        socket: Some(dir.path().join("virtiofsd.sock")),
+        path: None,
+        read_only: false,
+    };
+    refused(&|d| d.shares = vec![external.clone()], "external virtiofsd");
     // An x86 machine takes no virtio-gpu without VGA.
     let mut q35 = shown.clone();
     q35.arch = Arch::X86_64;
