@@ -665,6 +665,8 @@ pub(crate) fn vm(
         DisplayDevice::CirrusVga => roms.vgabios_cirrus.clone(),
         // OVMF drives it through its GOP; no legacy VGA BIOS.
         DisplayDevice::VmwareSvga => None,
+        // The aarch64 `virt` machine's device, never chosen here.
+        DisplayDevice::VirtioGpu => None,
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
     // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead. Under
@@ -835,11 +837,13 @@ pub(crate) fn vm(
 /// machine on AAVMF (§22, phase 3d). Its template was built under QEMU's
 /// `virt`, so each PCI function takes the slot QEMU's argv gave it
 /// ([`crate::qemu::build_args`]): the agent's virtio-serial controller, the
-/// disks, the CD-ROMs as read-only virtio-blk, then the NICs. The display
-/// device and the xHCI QEMU adds after them are left out — the machine has
-/// neither yet, so the guest runs headless on its PL011 serial console — and
-/// so is every function after them. What [`vmlab_refusals`] refuses is
-/// refused again here, as the last word before a spawn.
+/// disks, the CD-ROMs as read-only virtio-blk, the NICs, the display — a 2D
+/// virtio-gpu, QEMU's `virtio-gpu-pci`, when the VM names one — and the
+/// xHCI of the tablet. `virt` has no PS/2 controller, so the xHCI always
+/// carries a USB keyboard too, where QEMU adds `usb-kbd` under
+/// `input = "usb"` only. A VM with no display device runs headless on its
+/// PL011 serial console. What [`vmlab_refusals`] refuses (any other display
+/// device among it) is refused again here, as the last word before a spawn.
 ///
 /// [`vmlab_refusals`]: crate::config::hypervisor::vmlab_refusals
 fn virt(
@@ -944,6 +948,17 @@ fn virt(
             },
         });
     }
+    let display = resolved.display_device.as_ref().map(|_| Display {
+        device: DisplayDevice::VirtioGpu,
+        gpu: None,
+        vram_bytes: vmlab_hv_proto::machine::default_gpu_vram_bytes(),
+        render_node: None,
+        pci: slots.next(),
+        rom: None,
+        socket: Some(paths.display_sock.clone()),
+        vnc_socket: Some(paths.vnc_sock.clone()),
+    });
+    let tablet = Some(slots.next());
     if slots.0 > 32 {
         bail!("vm \"{name}\": more PCI devices than `virt`'s bus 0 has slots for under vmlab-hv");
     }
@@ -958,14 +973,14 @@ fn virt(
         vmware_cpuid_freq: false,
         msr_policy: MsrPolicy::Fault,
         applesmc: None,
-        usb_keyboard: false,
+        usb_keyboard: true,
         smbios_type2: false,
         pit_ticks: PitTicks::Replay,
         // QEMU's `-cpu max` under TCG ignores `nested`, and so does this.
         cpu: CpuPolicy::Host,
         hyperv: Vec::new(),
-        display: None,
-        tablet: None,
+        display,
+        tablet,
         tpm: None,
         console_pci,
         ahci_pci: None,
@@ -1233,8 +1248,8 @@ mod tests {
     /// Phase 3d: an aarch64 VM is vmlab-hv's emulated `virt` machine on
     /// AAVMF, each function in the slot QEMU's `virt` argv gave it — the
     /// agent's virtio-serial 00:01.0, the disks, the CD-ROM as read-only
-    /// virtio-blk, then the NIC — and headless: the virtio GPU and the xHCI
-    /// QEMU adds after them are left out.
+    /// virtio-blk, the NIC, then the 2D virtio-gpu and the xHCI of the
+    /// tablet and the keyboard (#1225).
     #[test]
     fn an_aarch64_vm_is_the_emulated_virt_machine_in_qemus_slots() {
         let r = aarch64(r#"profile = "linux-modern" cpus = 2"#);
@@ -1265,7 +1280,19 @@ mod tests {
             NicAttachment::StreamVnet { .. }
         ));
         assert!(d.nics[0].rom.is_none());
-        assert!(d.display.is_none() && d.tablet.is_none() && d.usb.is_none());
+        let display = d.display.as_ref().expect("display");
+        assert_eq!(display.device, DisplayDevice::VirtioGpu);
+        assert_eq!(Some(display.pci), at(6));
+        assert!(display.gpu.is_none() && display.rom.is_none() && display.render_node.is_none());
+        assert_eq!(display.socket.as_deref(), Some(Path::new("/run/l/v/display.sock")));
+        assert_eq!((d.tablet, d.usb_keyboard, d.usb), (at(7), true, None));
+        // No display device: headless, and the xHCI takes the slot after
+        // the NIC.
+        let mut headless = r.clone();
+        headless.display_device = None;
+        let h = vm("l", &headless, &aavmf_paths(), QemuAccel::Tcg, &roms()).unwrap();
+        assert!(h.display.is_none());
+        assert_eq!(h.tablet, at(6));
         assert_eq!(d.ports[0].name, vmlab_agent_proto::PORT_NAME);
         let Boot::Firmware {
             firmware,

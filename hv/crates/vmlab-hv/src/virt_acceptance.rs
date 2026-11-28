@@ -1,6 +1,8 @@
 //! The aarch64 `virt` machine through the executable's control socket
 //! (seam S1; phase 3d, card C10): a guest of a few words that needs no host
-//! asset, and AAVMF to its UEFI shell on the serial log.
+//! asset, and AAVMF to its UEFI shell on the serial log. With a display
+//! (#1225): the display sockets beside the control socket, and AAVMF to its
+//! shell on the virtio GPU and the USB keyboard.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -466,5 +468,222 @@ fn snapshots_online_and_offline(jit: bool) {
             name: "online".into(),
         })
         .unwrap());
+    machine.quit();
+}
+
+/// A display at 00:06.0 and the xHCI of the tablet and the keyboard at
+/// 00:07.0, the slots that vmlab gives them after a NIC.
+fn with_display(description: &mut serde_json::Value) {
+    description["display"] = serde_json::json!({
+        "device": "virtio-gpu", "pci": {"bus": 0, "device": 6, "function": 0}, "rom": null,
+    });
+    description["tablet"] = serde_json::json!({"bus": 0, "device": 7, "function": 0});
+    description["usb_keyboard"] = serde_json::json!(true);
+}
+
+/// The input of a display client: keys, and the tablet.
+fn input_client(path: &Path) -> vmlab_hv_display::Client {
+    use vmlab_hv_display::{Capabilities, Client};
+    Client::connect(path, Capabilities(Capabilities::INPUT)).unwrap()
+}
+
+/// Press and release `qcode` over the display socket.
+fn tap(client: &vmlab_hv_display::Client, qcode: &str) {
+    for down in [true, false] {
+        client
+            .send(&vmlab_hv_display::Message::Key {
+                qcode: qcode.into(),
+                down,
+            })
+            .unwrap();
+    }
+}
+
+/// #1225 at S1 without a host asset: a `virt` machine with a virtio GPU,
+/// the tablet and the USB keyboard says that it has a display and input on
+/// its control socket and serves both display sockets beside it. Before a
+/// guest driver sets a scanout the screen is the placeholder. Keys and the
+/// pointer go in while the guest runs, and an online snapshot of the
+/// machine with the two functions saves and loads.
+#[test]
+fn a_virt_machine_with_a_display_serves_its_screen_and_its_input() {
+    use vmlab_hv_display::{FrameFlags, Message};
+    use vmlab_hv_proto::control::Capability;
+    let dir = tempfile::Builder::new()
+        .prefix("hv-virt-gpu-")
+        .tempdir()
+        .unwrap();
+    let kernel = counting_kernel(dir.path());
+    let mut desc = description(
+        dir.path(),
+        1,
+        64,
+        serde_json::json!({"kind": "kernel", "kernel": kernel, "initrd": null, "cmdline": ""}),
+    );
+    with_display(&mut desc);
+    let disk = dir.path().join("disk0.qcow2");
+    vmlab_disk::ops::create_qcow2(&disk, 16 << 20, None, None).unwrap();
+    desc["disks"] = serde_json::json!([{
+        "id": "disk0", "path": disk, "format": "qcow2", "read_only": false, "vmstate": true,
+    }]);
+    let mut machine = Machine::start(dir.path(), &desc);
+    for capability in [Capability::Display, Capability::Input] {
+        assert!(
+            machine.client.has_capability(capability),
+            "{capability:?}: {:?}",
+            machine.client.capabilities()
+        );
+    }
+    let native = dir.path().join("display.sock");
+    assert!(dir.path().join("vnc.sock").exists());
+    let screen = crate::display_acceptance::screenshot(&native);
+    assert!(screen.flags.has(FrameFlags::PLACEHOLDER));
+    assert_eq!((screen.width, screen.height), (640, 480));
+
+    let at_start = machine.run_a_while();
+    ok(machine.client.call(Control::Resume).unwrap());
+    let input = input_client(&native);
+    tap(&input, "a");
+    for (x, y) in [(0, 0), (320, 240), (639, 479)] {
+        input
+            .send(&Message::PointerAbs {
+                x,
+                y,
+                width: 640,
+                height: 480,
+            })
+            .unwrap();
+    }
+    input.send(&Message::Buttons { mask: 1 }).unwrap();
+    input.send(&Message::Buttons { mask: 0 }).unwrap();
+    drop(input);
+    ok(machine.client.call(Control::Pause).unwrap());
+    assert!(
+        machine.count() > at_start,
+        "the guest stopped: {}",
+        machine.diagnostics()
+    );
+    ok(machine
+        .client
+        .call(Control::SnapshotSave {
+            name: "display".into(),
+        })
+        .unwrap());
+    ok(machine
+        .client
+        .call(Control::SnapshotLoad {
+            name: "display".into(),
+        })
+        .unwrap());
+    let after = machine.run_a_while();
+    assert!(after > 0, "{}", machine.diagnostics());
+    machine.quit();
+}
+
+/// The keys that take this AAVMF from its boot manager to its shell, as in
+/// `TO_THE_SHELL`, typed on the USB keyboard as qcodes.
+const TO_THE_SHELL_ON_USB: [(&str, &str); 4] = [
+    ("Press any key to enter the Boot Manager Menu", "x"),
+    ("EFI Internal Shell", "down"),
+    ("EFI Internal Shell", "ret"),
+    ("any other key to continue", "ret"),
+];
+
+/// #1225, the proof at S1: AAVMF, unchanged, drives the virtio GPU and
+/// reads the USB keyboard of the xHCI. Keys typed over the display socket
+/// take it from its boot manager to the prompt of its UEFI shell, which the
+/// serial log shows, and the screen over the same socket is the firmware's
+/// console, not the placeholder.
+#[test]
+#[cfg_attr(
+    vmlab_ci_no_host_assets,
+    ignore = "requires the AAVMF images of guest/fetch-firmware.sh"
+)]
+fn aavmf_shows_its_console_on_the_virtio_gpu_and_reads_the_usb_keyboard() {
+    use vmlab_hv_display::FrameFlags;
+    let Some((code, pristine)) = aavmf() else {
+        eprintln!(
+            "skipping: AAVMF is absent; run guest/fetch-firmware.sh aarch64 or set VMLAB_HV_FIRMWARE_DIR_AARCH64"
+        );
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("hv-virt-gpu-")
+        .tempdir()
+        .unwrap();
+    let vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::copy(pristine, &vars).unwrap();
+    let mut description = description(
+        dir.path(),
+        1,
+        1024,
+        serde_json::json!({"kind": "firmware", "firmware": "aavmf", "code": code, "vars": vars}),
+    );
+    with_display(&mut description);
+    let mut machine = Machine::start(dir.path(), &description);
+    let native = dir.path().join("display.sock");
+    let keys = input_client(&native);
+    ok(machine.client.call(Control::Resume).unwrap());
+    let timeout = std::env::var("VMLAB_HV_VIRT_TIMEOUT")
+        .ok()
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(600);
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let mut step = 0;
+    let mut sent = Instant::now();
+    while !machine.serial().contains("Shell>") {
+        if let Some((text, qcode)) = TO_THE_SHELL_ON_USB.get(step)
+            && machine.serial().contains(text)
+            && sent.elapsed() > Duration::from_millis(500)
+        {
+            tap(&keys, qcode);
+            step += 1;
+            sent = Instant::now();
+        }
+        assert!(
+            machine.process.try_wait().unwrap().is_none(),
+            "vmlab-hv ended before the UEFI shell: {}",
+            machine.diagnostics()
+        );
+        if Instant::now() >= deadline {
+            let _ = machine.client.call(Control::Quit);
+            let _ = machine.process.wait();
+            panic!(
+                "no UEFI shell in {timeout} seconds, {step} keys typed: {}",
+                machine.diagnostics()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let screen = crate::display_acceptance::screenshot(&native);
+    assert!(
+        !screen.flags.has(FrameFlags::PLACEHOLDER),
+        "AAVMF set no scanout: {}",
+        machine.diagnostics()
+    );
+    let lit = screen
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[..3] != [0; 3])
+        .count();
+    assert!(
+        lit > 0,
+        "the firmware console of {}x{} is black",
+        screen.width,
+        screen.height
+    );
+    if let Some(directory) = std::env::var_os("VMLAB_HV_DISPLAY_ARTIFACTS") {
+        crate::display_acceptance::diagnostic_screenshot(
+            &native,
+            &PathBuf::from(directory).join("aavmf-virt-gpu.ppm"),
+        );
+    }
+    eprintln!(
+        "AAVMF reached its shell on the USB keyboard; its console is {}x{} with {lit} lit pixels",
+        screen.width, screen.height
+    );
+    drop(keys);
     machine.quit();
 }
