@@ -2955,7 +2955,7 @@ template "t" { arch = "x86" version = "1" disk = 1GiB cpu_model = ""
         // Any non-empty name is QEMU's to judge, not vmlab's.
         let es = errs(
             r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "aarch64/t" cpu_model = "Westmere,+aes" } }"#,
+lab "l" { vm "a" { template = "aarch64/t" hypervisor = "qemu" cpu_model = "Westmere,+aes" } }"#,
         );
         assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
     }
@@ -3038,7 +3038,7 @@ template "w98" { arch = "x86" version = "1" disk = 1GiB nested = true cpu_model 
             r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" nested = true } }"#,
             r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "aarch64/t" cpu_model = "pentium3" } }"#,
+lab "l" { vm "a" { template = "aarch64/t" hypervisor = "qemu" cpu_model = "pentium3" } }"#,
         ] {
             let es = hw_errs(&Hardware::blank(), src);
             assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
@@ -3061,7 +3061,7 @@ template "t" { arch = "x86" version = "1" disk = 1GiB accel = "whpx"
         }
         for ok in ["kvm", "tcg"] {
             let es = errs(&format!(
-                "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"aarch64/t\" accel = \"{ok}\" }} }}"
+                "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"aarch64/t\" hypervisor = \"qemu\" accel = \"{ok}\" }} }}"
             ));
             assert!(es.iter().all(|m| !m.contains("accel")), "{es:#?}");
         }
@@ -5560,6 +5560,30 @@ lab "l" {
             .map(|i| i.message)
             .collect();
         assert_eq!(es, ["w: no virtiofsd"], "{es:#?}");
+    }
+
+    /// An aarch64 VM vmlab-hv refuses is an error at `up` naming each
+    /// device the `virt` machine lacks, with no QEMU fallback (§22.5); one
+    /// whose only gap is the display validates, and an explicit QEMU stays.
+    #[test]
+    fn an_aarch64_vm_vmlab_hv_refuses_is_an_error_naming_the_device() {
+        let base = r#"template = "scratch" arch = "aarch64" profile = "linux-modern" disk = 10GiB"#;
+        let es = hv_errs(
+            &HvHost::kvm(),
+            &format!(
+                r#"vm "arm" {{ {base} usb = true tpm = true }}
+  vm "plain" {{ {base} }}
+  vm "pinned" {{ {base} hypervisor = "qemu" usb = true }}"#
+            ),
+        );
+        assert_eq!(es.len(), 2, "{es:#?}");
+        for word in ["`usb = true`", "a TPM"] {
+            assert!(
+                es.iter()
+                    .any(|e| e.contains("vm \"arm\"") && e.contains(word) && e.contains("`virt`")),
+                "{word}: {es:#?}"
+            );
+        }
     }
 
     #[test]

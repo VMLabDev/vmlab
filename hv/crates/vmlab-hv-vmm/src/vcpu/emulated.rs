@@ -27,9 +27,12 @@ use super::guest_bus::GuestBus;
 use super::{Conduit, Exit, Hypercall, HypercallOutcome, Kick, VcpuBackend, VcpuState, Waker};
 use crate::vm::ExitReason;
 
-/// The instructions of one slice. A kick, and an interrupt that another
-/// thread raised, wait for the end of a slice.
-const SLICE: u64 = 1 << 16;
+/// The most instructions of one slice (#1217). A slice ends sooner at the
+/// deadline of the timer of the CPU, after a write of a timer register, and
+/// at a kick: an interrupt that another thread raises, mail of another vCPU
+/// and a pause kick the core, which leaves its compiled code at the next
+/// block head and takes them there, inside the slice.
+const SLICE: u64 = 1 << 20;
 /// The slice while the trace log is on.
 const DEBUG_SLICE: u64 = 64;
 /// With the JIT on, a line of its counts after this many instructions.
@@ -298,7 +301,7 @@ impl EmulatedVcpu {
         self.jit_report = self.cpu.instructions + JIT_REPORT;
         let jit = self.cpu.jit_counts();
         log::info!(
-            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses, {} flushes, {} scans, {} ms flushing; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting; compiles: {} first, {} after a drop of the region, {} after an invalidation, {} after an eviction, {} drops for the memory; translations: {} blocks, {} ms; returns: {} jump cache misses served in code, {} at a block that the loop ends, {} with nothing to chain to, {} at the budget, {} kicked; {} changes of the address space kept the jump cache; superblocks: {} joins, {} side exits",
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses, {} flushes, {} scans, {} ms flushing; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting; compiles: {} first, {} after a drop of the region, {} after an invalidation, {} after an eviction, {} drops for the memory; translations: {} blocks, {} ms; returns: {} jump cache misses served in code, {} at a block that the loop ends, {} with nothing to chain to, {} at the budget, {} kicked; {} changes of the address space kept the jump cache; superblocks: {} joins, {} side exits; terminals: {} served in code, {} served then left; by kind, returned/served: {}",
             self.id,
             self.cpu.instructions,
             jit.interpreted_instructions,
@@ -350,6 +353,14 @@ impl EmulatedVcpu {
             jit.jump_spaces,
             jit.joins,
             jit.side_exits,
+            jit.terminal_served.iter().sum::<u64>(),
+            jit.returns_trapped,
+            vmlab_hv_tcg_aarch64::exec::TERMINAL_KIND_NAMES
+                .iter()
+                .zip(jit.terminal_returns.iter().zip(&jit.terminal_served))
+                .map(|(name, (returned, served))| format!("{name} {returned}/{served}"))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         let waits = &jit.machine.waits;
         if waits.code_page.count + waits.code_mail.count + waits.all.count > 0
@@ -450,7 +461,15 @@ impl VcpuBackend for EmulatedVcpu {
         // what the stderr log writes, not what the recorder keeps.
         let short = crate::diagnostics::report::stderr_enabled(log::Level::Trace, module_path!());
         let before = self.cpu.exceptions;
-        let stop = self.cpu.run(if short { DEBUG_SLICE } else { SLICE });
+        let mut slice = if short { DEBUG_SLICE } else { SLICE };
+        // The windows of the lockstep are written at the end of a slice: one
+        // ends where the next window is due.
+        if let Some(windows) = &self.windows
+            && let Some(left) = windows.left(self.cpu.instructions)
+        {
+            slice = slice.min(left.max(1));
+        }
+        let stop = self.cpu.run(slice);
         if debug
             && self.cpu.exceptions != before
             && let Some(taken) = self.cpu.taken

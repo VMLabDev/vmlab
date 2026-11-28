@@ -8,6 +8,15 @@
  * hex, and the maps and the thread names of the process are copied beside
  * it, for ipstack.py.
  *
+ * IPSTACK_WORDS=N (card #1212) also copies the first N words of the user
+ * stack of each sample and writes them after a "|": a leaf that keeps no
+ * frame (the memmove and memset of glibc) has its return address there, at
+ * the stack pointer, where the frame-pointer chain does not see it. The
+ * line then ends with "@<ns>", the time of the sample on CLOCK_MONOTONIC (the
+ * kernel refuses CLOCK_REALTIME for a hardware event), and OUT.clock holds
+ * "<realtime ns> <monotonic ns>" read together at the start, so that a
+ * window of a few seconds (a bench workload) can be cut out.
+ *
  * Build: cc -O2 -o ipstack ipstack.c
  * Use:   ipstack PID SECONDS OUT   (writes OUT.stacks, OUT.maps, OUT.threads)
  */
@@ -83,6 +92,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     size_t page = sysconf(_SC_PAGESIZE);
+    long words = getenv("IPSTACK_WORDS") ? atol(getenv("IPSTACK_WORDS")) : 0;
+    if (words < 0 || words > 64) words = 0;
     struct dirent *de;
     while ((de = readdir(d)) && nev < EVENTS) {
         if (de->d_name[0] == '.') continue;
@@ -107,6 +118,12 @@ int main(int argc, char **argv) {
         attr.exclude_kernel = 1;
         attr.exclude_guest = 1;
         attr.exclude_callchain_kernel = 1;
+        if (words) {
+            attr.sample_type |= PERF_SAMPLE_TIME | PERF_SAMPLE_STACK_USER;
+            attr.use_clockid = 1;
+            attr.clockid = CLOCK_MONOTONIC;
+            attr.sample_stack_user = (uint32_t)(words * 8);
+        }
         int fd = (int)syscall(__NR_perf_event_open, &attr, tid, -1, -1, 0);
         if (fd < 0) continue;
         void *ring = mmap(NULL, (PAGES + 1) * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -120,6 +137,18 @@ int main(int argc, char **argv) {
         nev++;
     }
     closedir(d);
+    if (words) {
+        struct timespec real, mono;
+        clock_gettime(CLOCK_REALTIME, &real);
+        clock_gettime(CLOCK_MONOTONIC, &mono);
+        snprintf(name, sizeof(name), "%s.clock", out);
+        FILE *clock = fopen(name, "w");
+        if (clock) {
+            fprintf(clock, "%lld %lld\n", (long long)real.tv_sec * 1000000000LL + real.tv_nsec,
+                    (long long)mono.tv_sec * 1000000000LL + mono.tv_nsec);
+            fclose(clock);
+        }
+    }
     snprintf(name, sizeof(name), "%s.threads", out);
     FILE *threads = fopen(name, "w");
     if (threads) {
@@ -170,15 +199,32 @@ int main(int argc, char **argv) {
                     uint32_t ids[2];
                     ring_copy(data, mask, at, &ip, 8);
                     ring_copy(data, mask, at + 8, ids, 8);
-                    ring_copy(data, mask, at + 16, &nr, 8);
+                    /* PERF_SAMPLE_TIME comes after the ids, when it is on. */
+                    uint64_t when = 0, skip = words ? 8 : 0;
+                    if (words) ring_copy(data, mask, at + 16, &when, 8);
+                    ring_copy(data, mask, at + 16 + skip, &nr, 8);
+                    uint64_t stack_at = at + 24 + skip + nr * 8;
                     if (nr > 512) nr = 512;
-                    ring_copy(data, mask, at + 24, chain, nr * 8);
+                    ring_copy(data, mask, at + 24 + skip, chain, nr * 8);
                     fprintf(stacks, "%x %" PRIx64, ids[1], ip);
                     for (uint64_t k = 0; k < nr; k++) {
                         /* The context markers (PERF_CONTEXT_USER and the
                          * others) are the top 4095 values. */
                         if (chain[k] >= (uint64_t)-4095) continue;
                         if (k == 0 || chain[k] != ip) fprintf(stacks, " %" PRIx64, chain[k]);
+                    }
+                    if (words) {
+                        /* PERF_SAMPLE_STACK_USER: the size, the bytes, then
+                         * the size that was copied (dyn_size). */
+                        uint64_t size, top[64], dyn = 0;
+                        ring_copy(data, mask, stack_at, &size, 8);
+                        if (size) ring_copy(data, mask, stack_at + 8 + size, &dyn, 8);
+                        if (dyn > size) dyn = size;
+                        if (dyn > sizeof(top)) dyn = sizeof(top);
+                        ring_copy(data, mask, stack_at + 8, top, dyn);
+                        fputs(" |", stacks);
+                        for (uint64_t k = 0; k < dyn / 8; k++) fprintf(stacks, " %" PRIx64, top[k]);
+                        fprintf(stacks, " @%" PRIu64, when);
                     }
                     fputc('\n', stacks);
                     samples++;

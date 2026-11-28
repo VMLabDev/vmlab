@@ -2740,7 +2740,7 @@ Every machine runs on exactly one hypervisor: **QEMU**, driven over QMP, or
 driven over its own control protocol. Since §22.4, vmlab-hv is the only
 hypervisor for x86 and x86_64 guests. Since §22.5 it runs aarch64 guests too,
 on its own emulator, and QEMU runs riscv64 guests and an aarch64 guest that
-vmlab-hv refuses or a setting puts there to troubleshoot. ADR-0021 records the decision; the
+a setting puts there to troubleshoot. ADR-0021 records the decision; the
 Hypervisor seam (ADR-0001, ADR-0020) is what lets both run behind one
 lifecycle.
 
@@ -2749,8 +2749,8 @@ lifecycle.
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
 automatic for both kinds. Automatic selection uses the existing identity,
 including the x86 migration (§22.3) and the aarch64 one (§22.5), and selects
-vmlab-hv for every new x86 machine and for an aarch64 one it refuses nothing,
-and QEMU for any other (§22.1, §22.4, §22.5). The field is declared on the machine only and
+vmlab-hv for every new x86 machine and every new aarch64 VM, whose refusals
+are errors, and QEMU for any other (§22.1, §22.4, §22.5). The field is declared on the machine only and
 never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
@@ -3130,36 +3130,43 @@ setting, and not as a product path. riscv64 stays on QEMU until phase 3b.
 - **Firmware.** The AAVMF pair is looked up as for QEMU (§5.2): the host
   config's `firmware_dir`, vmlab's bundle, then the distro's. Each VM has its
   own VARS copy. The x86 OVMF size check does not apply.
-- **No display yet.** The machine has no display device, input device or
-  USB controller. A profile's display device is left out, not refused: the
-  guest runs headless on its serial console (`vmlab logs`), and is reached
-  with `vmlab exec` and `vmlab shell`. `vm screenshot`, `vm type` and the
-  other screen and input verbs, `vmlab record` and `--record` say the machine
-  has no display, and `machine.capabilities` reports none. Because a VM that
-  ran on QEMU had a screen, `up` and `vm start` warn, for a VM whose hardware
-  names a display device, that it runs headless, what that takes away, and
-  that `hypervisor = "qemu"` keeps a screen. The install CD-ROM is a read-only
-  virtio disk on either hypervisor, and an eject of it is refused by name.
+- **Display and input.** The display is a 2D virtio-gpu without VGA, QEMU's
+  `virtio-gpu-pci` (a profile's `virtio-vga` or `virtio-gpu` resolves to it
+  on `virt`), in the slot after the NICs, served on `display.sock` and
+  `vnc.sock` as every vmlab-hv display is. The xHCI in the slot after it
+  carries the USB tablet and a USB keyboard: `virt` has no PS/2 controller,
+  so the keyboard is always there, also where QEMU adds `usb-kbd` only under
+  `input = "usb"`. AAVMF draws its console on the GPU and reads the
+  keyboard. `vm screenshot`, `vm type` and the other screen and input verbs,
+  `vmlab record`, `--record` and `gui = true` work. Any other display device
+  is refused like any other device the machine lacks (#1225). A VM with no
+  display device runs headless on its serial console (`vmlab logs`), is
+  reached with `vmlab exec` and `vmlab shell`, and its screen and input
+  verbs say the machine has no display. The install CD-ROM is a read-only virtio disk on either hypervisor, and an
+  eject of it is refused by name.
 - **Refusals.** vmlab-hv refuses, for an aarch64 VM: a host that is not
   x86_64; `accel = "kvm"`; `qemu_args`; a machine other than `virt`; firmware
-  other than UEFI; more than eight vCPUs or less than 64 MiB; a `gpu {}`
-  block; `usb = true`; a TPM; `audio`; a `cpu_model`; a NIC model other than
+  other than UEFI; more than eight vCPUs or less than 64 MiB; a display
+  device other than the virtio-gpu; a `gpu {}` block; `usb = true`; a TPM; `audio`; a `cpu_model`; a NIC model other than
   virtio-net; `agent_transport = "isa-serial"`; an Apple SMC; and a floppy.
   `accel = "tcg"` is accepted and changes nothing. A share is never virtio-fs
   on this machine: `transport = "auto"` places it on SMB, and an explicit
   `transport = "virtiofs"` fails the start. A NIC takes the stream socket,
   never the kernel fast path's TAP queues.
-- **Selection.** Automatic selection puts a new aarch64 VM on vmlab-hv when
-  `vmlab_refusals` names no reason, and otherwise on QEMU with the reason in
-  `status`, as §22.1 says for a machine of another architecture. An explicit
+- **Selection.** Automatic selection puts every new aarch64 VM on vmlab-hv.
+  There is no QEMU fallback: when `vmlab_refusals` names a reason,
+  `vmlab validate`, `up` and `vm start` fail with the refusal, which names
+  the VM and each device the `virt` machine lacks, as §22.4 says for an x86
+  machine. An explicit
   `hypervisor = "qemu"` or a host default `hypervisor { vm = "qemu" }` puts it
   on QEMU, which is how a lab uses QEMU to troubleshoot.
 - **Existing machines.** An aarch64 VM whose identity is QEMU, saved or
-  inferred from its disks, moves to vmlab-hv at its next start when
-  `vmlab_refusals` names no reason, under the rules of §22.3: `status` shows
-  vmlab-hv before the switch is saved, the start checks the hardware, saves
-  the switch before boot, and `up` announces it once. When vmlab-hv refuses
-  it, it stays on QEMU and `status` names the reason. Offline snapshots carry
+  inferred from its disks, moves to vmlab-hv at its next start under the
+  rules of §22.3: `status` shows vmlab-hv before the switch is saved, the
+  start checks the hardware, saves the switch before boot, and `up` announces
+  it once. When vmlab-hv refuses it, the start fails with the refusal and
+  keeps the old identity. It does not stay on QEMU; an explicit
+  `hypervisor = "qemu"` puts it there to troubleshoot. Offline snapshots carry
   over. Online QEMU snapshots are refused by name, with §22.3's instructions.
 - **Known limit.** Emulated aarch64 is slow next to KVM, and a heavily
   loaded host can push a guest's boot past its own timeouts: Fedora 44 at one

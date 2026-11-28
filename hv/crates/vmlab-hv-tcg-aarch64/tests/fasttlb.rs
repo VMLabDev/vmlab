@@ -176,6 +176,65 @@ fn a_load_and_a_store_of_ram_fill_the_tables_of_their_level_and_then_hit() {
 }
 
 #[test]
+fn an_access_that_is_not_aligned_hits_in_its_page_and_misses_across_it() {
+    // N10 (card T3-D1): a load at an address that is not a multiple of 8
+    // hits once its page is in the table, and a store that crosses into the
+    // next page misses every time, though both pages are mapped.
+    let mut machine = Machine::new(&[ldr(1, 0), str(1, 2), HVC]);
+    machine.map(VA, DATA | AF | NO_EXECUTE);
+    machine.map(VA + 0x1000, OTHER | AF | NO_EXECUTE);
+    let value = 0x1122_3344_5566_7788u64;
+    machine
+        .cpu
+        .memory
+        .write(DATA + 0x13, &value.to_le_bytes())
+        .unwrap();
+    machine.cpu.state.set_x(0, VA + 0x13);
+    machine.cpu.state.set_x(2, VA + 0xffc);
+    machine.run();
+    assert_eq!(machine.cpu.taken, None);
+    assert_eq!(machine.cpu.state.x(1), value);
+    assert_eq!(machine.misses(), 2);
+    assert!(machine.holds(EL1, false, VA));
+    machine.run();
+    assert_eq!(machine.cpu.taken, None);
+    assert_eq!(machine.misses(), 3);
+    assert_eq!(machine.cpu.jit_counts().tlb_accesses, 4);
+    // The store wrote its 8 bytes, 4 in each page.
+    assert_eq!(machine.word(DATA + 0xff8) >> 32, value & 0xffff_ffff);
+    assert_eq!(machine.word(OTHER) & 0xffff_ffff, value >> 32);
+}
+
+#[test]
+fn a_device_page_fills_nothing_while_blocks_check_no_alignment() {
+    // The MMU on and SCTLR_EL1.A clear: Device memory (MAIR index 1) asks
+    // for the alignment of the access, and the inlined lookup does not
+    // check it, so the page gets no entry and every access is a miss that
+    // the Rust path checks.
+    let mut machine = Machine::new(&[ldr(1, 0), HVC]);
+    machine.map(VA, DATA | AF | NO_EXECUTE | 1 << 2);
+    machine
+        .cpu
+        .memory
+        .write(DATA + 0x10, &0x99u64.to_le_bytes())
+        .unwrap();
+    machine.cpu.state.set_x(0, VA + 0x10);
+    for misses in 1..=2 {
+        machine.run();
+        assert_eq!(machine.cpu.taken, None);
+        assert_eq!(machine.cpu.state.x(1), 0x99);
+        assert_eq!(machine.misses(), misses);
+    }
+    assert!(machine.cpu.fast_tlb().expect("the JIT is on").is_empty());
+    // The same load at an address that is not a multiple of 8 takes the
+    // alignment fault.
+    machine.cpu.state.set_x(0, VA + 0x13);
+    machine.cpu.state.set_pc(CODE);
+    assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+    assert!(machine.cpu.taken.is_some());
+}
+
+#[test]
 fn an_access_of_el0_fills_the_tables_of_el0() {
     let mut machine = Machine::new(&[ldr(1, 0), str(1, 2), HVC]);
     machine.map(VA, DATA | AF | USER | NO_EXECUTE);
