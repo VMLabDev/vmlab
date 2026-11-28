@@ -590,7 +590,7 @@ class X86HvBackend(HvBackend):
             raise lib.BenchError(
                 f"{hv_bin} not built; run `cargo build --release -p vmlab-hv`"
             )
-        if ipxe_rom and not os.path.isfile(ipxe_rom):
+        if switch_sock is not None and ipxe_rom and not os.path.isfile(ipxe_rom):
             raise lib.BenchError(f"{ipxe_rom} absent; run `just firmware-ipxe-build`")
         self.run_dir = run_dir
         self.arch = "x86_64"

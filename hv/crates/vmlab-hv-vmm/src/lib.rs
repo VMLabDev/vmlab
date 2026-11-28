@@ -21,6 +21,7 @@ mod gpu;
 pub mod host;
 pub mod hyperv;
 pub mod kvm;
+mod kvm_stats;
 pub mod layout;
 pub mod loader;
 mod macos;

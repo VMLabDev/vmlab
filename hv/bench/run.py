@@ -52,6 +52,10 @@ BLK_SEQ_MIB = 512        # sequential read/write volume
 BLK_RAND_OPS = 20000     # 4-KiB O_DIRECT ops per random workload
 BLK_RAND_SPAN_MIB = 1024 # preallocated file size for random writes
 IDLE_WINDOW = 60.0       # idle host CPU sampling window
+# The idle suite's wait between agent ready and its window: a Windows guest
+# finishes its post-boot work (servicing, indexing) some minutes after the
+# agent answers (card #1197 measured 10 minutes on Server 2025).
+IDLE_SETTLE = 600.0
 
 
 def parse_args(argv):
@@ -63,10 +67,15 @@ def parse_args(argv):
                         "the template's own for x86_64)")
     p.add_argument("--repeats", type=int, default=3, help="repeats per configuration")
     p.add_argument("--guest", default="debian-13", help="template name")
-    p.add_argument("--suite", choices=("full", "boot", *lib.G2G_SUITES), default="full",
+    p.add_argument("--suite", choices=("full", "boot", "idle", *lib.G2G_SUITES), default="full",
                    help="TCG: full set or boot only; "
-                        "x86_64: full single-VM set, jumbo g2g, MTU-1500 g2g1500, "
-                        "or four-flow MTU-1500 g2g-multiflow")
+                        "x86_64: full single-VM set, idle host CPU and KVM exits, "
+                        "jumbo g2g, MTU-1500 g2g1500, or four-flow MTU-1500 g2g-multiflow")
+    p.add_argument("--idle-settle", type=float, default=IDLE_SETTLE,
+                   help="idle suite: seconds left alone after agent ready before sampling")
+    p.add_argument("--no-apicv", action="store_true",
+                   help="x86_64: configure VMs as on a host without APIC virtualization "
+                        "(no hv-avic), as a nested host such as WSL2 must")
     p.add_argument("--cpus", default=None, help="taskset window override (e.g. 16-19)")
     p.add_argument("--hv-bin", default=os.path.join(lib.REPO_DIR, "target/release/vmlab-hv"))
     p.add_argument("--timeout-scale", type=float, default=1.0)
@@ -774,6 +783,36 @@ def measure_udp_tx(agent, peer, guest_cpu):
     return mbps, sent, received
 
 
+def kvm_stats(backend):
+    """KVM's vCPU exit statistics of the VM, summed, or None when the
+    backend reports none (a kernel without KVM_GET_STATS_FD)."""
+    try:
+        if backend.name == "qemu":
+            return lib.qemu_kvm_stats(backend.qmp_sock)
+        return lib.hv_kvm_stats(backend.control_sock)
+    except (OSError, lib.BenchError) as error:
+        log(f"note: no KVM statistics: {error}")
+        return None
+
+
+def measure_idle(backend, settle):
+    """The idle workloads: wait `settle` seconds, then sample the VM
+    process's host CPU and KVM's exit counters over IDLE_WINDOW."""
+    log(f"idle: leaving the guest alone for {settle:.0f}s")
+    time.sleep(settle)
+    pid = backend.session.proc.pid
+    c0, k0 = lib.process_cpu_seconds(pid), kvm_stats(backend)
+    t0 = time.monotonic()
+    time.sleep(IDLE_WINDOW)
+    c1, k1 = lib.process_cpu_seconds(pid), kvm_stats(backend)
+    window = time.monotonic() - t0
+    if c0 is None or c1 is None:
+        raise lib.BenchError("VM process vanished during idle sampling")
+    samples = lib.idle_rates(c0, c1, k0, k1, window)
+    log(f"idle over {window:.0f}s: {samples}")
+    return samples
+
+
 def x86_one_repeat(args, guest, smp, pin, version, index):
     """One x86_64 VM through the full workload set for its guest."""
     lib.require_vm_slots()
@@ -828,7 +867,9 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
         samples = {"boot_to_agent_ready": boot_secs}
         env_tool = {}
 
-        if not windows:
+        if args.suite == "idle":
+            samples.update(measure_idle(backend, args.idle_settle))
+        elif not windows:
             nic = guest_nic(agent)
 
             def configure_nic():
@@ -1222,6 +1263,7 @@ def sweep_stale_vms():
 
 def main(argv=None):
     args = parse_args(argv)
+    lib.NO_APIC_VIRTUALIZATION = args.no_apicv
     if (args.backend in ("interpreter", "jit") and args.arch == "aarch64") or (
             args.backend == "qemu" and args.guest == "flat-a64"):
         # The flat aarch64 images on our interpreter loop, on its JIT (3e
@@ -1247,6 +1289,8 @@ def main(argv=None):
     arches = resolve_arches(args.arch)
     if args.suite == "boot" and "x86_64" in arches:
         raise lib.BenchError("--suite boot requires a TCG arch")
+    if args.suite == "idle" and arches != ["x86_64"]:
+        raise lib.BenchError("--suite idle is an x86_64 suite")
     if args.suite in lib.G2G_SUITES and arches != ["x86_64"]:
         raise lib.BenchError(f"--suite {args.suite} is an x86_64 suite")
     if args.suite in lib.G2G_SUITES and args.guest.startswith("windows-"):

@@ -178,6 +178,14 @@ pub fn compose_cpuid(
     }
     if has(HyperV::Avic) {
         recommendations |= 1 << 9;
+    } else if has(HyperV::Vapic) {
+        // Without host APIC virtualization every xAPIC MMIO access (EOI, TPR,
+        // ICR) is an exit KVM emulates instruction by instruction, which a
+        // nested host pays for many times over (card #1197). Recommending the
+        // synthetic APIC MSRs moves Windows onto them, as QEMU does for
+        // hv-vapic without hv-avic. With AVIC the hardware takes the MMIO
+        // accesses, so QEMU and this policy leave the bit off there.
+        recommendations |= 1 << 3;
     }
     for (function, requested) in [
         (3, [access, privileges, 0, misc & !(1 << 3)]),
@@ -447,6 +455,33 @@ mod tests {
         );
     }
 
+    /// Card #1197: a host without APIC virtualization recommends the
+    /// synthetic APIC MSRs (QEMU's hv-vapic without hv-avic: 0xe24 with the
+    /// AutoEOI deprecation off and the APIC access recommendation on), so
+    /// Windows leaves the xAPIC MMIO page that KVM emulates per access.
+    #[test]
+    fn without_avic_windows_is_told_to_use_the_apic_msrs() {
+        let leaf4 = |features: &[HyperV]| {
+            compose_cpuid(&CpuId::new(0).unwrap(), &full_support(), features)
+                .unwrap()
+                .as_slice()
+                .iter()
+                .find(|e| e.function == BASE + 4)
+                .unwrap()
+                .eax
+        };
+        assert_eq!(leaf4(WINDOWS_FEATURES), 0xc2c);
+        let mut avic = WINDOWS_FEATURES.to_vec();
+        avic.push(HyperV::Avic);
+        assert_eq!(leaf4(&avic), 0xe24);
+        let no_vapic: Vec<_> = WINDOWS_FEATURES
+            .iter()
+            .copied()
+            .filter(|&f| f != HyperV::Vapic)
+            .collect();
+        assert_eq!(leaf4(&no_vapic) & (1 << 3), 0);
+    }
+
     #[test]
     fn dependencies_and_unsupported_bits_fail_before_installation() {
         let base = CpuId::new(0).unwrap();
@@ -489,7 +524,8 @@ mod tests {
                 .find(|e| e.function == BASE + 4)
                 .unwrap()
                 .eax,
-            0xc24
+            // No AVIC: the APIC access recommendation (bit 3) is on.
+            0xc2c
         );
     }
 
