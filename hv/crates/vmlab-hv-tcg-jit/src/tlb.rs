@@ -20,10 +20,13 @@
 //!   read: the owner drops the write entries of a page that gets
 //!   translated code by it (H11a).
 //!
-//! The inlined lookup masks the address with the page bits and the bits
-//! below the size of the access, and compares that with the tag. So an
-//! access that is not aligned to its size misses, and such an access is
-//! the only one that can cross its page.
+//! The inlined lookup takes the entry at the place of the page of the
+//! first byte of the access and compares the page of its last byte
+//! (`va + size - 1`) with the tag (N10, card T3-D1). So an access that is
+//! not aligned to its size hits where it stays in its page, and one that
+//! crosses into the next page misses: the page of its last byte has
+//! another place. The alignment that a memory asks of an address is not
+//! checked here: an owner fills no entry for a page whose memory asks it.
 //!
 //! A flush, and the search of the write entries of a page that gets code,
 //! visit the places filled since the last flush while there are at most
@@ -39,8 +42,8 @@
 pub const ENTRIES: usize = 256;
 /// Log2 of the bytes of one entry.
 pub const ENTRY_BITS: u32 = 5;
-/// The tag of an empty entry. A masked address has at most its three low
-/// bits set below the page bits, so it never equals this.
+/// The tag of an empty entry. A masked address has no bit set below the
+/// page bits, so it never equals this.
 pub const EMPTY: u64 = u64::MAX;
 
 /// The most mappings larger than a page that the TLB keeps apart. With
@@ -163,10 +166,12 @@ impl FastTlb {
     }
 
     /// The entry that an access of `bytes` bytes at `va` hits, as the
-    /// inlined lookup finds it.
+    /// inlined lookup finds it: at the place of the page of `va`, with the
+    /// page of the last byte as its tag.
     pub fn lookup(&self, level: usize, write: bool, va: u64, bytes: u8) -> Option<&Entry> {
         let entry = self.entry(Self::place(level, write, Self::index(va)));
-        (va & (!0xfff | (u64::from(bytes.max(1)) - 1)) == entry.tag).then_some(entry)
+        let last = va.wrapping_add(u64::from(bytes.max(1)) - 1);
+        (last & !0xfff == entry.tag).then_some(entry)
     }
 
     /// Keep the page of `va` for `level`: its host page at `host`, its
@@ -331,7 +336,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_hit_needs_the_page_and_the_alignment_of_the_access() {
+    fn a_hit_needs_every_byte_of_the_access_in_the_page() {
         let mut tlb = FastTlb::new();
         tlb.fill(1, false, 0x1234_5678, 0x7000_0000, 0, 0x8000_5000, 12);
         let entry = *tlb.lookup(1, false, 0x1234_5000, 8).expect("a hit");
@@ -345,11 +350,26 @@ mod tests {
                     .is_some()
             );
         }
-        // One that is not aligned to its size misses, and so does every one
-        // that crosses into the next page.
-        assert!(tlb.lookup(1, false, 0x1234_5001, 2).is_none());
-        assert!(tlb.lookup(1, false, 0x1234_5ffc, 8).is_none());
+        // One that is not aligned to its size hits in its page (N10), and
+        // every one that crosses into the next page misses, also with that
+        // page in the TLB.
+        assert!(tlb.lookup(1, false, 0x1234_5001, 2).is_some());
+        assert!(tlb.lookup(1, false, 0x1234_5ff7, 8).is_some());
+        assert!(tlb.lookup(1, false, 0x1234_5fe9, 16).is_some());
         assert!(tlb.lookup(1, false, 0x1234_5fff, 1).is_some());
+        tlb.fill(1, false, 0x1234_6000, 0x7000_1000, 0, 0x8000_6000, 12);
+        for (va, bytes) in [(0x1234_5fff, 2), (0x1234_5ffc, 8), (0x1234_5ff8, 16)] {
+            assert!(tlb.lookup(1, false, va, bytes).is_none(), "{va:#x}");
+        }
+        // The last page of the address space and the first: an access that
+        // wraps around misses.
+        tlb.fill(1, false, u64::MAX, 0x7000_2000, 0, 0x8000_7000, 12);
+        tlb.fill(1, false, 0, 0x7000_3000, 0, 0x8000_8000, 12);
+        assert!(tlb.lookup(1, false, u64::MAX - 7, 8).is_some());
+        assert!(tlb.lookup(1, false, u64::MAX - 3, 8).is_none());
+        for va in [u64::MAX, u64::MAX - 0xfff, 0x1234_6000, 0] {
+            tlb.flush_page(va >> 12, u64::MAX);
+        }
         // The other level, the other kind, and another page with its place.
         assert!(tlb.lookup(0, false, 0x1234_5000, 8).is_none());
         assert!(tlb.lookup(1, true, 0x1234_5000, 8).is_none());

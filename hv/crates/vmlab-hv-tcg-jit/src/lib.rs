@@ -22,8 +22,10 @@
 //! What a block returns: `DONE` after its last operation, with its outputs
 //! in the state; `BUDGET` when the budget of the context did not hold its
 //! instructions (H10), with nothing done; `CHAIN` and `LOOKUP` after its
-//! last operation, when it found no code to go on to (H5, H6); and any other
-//! value that the thunk returned, with the words of the leave in the frame.
+//! last operation, when it found no code to go on to (H5, H6); `TRAPPED`
+//! after its last operation, when the thunk also ran the instruction after
+//! it that the owner runs (`TERMINAL`, card T3-D2); and any other value that
+//! the thunk returned, with the words of the leave in the frame.
 //! `Context::block` names the block that left.
 //!
 //! Chaining (H5): the exit of a block to a constant target in its page is a
@@ -78,6 +80,12 @@ pub const LOOKUP: u64 = 0x20;
 /// The block ran to its end and the jump cache had an entry for the PC,
 /// which it did not take (`Chain::verify`).
 pub const VERIFY: u64 = 0x30;
+/// The block ran to its end, and the thunk ran the instruction after it
+/// that its owner runs (`TERMINAL`), without code to go on to.
+pub const TRAPPED: u64 = 0x40;
+/// A value that the thunk returns for `TERMINAL` below this is an exit
+/// code, and at or above it the address of code (card T3-D2).
+pub const LOWEST_CODE: u64 = 0x1000;
 /// The most exits of a block that can be linked: two at its end, and the
 /// side exits of a superblock (card J14).
 pub const SITES: usize = 10;
@@ -120,6 +128,14 @@ pub const LOGGED: u64 = 4 << 32;
 /// The low 32 bits are 0, not an operation. The thunk returns the address
 /// of the code to go on to, or 0, and the block then leaves with `LOOKUP`.
 pub const JUMP: u64 = 8 << 32;
+/// The end of a block whose `Chain::terminal` is set, before the
+/// instruction that its owner runs (card T3-D2): every output of the block
+/// is written, and the PC of the state is that instruction. The low 32
+/// bits are 0. The thunk returns 0, and the block leaves with `DONE` and
+/// the owner runs the instruction; or `TRAPPED`, which it leaves with,
+/// when the owner ran the instruction and the run cannot go on; or the
+/// address of the code of the next block, which the run goes on to.
+pub const TERMINAL: u64 = 16 << 32;
 
 /// What compiled code reads through R13.
 #[repr(C)]
@@ -306,10 +322,13 @@ pub struct Jit {
     /// The jump cache. Compiled code reads it, and the thunk of a run fills
     /// it while the run holds the JIT shared (`fill_shared`).
     jump: Box<[Cell<JumpEntry>]>,
-    jump_generation: u64,
+    /// Cells, so that the thunk of a run that serves the last instruction
+    /// of a block can change the translation (`clear_jumps_shared`,
+    /// `set_jump_space_shared`, card T3-D2).
+    jump_generation: Cell<u64>,
     /// The address space of the entries that are filled and hit from now
     /// on, in its place in the key.
-    jump_space: u64,
+    jump_space: Cell<u64>,
     defect: Defect,
     /// The address and the length of the trampoline.
     trampoline: (u64, u64),
@@ -381,8 +400,8 @@ impl Jit {
             jump: (0..JUMP_ENTRIES)
                 .map(|_| Cell::new(JumpEntry::EMPTY))
                 .collect(),
-            jump_generation: JUMP_GENERATION_STEP,
-            jump_space: 0,
+            jump_generation: Cell::new(JUMP_GENERATION_STEP),
+            jump_space: Cell::new(0),
             defect: Defect::None,
             trampoline: (base, len as u64),
             perf_map: false,
@@ -527,15 +546,31 @@ impl Jit {
     /// at every write of a table base, twice for each system call of a
     /// kernel without hardware PAN.
     pub fn clear_jumps(&mut self) {
-        if self.jump_generation >= JUMP_GENERATION_LAST {
+        self.clear_jumps_shared();
+        self.stats.clears += 1;
+    }
+
+    /// `clear_jumps` while a run of compiled code holds the JIT, from its
+    /// thunk (card T3-D2). The caller counts it (`count_shared`) and puts
+    /// `jump_tag` into the context of the run.
+    #[inline]
+    pub fn clear_jumps_shared(&self) {
+        let generation = self.jump_generation.get();
+        if generation >= JUMP_GENERATION_LAST {
             for entry in self.jump.iter() {
                 entry.set(JumpEntry::EMPTY);
             }
-            self.jump_generation = JUMP_GENERATION_STEP;
+            self.jump_generation.set(JUMP_GENERATION_STEP);
         } else {
-            self.jump_generation += JUMP_GENERATION_STEP;
+            self.jump_generation.set(generation + JUMP_GENERATION_STEP);
         }
-        self.stats.clears += 1;
+    }
+
+    /// Count the clears and the changes of the address space that a run
+    /// made from its thunk (`clear_jumps_shared`, `set_jump_space_shared`).
+    pub fn count_shared(&mut self, clears: u64, spaces: u64) {
+        self.stats.clears += clears;
+        self.stats.spaces += spaces;
     }
 
     /// The address space of the jump cache from now on (card J10): an
@@ -546,17 +581,30 @@ impl Jit {
     /// the space of when it was made (`context`).
     #[inline]
     pub fn set_jump_space(&mut self, space: u16) {
-        let space = u64::from(space) << JUMP_SPACE_SHIFT;
-        if space != self.jump_space {
-            self.jump_space = space;
+        if self.set_jump_space_shared(space) {
             self.stats.spaces += 1;
         }
     }
 
-    /// The generation and the space that a key of an entry holds now.
+    /// `set_jump_space` while a run of compiled code holds the JIT, from
+    /// its thunk (card T3-D2). `true`: the space changed, and the caller
+    /// counts it (`count_shared`) and puts `jump_tag` into the context.
     #[inline]
-    fn jump_tag(&self) -> u64 {
-        self.jump_generation + self.jump_space
+    pub fn set_jump_space_shared(&self, space: u16) -> bool {
+        let space = u64::from(space) << JUMP_SPACE_SHIFT;
+        if space != self.jump_space.get() {
+            self.jump_space.set(space);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The generation and the space that a key of an entry holds now:
+    /// `Context::jump_generation` of a run made now.
+    #[inline]
+    pub fn jump_tag(&self) -> u64 {
+        self.jump_generation.get() + self.jump_space.get()
     }
 
     /// Put the code `to` into the jump cache for the virtual PC `pc` in the
