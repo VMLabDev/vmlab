@@ -416,7 +416,10 @@ fn after_an_eret_in_the_run_the_store_after_an_exclusive_store_takes_the_table_o
         state.system.regs[sysreg::reg::FAR_EL1] = 0;
         machine.run();
         // The fault of the store of EL0 reached the vector of EL1.
-        assert_eq!(machine.cpu.state.system.regs[sysreg::reg::FAR_EL1], VA + 0x1008);
+        assert_eq!(
+            machine.cpu.state.system.regs[sysreg::reg::FAR_EL1],
+            VA + 0x1008
+        );
         assert_eq!(machine.word(OTHER + 8), 0x600d, "EL0 wrote a page of EL1");
         assert_eq!(machine.cpu.state.x(5), 0, "the exclusive store wrote");
     };
