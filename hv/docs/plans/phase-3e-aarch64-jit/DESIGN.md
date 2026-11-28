@@ -2323,6 +2323,101 @@ the median of 3, s:
   for a device on a loaded host: seconds a boot in T3-D4c, where a broadcast
   waited as long as the slowest device access of another CPU.
 
+### V3, measured by card #1217: fewer slice exits
+
+Helios, 2026-11-28, *measured*, the release build, the full suite
+(`--suite full`, Debian 13: boot, `sha256`, `xz`) and the flat images,
+with the pin of card #1205. Before is `e13c8daa` (`next`). After is
+`39758d3c`, whose code is that of the card. The rows are in
+`bench/history/aarch64.jsonl` with the note "card #1217", each with its
+host load. Other cards ran builds and VMs at the same time, and the
+check of this card ran during round 1. No QEMU source was read (X1).
+
+- **V3a. What was built.** A CPU of a machine ran each run of compiled
+  code for at most `CHAIN_SLICE`, 4,096 instructions, and each slice of
+  its vCPU loop (`SLICE` of `emulated.rs`) for 65,536. A line that rises,
+  mail and a pause already kick the run (H10c), and the loop already left
+  at the deadline of the timer (card C13), so the short runs served only
+  the clock check and a lost kick. Now a run of compiled code gets half of
+  the instructions that the measured speed of the CPU runs up to the
+  deadline of its timer, at least 4,096 (the old slice, and every run
+  before a speed is measured) and at most 65,536 (`chain_budget`); without
+  a deadline it gets 65,536, which bounds only a lost kick. The speed is
+  instructions per tick of the counter, measured at each clock read of the
+  loop, a quarter of the way to each new measure (`learn_rate`). The loop
+  reads the clock after each run of compiled code as before, and leaves at
+  the deadline. `SLICE` is 1 << 20; a slice still ends at the deadline,
+  after a write of a timer register and at a kick, and with the boot
+  windows of C13b on it ends where the next window is due. `Cpu::run` gave
+  the mailbox of the CPU its seat under a `Mutex` at every run; it now
+  gives it only when the seat or the mailboxes changed.
+  Sources read: `exec.rs` and `shootdown.rs` of this crate, `seat.rs` of
+  `vmlab-hv-tcg-jit`, `emulated.rs` and `windows.rs` of `vmlab-hv-vmm`;
+  no code of another JIT and no QEMU source.
+- **V3b. The returns at the budget.** From the last JIT line of each vCPU
+  of every kept run (boot and both workloads, 17 to 28e9 instructions a
+  run): 348,000 to 372,000 returns at the budget per 1e9 instructions
+  before, 21,600 to 25,900 after, at 1 and at 4 vCPUs. The runs entered
+  per 1e9 instructions fall by about the same count. The kicked returns
+  are unchanged: 45 to 88 per 1e9 at one vCPU, 3,559 to 4,157 at four.
+- **V3c. The kicks and the timer at the seam.** Unit tests: a machine CPU
+  in chained code with a budget of 300 million leaves its loop at the
+  deadline of its timer, and has measured its speed; an IRQ line that
+  another thread raises ends a chained run whose budget does not end; a
+  post on new mailboxes kicks the seat of the CPU; at the vCPU seam
+  (`emulated_tests.rs`), an SPI raised while the vCPU spins in compiled
+  code with no timer armed is taken inside the slice of 1 << 20. The
+  timer test of C13 had a deadline 20 us away, which passed before the
+  run began in 1 of 30 runs on `next` at this load, so that the CPU had no
+  deadline; it is 200 us away now and passed 30 of 30.
+- **V3d. K3** on a Debian 13 boot at 2 vCPUs (`VMLAB_HV_JIT_CHECK=1`,
+  `VMLAB_HV_JIT_CHECK_RUNS=1000`), the after build: agent ready after
+  88.6 s at a load of 7.8 to 11.0, no difference: 60.5 and 50.8 million
+  checked runs (443.5 and 373.8 million instructions) on vCPU 0 and 1 up
+  to their last JIT lines, at 14.0e9 and 5.0e9 instructions.
+- **V3e. One boot of the after side fell into emergency mode**: repeat 3
+  of the 1-vCPU set of round 1, at a host load of 15 to 27, on systemd's
+  90 s device timeout of `/boot/efi`, with the guest kernel at 112 s when
+  AppArmor loaded. That set has no row; round 2 measured the pair again.
+  None of the other 11 after boots (12 with that of K3) and none of the 12
+  before boots did.
+  It is the load symptom of J2a, J4e and J5d, and the after boots were
+  faster at both vCPU counts.
+
+The rows, the median of 3 (the samples in brackets), s, and the share of
+QEMU's speed from the baseline in each row. Round 2 has the 1-vCPU pair,
+rounds 1 and 3 the 4-vCPU pairs:
+
+| Row | Before | After | After / before | After, % of QEMU |
+|---|---|---|---|---|
+| Boot to agent ready, 1 vCPU, round 2 | 56.19 (56.19, 60.29, 54.81) | 48.82 (94.76, 48.82, 48.51) | 1.15 | 66 % |
+| `sha256`, 1 vCPU, round 2 | 2.20 (2.00, 2.20, 2.65) | 2.13 (1.83, 2.13, 2.20) | 1.03 | 96 % |
+| `xz`, 1 vCPU, round 2 | 8.95 (9.08, 8.95, 8.92) | 8.45 (8.45, 8.59, 8.37) | 1.06 | 32 % |
+| Boot MIPS, 1 vCPU, round 2 | 320.9 | 368.5 | 1.15 | |
+| Load (1 min) at the start, round 2 | 5.5 | 9.4 | | |
+| Boot to agent ready, 4 vCPUs, round 1 | 38.17 (73.45, 38.17, 37.63) | 34.72 (36.18, 34.72, 34.64) | 1.10 | 70 % |
+| `sha256`, 4 vCPUs, round 1 | 1.97 (1.97, 2.06, 1.97) | 2.01 (2.01, 2.11, 1.91) | 0.98 | 104 % |
+| `xz`, 4 vCPUs, round 1 | 8.79 (8.82, 8.73, 8.79) | 8.57 (8.65, 8.57, 8.51) | 1.03 | 30 % |
+| Boot MIPS, 4 vCPUs, round 1 | 500.5 | 554.9 | 1.11 | |
+| Load (1 min) at the start, round 1 | 15.7 | 11.4 | | |
+| Boot to agent ready, 4 vCPUs, round 3 | 38.46 (41.61, 37.81, 38.46) | 36.22 (36.13, 36.76, 36.22) | 1.06 | 67 % |
+| `sha256`, 4 vCPUs, round 3 | 2.02 (2.09, 2.02, 1.98) | 1.91 (1.84, 1.91, 1.96) | 1.06 | 109 % |
+| `xz`, 4 vCPUs, round 3 | 8.93 (8.93, 9.34, 8.69) | 8.42 (8.29, 8.42, 8.48) | 1.06 | 31 % |
+| Boot MIPS, 4 vCPUs, round 3 | 497.1 | 534.8 | 1.08 | |
+| Load (1 min) at the start, round 3 | 4.0 | 8.6 | | |
+| CoreMark mix, flat, 1 CPU, MIPS | 2,652 (2,550, 2,662, 2,652) | 2,753 (2,753, 2,756, 2,742) | 1.04 | |
+| Scalar loop, flat, 1 CPU, MIPS | 9,057 (9,057, 9,073, 8,949) | 9,398 (9,451, 9,358, 9,398) | 1.04 | |
+
+- **V3f. The verdict.** The proposal estimated `xz` 1.05 to 1.12 times
+  and the boot 1.04 to 1.08 times. Measured: `xz` 1.03 to 1.06 times, the
+  boot 1.06 to 1.15 times (the 1.15 of one vCPU with an after sample at a
+  higher load beside it), `sha256` 0.98 to 1.06 times, inside its spread.
+  The returns at the budget fall 16 times (V3b). The flat images run on a
+  CPU without lines, whose budget the change does not touch: their 4 %
+  is the host. The bench has no CoreMark row at four vCPUs: CoreMark runs
+  only as a flat image on one CPU. No bar applies (Q4, the answer of
+  2026-11-28); the rows are recorded against QEMU as above.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
