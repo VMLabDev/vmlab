@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+use vm_memory::GuestMemoryBackend;
 
 use super::{Net, NetConfig, Shared, notify_worker, tap::TapBackend};
 use crate::{GuestMemory, VirtioDevice};
