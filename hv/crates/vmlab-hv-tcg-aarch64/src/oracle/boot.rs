@@ -860,7 +860,8 @@ mod tests {
                 disk: "/d/disk.qcow2".into(),
             }),
         };
-        assert!(options.argv().join(" ").contains(" -cpu cortex-a53,pmu=off "));
+        let argv = options.argv().join(" ");
+        assert!(argv.contains(" -cpu cortex-a53,pmu=off "));
         let dump = options.dump_argv(Path::new("/d/x.dtb")).join(" ");
         assert!(dump.contains(" -cpu cortex-a53,pmu=off "));
     }
