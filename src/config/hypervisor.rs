@@ -1507,7 +1507,10 @@ mod tests {
         };
         let mut arm = resolved("arm");
         let said = virt_display_dropped(&arm).expect("said");
-        assert!(said.contains("virtio-gpu-pci") && said.contains("hypervisor = \"qemu\""), "{said}");
+        assert!(
+            said.contains("virtio-gpu-pci") && said.contains("hypervisor = \"qemu\""),
+            "{said}"
+        );
         assert_eq!(virt_display_dropped(&resolved("pc")), None);
         arm.display_device = None;
         assert_eq!(virt_display_dropped(&arm), None);

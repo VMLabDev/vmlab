@@ -4897,5 +4897,9 @@ fn an_aarch64_vm_on_vmlab_hv_is_headless_and_shares_over_smb() {
     let m: Arc<dyn Machine> = pc;
     assert!(m.clone().display().is_some());
     assert!(m.takes_tap_fds());
-    assert!(m.launch_warnings().iter().all(|w| !w.contains("runs headless")));
+    assert!(
+        m.launch_warnings()
+            .iter()
+            .all(|w| !w.contains("runs headless"))
+    );
 }
