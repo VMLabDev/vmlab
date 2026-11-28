@@ -57,9 +57,12 @@
 //! entry is what the paths above ask of their own hits: a read entry for a
 //! page of RAM with the read permission of the level, a write entry also
 //! for a page with a watch word that is even, which no translated code of
-//! this CPU is in (H11a), and only while no exclusive mark is set. An
-//! unprivileged access, an exclusive one and one of 16 bytes never fill and
-//! never hit. A store through the fast TLB reads the watch word after its
+//! this CPU is in (H11a), and only while no exclusive mark is set. A page
+//! of Device memory gets no entry: an inlined access hits wherever its
+//! bytes are in the page of the entry, aligned or not (N10, card T3-D1),
+//! and the alignment that Device memory asks (card S4) is checked in the
+//! paths above only. An unprivileged access and an exclusive one never
+//! fill and never hit. A store through the fast TLB reads the watch word after its
 //! write and tells the memory when it is odd, as a store of the path above
 //! does. The dirty marking of the memory (H7e) is the stamps of card S3:
 //! a write that skips it is one that the path above makes straight too.
@@ -546,7 +549,12 @@ impl Side {
     /// header). The caller found `entry` with the permission of that level.
     #[inline]
     fn fill_fast(&mut self, va: u64, entry: &vmlab_hv_tcg::tlb::Entry, write: bool) {
-        if self.mmu.fast().is_none() || entry.host == 0 {
+        // Device memory: its alignment is checked in the Rust paths alone,
+        // since an inlined hit asks nothing of the low bits (N10).
+        if self.mmu.fast().is_none()
+            || entry.host == 0
+            || entry.flags as u8 & mmu::flag::DEVICE != 0
+        {
             return;
         }
         if write
@@ -978,11 +986,12 @@ enum Access16 {
 const UNPRIVILEGED: u8 = 0x80;
 /// The bits of `Op::aux` of a load or a store that hold the alignment that
 /// Device memory asks of it, less one: a mask of the low bits of the
-/// address (card S4). An inlined access with one of them set in its
-/// address misses the fast TLB, so a Device page faults in the Rust path.
+/// address (card S4). The emitter does not read them: a Device page gets
+/// no entry in the fast TLB (`Side::fill_fast`), so an access of one
+/// always reaches the Rust path, which checks them.
 const DEVICE_MASK: u8 = 0x0f;
 const _: () =
-    assert!(UNPRIVILEGED == jit::emit::THUNK_ACCESS && DEVICE_MASK & !jit::emit::ALIGNMENT == 0);
+    assert!(UNPRIVILEGED == jit::emit::THUNK_ACCESS && DEVICE_MASK & !jit::emit::OWNER == 0);
 
 /// Where a block can leave before its end.
 #[derive(Clone, Debug)]

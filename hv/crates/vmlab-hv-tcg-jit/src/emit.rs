@@ -26,10 +26,11 @@
 //!
 //! A load or a store of 1 to 8 bytes looks up the fast TLB inline (H7, the
 //! layout in `tlb`): the index from the page bits of the address, the tag
-//! compared with the address masked to its page and to the bits below its
-//! size, the addend, and the access of the host. A pair of 16 bytes is
-//! masked as an access of 8 and misses at the last 8 bytes of its page, so
-//! that both of its words are in one page: two accesses of 8 bytes. A store then reads the
+//! compared with the page of the last byte of the access (`va + size - 1`,
+//! N10), the addend, and the access of the host. So an access that is not
+//! aligned to its size hits where it stays in its page, and one that
+//! crosses into the next page misses. A pair of 16 bytes hits where its 16
+//! bytes are in one page: two accesses of 8 bytes. A store then reads the
 //! watch word of its page and asks the thunk to tell the memory when it is
 //! odd (card S3). A miss is a stub after the block (H7c) that puts the words
 //! of the access and of its leave into the frame and runs the access in the
@@ -259,12 +260,12 @@ pub enum Memory {
 /// TLB does not answer for the access (H7a: an unprivileged access of
 /// aarch64).
 pub const THUNK_ACCESS: u8 = 0x80;
-/// The bits of `Op::aux` of a load or a store that are a mask of the low
-/// bits of the address that an inline hit asks to be zero, beside those
-/// below the size of the access. An address with one of them set misses
-/// the fast TLB, and the thunk serves it, which knows why the owner asks
-/// for them (the alignment of Device memory on aarch64).
-pub const ALIGNMENT: u8 = 0x7f;
+/// The bits of `Op::aux` of a load or a store that the emitter does not
+/// read: the owner's, for its thunk (the alignment of Device memory on
+/// aarch64). An inline hit asks only that the bytes of the access are in
+/// the page of the entry (N10), so an owner whose memory asks more of an
+/// address in some page fills no entry for that page.
+pub const OWNER: u8 = 0x7f;
 
 /// How a block that can be chained to starts and ends (DESIGN.md H5, H6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1581,8 +1582,8 @@ impl Emitter<'_> {
     /// result of a load the word `dst`, and the leave `imm`. An access of 16
     /// bytes is a pair of words (`LoadPair`, `StorePair`): the result in
     /// `dst` and the word after it, the value in `b` (low) and `dst` (high).
-    /// It hits where its address is a multiple of 8 and its 16 bytes are in
-    /// one page, and it is two accesses of 8 bytes of the host.
+    /// It hits where its 16 bytes are in one page, and it is two accesses of
+    /// 8 bytes of the host.
     fn access(&mut self, index: usize, op: &Op, reads: &[Slot], bytes: u8, store: bool) {
         let at = index as u32;
         let pair = bytes == 16;
@@ -1600,19 +1601,17 @@ impl Emitter<'_> {
             .alu_imm(Alu::And, Rm::Reg(RCX), ((ENTRIES - 1) << ENTRY_BITS) as i32);
         let table = if store { CONTEXT_WRITES } else { CONTEXT_READS };
         self.asm.alu(Alu::Add, RCX, Rm::Mem(R13, table));
-        // The address in its page and below its size, against the tag.
+        // The page of the last byte of the access against the tag (N10).
+        // The entry is at the place of the page of the first byte, so a tag
+        // that equals the page of the last byte is also the page of the
+        // first: an access that crosses into the next page misses.
         self.asm.mov(RDX, Rm::Reg(RAX));
-        let low = (i32::from(bytes.min(8)) - 1) | i32::from(op.aux & ALIGNMENT);
-        self.asm.alu_imm(Alu::And, Rm::Reg(RDX), !0xfff | low);
+        if bytes > 1 {
+            self.asm.alu_imm(Alu::Add, Rm::Reg(RDX), i32::from(bytes) - 1);
+        }
+        self.asm.alu_imm(Alu::And, Rm::Reg(RDX), !0xfff);
         self.asm.alu(Alu::Cmp, RDX, Rm::Mem(RCX, TAG));
         self.asm.jcc(Cond::Ne, miss);
-        if pair {
-            // The last 8 bytes of a page: the second word is in the next.
-            self.asm.mov(RDX, Rm::Reg(RAX));
-            self.asm.alu_imm(Alu::And, Rm::Reg(RDX), 0xff8);
-            self.asm.alu_imm(Alu::Cmp, Rm::Reg(RDX), 0xff8);
-            self.asm.jcc(Cond::E, miss);
-        }
         self.asm.alu(Alu::Add, RAX, Rm::Mem(RCX, ADDEND));
         if let Some(value) = value {
             let parts = [Some((0, value)), high.map(|high| (8, high))];
