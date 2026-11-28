@@ -61,8 +61,8 @@
 //! of Device memory gets no entry: an inlined access hits wherever its
 //! bytes are in the page of the entry, aligned or not (N10, card T3-D1),
 //! and the alignment that Device memory asks (card S4) is checked in the
-//! paths above only. An unprivileged access and an exclusive one never
-//! fill and never hit. A store through the fast TLB reads the watch word after its
+//! paths above only. An unprivileged access, an exclusive one and one of
+//! 16 bytes into one register (`Access16`) never fill and never hit. A store through the fast TLB reads the watch word after its
 //! write and tells the memory when it is odd, as a store of the path above
 //! does. The dirty marking of the memory (H7e) is the stamps of card S3:
 //! a write that skips it is one that the path above makes straight too.
