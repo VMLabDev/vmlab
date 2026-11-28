@@ -2210,7 +2210,16 @@ fn a_hit_asks_nothing_and_a_miss_runs_the_access_in_the_thunk() {
     let host = ram.as_ptr() as usize;
     tlb.fill(1, false, RAM, host, 0, 0, 12, false);
     let watch_at = &watch as *const AtomicU32 as usize;
-    tlb.fill(1, true, RAM + 0x1000, host + 0x1000, watch_at, 0x1000, 12, false);
+    tlb.fill(
+        1,
+        true,
+        RAM + 0x1000,
+        host + 0x1000,
+        watch_at,
+        0x1000,
+        12,
+        false,
+    );
     ram[0x1004..0x1008].fill(0);
     let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
     let run = |jit: &mut Jit, block: &Block, ram: &mut [u8], writes| {
@@ -2314,7 +2323,16 @@ fn a_store_into_a_watched_page_tells_the_thunk_after_its_write() {
         let mut tlb = FastTlb::new();
         tlb.fill(1, false, RAM, host, 0, 0, 12, false);
         let watch_at = &watch as *const AtomicU32 as usize;
-        tlb.fill(1, true, page, host + offset, watch_at, offset as u64, 12, false);
+        tlb.fill(
+            1,
+            true,
+            page,
+            host + offset,
+            watch_at,
+            offset as u64,
+            12,
+            false,
+        );
         let (reads, writes) = (tlb.table(1, false), tlb.table(1, true));
         ram[offset + 4..offset + 8].fill(0);
         let ran = run_on_tables(&mut jit, &block, &ops, &mut ram, reads, writes);

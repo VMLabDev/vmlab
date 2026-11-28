@@ -414,7 +414,16 @@ mod tests {
     #[test]
     fn a_hit_needs_every_byte_of_the_access_in_the_page() {
         let mut tlb = FastTlb::new();
-        tlb.fill(1, false, 0x1234_5678, 0x7000_0000, 0, 0x8000_5000, 12, false);
+        tlb.fill(
+            1,
+            false,
+            0x1234_5678,
+            0x7000_0000,
+            0,
+            0x8000_5000,
+            12,
+            false,
+        );
         let entry = *tlb.lookup(1, false, 0x1234_5000, 8).expect("a hit");
         assert_eq!(entry.tag, 0x1234_5000);
         assert_eq!(0x1234_5678u64.wrapping_add(entry.addend), 0x7000_0678);
@@ -433,7 +442,16 @@ mod tests {
         assert!(tlb.lookup(1, false, 0x1234_5ff7, 8).is_some());
         assert!(tlb.lookup(1, false, 0x1234_5fe9, 16).is_some());
         assert!(tlb.lookup(1, false, 0x1234_5fff, 1).is_some());
-        tlb.fill(1, false, 0x1234_6000, 0x7000_1000, 0, 0x8000_6000, 12, false);
+        tlb.fill(
+            1,
+            false,
+            0x1234_6000,
+            0x7000_1000,
+            0,
+            0x8000_6000,
+            12,
+            false,
+        );
         for (va, bytes) in [(0x1234_5fff, 2), (0x1234_5ffc, 8), (0x1234_5ff8, 16)] {
             assert!(tlb.lookup(1, false, va, bytes).is_none(), "{va:#x}");
         }
@@ -541,7 +559,16 @@ mod tests {
         // More larger mappings than it keeps apart: every invalidation
         // drops everything.
         for mapping in 0..(LARGE as u64 + 1) {
-            tlb.fill(0, false, 0x4000_0000 + (mapping << 21), 0x1000, 0, 0, 21, false);
+            tlb.fill(
+                0,
+                false,
+                0x4000_0000 + (mapping << 21),
+                0x1000,
+                0,
+                0,
+                21,
+                false,
+            );
         }
         tlb.flush_page(0x7_0000, u64::MAX);
         assert!(tlb.is_empty());
@@ -556,7 +583,16 @@ mod tests {
             for page in 0..pages {
                 let (level, write) = ((page % 2) as usize, page % 3 == 0);
                 let global = page % 4 == 0;
-                tlb.fill(level, write, page << 12, 0x1000_0000, 0x55, 0x9000, 12, global);
+                tlb.fill(
+                    level,
+                    write,
+                    page << 12,
+                    0x1000_0000,
+                    0x55,
+                    0x9000,
+                    12,
+                    global,
+                );
             }
             // A global entry replaced by one that is not, and the reverse.
             tlb.fill(0, true, 0, 0x1000_0000, 0x55, 0x9000, 12, false);
