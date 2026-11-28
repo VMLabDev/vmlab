@@ -4896,13 +4896,13 @@ async fn the_stop_ladder_powers_down_over_vmlab_hv() {
     assert_eq!(vm.state().await, PowerState::Stopped);
 }
 
-/// Phase 3d (§22.5): an aarch64 VM on vmlab-hv is the headless `virt`
-/// machine. It reports no display, so every screen verb says so; it answers
-/// for its own virtio-fs with none, so the share plan puts its shares on
-/// SMB; it takes no TAP queues; and `up` says what the dropped display device
-/// takes away. An x86 VM on vmlab-hv keeps all of them.
+/// Phase 3d (§22.5): an aarch64 VM on vmlab-hv is the emulated `virt`
+/// machine. Its display is the virtio GPU (#1225), so the screen verbs
+/// reach it and `up` warns of no dropped display; it answers for its own
+/// virtio-fs with none, so the share plan puts its shares on SMB; and it
+/// takes no TAP queues. An x86 VM on vmlab-hv keeps all of them.
 #[test]
-fn an_aarch64_vm_on_vmlab_hv_is_headless_and_shares_over_smb() {
+fn an_aarch64_vm_on_vmlab_hv_has_a_display_and_shares_over_smb() {
     let dirs = Dirs::new();
     let (arm, _hv) = vm(
         &dirs,
@@ -4910,7 +4910,7 @@ fn an_aarch64_vm_on_vmlab_hv_is_headless_and_shares_over_smb() {
         on_vmlab_hv(Script::healthy()),
     );
     let m: Arc<dyn Machine> = arm.clone();
-    assert!(m.clone().display().is_none());
+    assert!(m.clone().display().is_some());
     assert!(m.virtiofs_in_process());
     assert!(m.virtiofsd().is_none());
     assert_eq!(
@@ -4920,9 +4920,7 @@ fn an_aarch64_vm_on_vmlab_hv_is_headless_and_shares_over_smb() {
     assert!(!m.takes_tap_fds());
     let warnings = m.launch_warnings();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("runs headless") && w.contains("virtio-gpu-pci")),
+        warnings.iter().all(|w| !w.contains("runs headless")),
         "{warnings:?}"
     );
 
