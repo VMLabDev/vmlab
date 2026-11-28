@@ -332,9 +332,10 @@ and, one entry per repeat in sample order, `env.repeat_host_load`:
 
 A row is comparable with another when both have `chosen: free`,
 `siblings_reserved: true`, and a `reserved_busy_cpus` close to the VM's own
-use. An idle one-vCPU TCG boot keeps about one CPU busy, plus a fraction for
-its I/O thread, so on a two-core reserve a value well above 1.5 says other
-work ran on the reserved threads during that repeat. `other_busy_cpus` does
+use. A one-vCPU TCG boot keeps about one CPU busy (0.92 for the Fedora 44
+boot of 2026-11-28 on helios, 176.93 s, with 4.39 of 28 other CPUs busy), so
+on a two-core reserve a value well above 1.2 says other work ran on the
+reserved threads during that repeat. `other_busy_cpus` does
 not touch the reserved cores, but a high value (a build on most of the
 host) still slows them through shared L3 capacity, memory bandwidth and a
 lower boost clock. Read such a repeat as an upper bound on the time, not as
