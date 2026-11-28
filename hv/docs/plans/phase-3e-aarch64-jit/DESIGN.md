@@ -2127,6 +2127,121 @@ above that for most of the set, so the workers were idle there.
   minutes. It used 2 to 5 % of a core there (`schedstat`). A reaper ended
   such VMs from then on.
 
+### T3, measured by card #1204
+
+Bar T3 of Q4 (O1): CoreMark at least 100 % of QEMU, and the Debian boot,
+`sha256` and `xz` each at least 50 % of QEMU, at 1 and 4 vCPUs. Helios,
+2026-11-28, *measured*, `next` at `ebdbfd08` (J10 to J14 merged, the JIT on
+by default), the release build. QEMU 11.1.3 is a black box: no QEMU source
+was read (X1 to X3), and no other source. The rows are in
+`bench/history/aarch64.jsonl` with the note "card #1204 bar T3". They are
+marked dirty: the checkout differed from `ebdbfd08` only by that file. The
+host load is the load average (1 min) sampled every 10 s from the launch of
+a VM to its last result. Other cards ran builds and VMs at the same time.
+A percentage of QEMU is QEMU's time over vmlab-hv's time, and for the flat
+rows vmlab-hv's MIPS over QEMU's.
+
+**T3a. The flat rows**, `--backend jit` and QEMU on `flat-a64`, cores 28 to
+31, the median of 3, the two sides in turn, two runs, load 5 to 6:
+
+| Workload | vmlab-hv JIT, MIPS | QEMU, MIPS | Of QEMU |
+|---|---|---|---|
+| CoreMark mix | 2,636.6 and 2,641.1 | 2,480.2 and 2,298.2 | 106 and 115 % |
+| Scalar loop | 8,942 and 9,096 | 3,212 and 2,888 | 278 and 315 % |
+
+**T3b. The D2 suite**, Debian 13 (`--suite full`), cores 20 to 23, the
+median of 3. Round 2 ran one repeat of each side in turn, one VM at a time,
+so both sides saw the same host:
+
+| Row | vCPUs | vmlab-hv, s (the 3 runs) | QEMU, s (the 3 runs) | Of QEMU | Load, min to max | T3 |
+|---|---|---|---|---|---|---|
+| Boot to agent ready | 1 | 73.50 (73.50, 77.50, 60.36) | 32.32 (33.83, 32.24, 32.32) | 44 % | 6.3 to 12.7 | not met |
+| `sha256_256M` | 1 | 3.07 (3.07, 3.96, 2.48) | 2.01 (2.00, 2.01, 2.04) | 65 % | 6.3 to 12.7 | met |
+| `xz_9_32M` | 1 | 8.59 (8.59, 8.61, 8.58) | 2.70 (2.70, 2.75, 2.69) | 31 % | 6.3 to 12.7 | not met |
+| Boot to agent ready | 4 | 52.28 (46.48, 61.75, 52.28) | 22.70 (22.70, 20.31, 24.37) | 43 % | 6.1 to 15.6 | not met |
+| `sha256_256M` | 4 | 2.28 (2.12, 2.42, 2.28) | 2.00 (2.00, 1.95, 2.09) | 88 % | 6.1 to 15.6 | met |
+| `xz_9_32M` | 4 | 9.16 (9.16, 9.38, 8.64) | 2.63 (2.68, 2.63, 2.60) | 29 % | 6.1 to 15.6 | not met |
+
+Round 1 ran the three repeats of each side in a block, vmlab-hv on cores 20
+to 23 and then QEMU on cores 24 to 27. It gives the same verdicts: the boot
+at 43 and 41 %, `sha256` at 82 and 101 %, `xz` at 31 and 31 %. One repeat of
+each side has a boot over 80 s (vmlab-hv 134.6 s, QEMU 100.3 and 81.3 s)
+while other work took the load to 51, 20 and 23. The medians do not use
+them. The boot suite alone (`--suite boot`, vmlab-hv only, load 9.6 to 18.9)
+gave 71.05 s at one vCPU and 54.20 s at four, 45 and 42 % of the QEMU boots
+of round 2.
+
+- **T3c. The verdicts.** CoreMark meets T3, at 106 and 115 %. `sha256`
+  meets it at 65 % at one vCPU and 88 % at four (J13). The boot misses it
+  at 44 and 43 %: it needs 1.14 and 1.15 times. `xz` misses it at 31 and
+  29 %: it needs 1.6 and 1.7 times. Against the estimates of J9c, CoreMark
+  and `sha256` reached them, the boot is under its 60 to 75 %, and `xz` is
+  where J9b measured it (31 and 32 %), because N10 is not built.
+
+**T3d. The profiles** of the two rows that miss, the W1 build (line tables
+and frame pointers) of the same commit with `VMLAB_HV_JIT_PERF_MAP=1`, one
+full suite at each vCPU count on cores 20 to 23 (load 12 to 15 at the
+start), every vCPU thread sampled by `measure/ipraw.c`, the windows of the
+boot and of `xz` cut from the bench log and classified by
+`measure/ipclass.py`. The counters are from the JIT lines of the same runs
+and of the boot suite rows.
+
+| Share of the samples | Boot, 1 vCPU | Boot, 4 vCPUs | `xz`, 1 vCPU | `xz`, 4 vCPUs |
+|---|---|---|---|---|
+| Samples | 58,717 | 95,078 | 8,991 | 9,453 |
+| Compiled code: the blocks | 25.1 % | 17.0 % | 24.6 % | 25.9 % |
+| Round trips: entering and leaving, the lookup and the checks of the loop, their library calls, the trampoline, the register copies | 27.2 % | 30.1 % | 7.2 % | 10.2 % |
+| The softmmu (TLB lookup, load and store paths) and the thunk with the pure calls | 9.6 % | 11.9 % | 56.8 % | 53.0 % |
+| RAM behind a TLB hit (`GuestBus`) and the page walk | 6.0 % | 7.8 % | 2.5 % | 2.0 % |
+| Translation and compile, with their library calls | 10.4 % | 10.8 % | 1.6 % | 1.6 % |
+| Devices and the VMM, with their library calls | 8.9 % | 8.2 % | 3.9 % | 3.7 % |
+| Fast TLB misses over accesses in the window | 3.6 % | 2.6 % | 32.2 % | 32.2 % |
+
+- **T3d1. `xz` is the miss path of the fast TLB.** 53 to 57 % of `xz` is
+  the thunk and the softmmu behind it: the thunk 16.8 %, `FastTlb::fill` 12.2 %, the 8-byte
+  `load` 9.6 % and its closure 4.2 %, `Side::fill_fast` 5.8 %, `lookup`
+  3.3 %, `hit_host` 2.2 % at one vCPU. One inlined access in three misses,
+  as in J12b (32 %), where 99.5 % of the misses were accesses not aligned
+  to their size. This is N10, which J12 proposed and which is not built.
+- **T3d2. The boot is the round trips first.** 27 % at one vCPU and 30 %
+  at four. The boot suite row at one vCPU (17.0e9 instructions at its last
+  JIT line) entered compiled code 113.7 million times: 80.0 million returns
+  at a block that the loop ends itself (70 %, H5c, J10m), 7.1 million at
+  the budget, 4.1 million with nothing to chain to, and 28.2 million misses
+  of the jump cache served in code.
+- **T3d3. The boot compiles each block about three times.** 1.06 million
+  compiles at one vCPU: 0.37 million the first time, 0.67 million after a
+  drop of a part of the region (64 %), 12,000 after an invalidation; 51
+  drops of a part, 903 MB of code, 2.69 s of compiling and 2.78 s of
+  translating. The region is 64 MB a CPU (`REGION_BYTES`) in 4 parts, and
+  J14 doubled the code of a boot (J14h1). Translation and compile are 10 to
+  11 % of the boot.
+- **T3d4. At four vCPUs the TLBI broadcast waits.** `Side::broadcast` is
+  3.1 % and `Shootdown::take` 1.2 % of the samples, and vCPU 0 counted 2.4
+  to 3.1 s of waiting for the other CPUs (`wait_ms`) in a boot of 46 to
+  62 s. At one vCPU none.
+- **T3d5. The memory path of the boot** behind a hit of the Rust TLB is 6
+  and 8 %: the bounds, the region and the copy of `GuestBus` (`sync.rs`,
+  with `raw_mutex` 1.2 % at four vCPUs). Not drafted: it is under the
+  costs above and needs a profile of its own.
+
+**T3e. Draft cards** for the rows that miss, for the lead to file. The
+estimates are *est.*, from the shares above.
+
+| Draft | Title | What | Measured share | Estimate |
+|---|---|---|---|---|
+| T3-D1 | aarch64 3e: unaligned accesses hit the fast TLB (N10) | The inlined lookup compares the page of the last byte of the access (`va + size - 1`) with the tag, so an access that is not aligned and stays in its page hits, and the same for a pair. K1 for the load and store group, K2 with unaligned addresses, K3 on a Debian boot, the `xz` rows at 1 and 4 vCPUs against QEMU. | 53 to 57 % of `xz` in the miss path, 32 % of its accesses miss (T3d1). 23 % of the misses of a boot (J12b). | `xz` 1.5 to 2.2 times (J12 basis): 47 to 69 % of QEMU at one vCPU, 43 to 63 % at four. The upper half of that meets T3. A boot: 1 to 2 %. |
+| T3-D2 | aarch64 3e: serve in compiled code the blocks that the loop ends itself | The returns of H5c (`MSR` of the table bases and the ASID at each kernel entry and exit, `ERET`, `SVC`, the system instructions): count them by instruction first, then end the block in a call that does the change of state and returns the next block's code as J10b does, for the kinds that make most returns. K2, K3 on a Debian boot at 1 and 2 vCPUs, the stress tests of J7, the boot rows against QEMU. | 70 % of the returns of a boot (80.0 million of 113.7 million), round trips 27 to 30 % of a boot (T3d2). | A boot 1.1 to 1.25 times if half to all of those returns stay in code. Basis: 70 % of the round-trip share, at 27 to 30 %. That is 48 to 55 % of QEMU: about at T3. |
+| T3-D3 | aarch64 3e: size the code region for superblocks | `REGION_BYTES` from a measured curve of the compiles after a drop and the boot time against the size (64, 128, 256, 512 MB a CPU), with the memory a 4-vCPU VM then maps, as J12 did for the TLB. | 64 % of the compiles of a boot are after a drop of a part, and translation and compile are 10 to 11 % of a boot (T3d3). | A boot 1.03 to 1.07 times. Basis: at most 64 % of the 10 to 11 %. |
+| T3-D4 | aarch64 3e: a cheaper TLBI broadcast at four vCPUs | Measure the broadcasts of a boot by kind and the wait of each, then post the invalidations that allow it without waiting for every CPU (the next block head of each CPU takes them), keeping the guarantees of J7 for the code pages. The stress tests of J7, K3 at 2 vCPUs, the boot rows at 4 vCPUs. | 4.3 % of the samples of a boot at four vCPUs, 2.4 to 3.1 s of waiting on vCPU 0 (T3d4). | A boot at four vCPUs 1.03 to 1.06 times. None at one vCPU. |
+
+- **T3f. What reaches T3.** `xz` needs T3-D1, and the estimate puts it
+  at or near the bar. The boot needs 1.14 and 1.15 times: T3-D2 alone is
+  about there, and T3-D3 and T3-D4 add to it. The spread of the boot rows
+  (60.4 to 77.5 s at one vCPU in round 2) is as large as that gain, so the
+  verdict on the boot after these cards needs more than three runs or a
+  quieter host.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -2203,6 +2318,9 @@ Proposed by card J9, open (Q15 of the MAP):
     of QEMU at 1 and 4 vCPUs. The estimates of J9c put the boot above
     that bar, and CoreMark, `sha256` and `xz` about at it. D1 is decided
     again with the rows of T3.
+  - Measured by card #1204 (T3 above): CoreMark at 106 and 115 %, `sha256`
+    at 65 and 88 %, the boot at 44 and 43 %, `xz` at 31 and 29 %. T3 is met
+    by CoreMark and `sha256` and not by the boot and `xz` (T3c).
   - **O2.** D1 as written: phase 3 is not finished until every row is at
     least 100 %. Cards after J14 (N6 to N9 and others) without an
     estimate that they reach it.

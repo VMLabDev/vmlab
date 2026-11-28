@@ -7,11 +7,12 @@ Scenarios run in order; each reports against the feature catalogue. The run
 fails when any feature failed or no scenario covered it.
 
 `--hypervisor vmlab`, the default, leaves the suite's machines to automatic
-selection (PRD §22): every x86 machine on vmlab-hv, the aarch64 guest of
-`arch.emulated` on QEMU. A scenario with no feature inside the phases
+selection (PRD §22): every x86 machine and the aarch64 guest of
+`arch.emulated` on vmlab-hv. A scenario with no feature inside the phases
 vmlab-hv has delivered (`--vmlab-phase`, default in `features.py`) does not
 run, and its features are skipped naming their phase. QEMU runs no x86
-guest, so `--hypervisor qemu` runs `arch.emulated` alone.
+guest, so `--hypervisor qemu` runs `arch.emulated` alone, its aarch64 guest
+pinned to QEMU.
 """
 
 from __future__ import annotations

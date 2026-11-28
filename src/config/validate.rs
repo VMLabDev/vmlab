@@ -5614,10 +5614,22 @@ lab "l" {
     fn tcg_and_another_arch_on_vmlab_are_refused() {
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "aarch64/t" hypervisor = "vmlab" accel = "tcg" }"#,
+            r#"vm "v" { template = "x86_64/t" hypervisor = "vmlab" accel = "tcg" }"#,
         );
         assert!(es.iter().any(|m| m.contains("accel = \"tcg\"")), "{es:#?}");
-        assert!(es.iter().any(|m| m.contains("aarch64")), "{es:#?}");
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "riscv64/t" hypervisor = "vmlab" }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("riscv64")), "{es:#?}");
+        // vmlab-hv emulates aarch64 (phase 3d): `tcg` is accepted there, and
+        // `kvm` is refused.
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "aarch64/t" hypervisor = "vmlab" accel = "kvm" }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("accel = \"kvm\"")), "{es:#?}");
+        assert!(es.iter().all(|m| !m.contains("accel = \"tcg\"")), "{es:#?}");
     }
 
     #[test]
