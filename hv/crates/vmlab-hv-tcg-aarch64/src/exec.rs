@@ -6168,9 +6168,7 @@ mod tests {
             ) -> vmlab_hv_tcg::Result<bool> {
                 self.flat.store_conditional(address, bytes, generation)
             }
-            fn transaction_lock(
-                &self,
-            ) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
+            fn transaction_lock(&self) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
                 self.flat.transaction_lock()
             }
             fn host_page(&mut self, page: u64) -> Option<HostPage> {
