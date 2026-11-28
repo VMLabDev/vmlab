@@ -54,6 +54,16 @@
 //! register slots of the state. RAX, RCX and RDX are scratch. The others,
 //! but RSP, are the pool.
 //!
+//! Card #1213: an operation of one word computes its result in the
+//! register that its word gets, the register of its first operand where
+//! nothing reads that operand later, so a result makes no move out of RAX.
+//! A load of one word loads into the register of its result. An `Add` of
+//! 64 bits that only the address of one inline load or store reads is
+//! taken into that access, as a `lea` of a base and a displacement or of a
+//! base and an index (`folds`). The outputs of a side exit go to the state
+//! straight from their registers, and an output of one word to a slot that
+//! its owner keeps narrow (`Shape::narrow`) makes no store to its high half.
+//!
 //! Sources read: the Intel 64 and IA-32 Architectures Software Developer's
 //! Manual, volume 2, for what each instruction computes, and the System V
 //! AMD64 ABI for the call of the thunk. The operations are those of
@@ -365,6 +375,12 @@ pub struct Shape<'a> {
     /// The side exits of a superblock (J14). A guard of a leave that is not
     /// here, or of one that cannot be linked, calls the thunk.
     pub sides: &'a [Side],
+    /// The register slots of one word, bit `r` for the slot `r`: the high
+    /// half of each is 0 whenever a block is entered, and the owner never
+    /// puts anything else there. An output of one word to such a slot
+    /// writes its low half only (card #1213): the store of zero to the
+    /// high half would be dead. Slots past 127 are never narrow.
+    pub narrow: u128,
 }
 
 /// A defect that the emitter puts into its code on purpose, for the tests
@@ -433,6 +449,14 @@ enum Val {
     Reg(Reg),
     Mem(Rm),
     Imm(u64),
+}
+
+/// The address of an inline load or store: the value of its word, or the
+/// two operands of the addition that it folds (`folds`).
+#[derive(Clone, Copy, Debug)]
+enum Address {
+    Word(Val),
+    Sum(Val, Val),
 }
 
 /// The words that `op` reads, then those that it writes, pushed onto `out`:
@@ -774,6 +798,78 @@ fn signed(
     Some((left, right, wide, flips))
 }
 
+/// The additions of the block that its inline loads and stores take into
+/// their address (3e card #1213): an `Add` of 64 bits whose result only
+/// the address of one inline access reads, not its leave, and whose
+/// operands no operation between them writes. The access computes the
+/// address with a `lea`, and the emitter skips the `Add`. `folded[j]` is
+/// the pair of operands for the access `j`. The uses of the operands move
+/// to the access.
+fn folds(
+    shape: &Shape,
+    slots: &[Slot],
+    spans: &[Span],
+    uses: &mut [Vec<u32>],
+    folded: &mut [Option<(Slot, Slot)>],
+    skip: &mut [bool],
+) {
+    let ops = shape.ops;
+    for i in 0..ops.len() {
+        let op = ops[i];
+        if skip[i] || op.code != Code::Add || op.imm != u64::MAX {
+            continue;
+        }
+        let word = op.dst;
+        let [j] = uses[usize::from(word)][..] else {
+            continue;
+        };
+        let j = j as usize;
+        let Some(access) = ops.get(j) else {
+            continue;
+        };
+        if skip[j] || folded[j].is_some() || inline_access(access, shape.memory).is_none() {
+            continue;
+        }
+        // The address, and nothing else of the access: not the value of a
+        // store, not its leave (whose stub would want it in the frame), and
+        // not the result of a load.
+        let leave = shape.leaves.get(access.imm as usize);
+        let is_store = matches!(
+            access.code,
+            Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 | Code::StorePair
+        );
+        if access.a != word
+            || (is_store && access.b == word)
+            || (!is_store && access.dst == word)
+            || (access.code == Code::StorePair && access.dst == word)
+            || (access.code == Code::LoadPair && access.dst.wrapping_add(1) == word)
+            || leave.is_none_or(|leave| leave.contains(&word))
+            || [op.a, op.b].contains(&word)
+        {
+            continue;
+        }
+        // The operands hold at the access the values that they held at
+        // the addition.
+        if spans[i + 1..j]
+            .iter()
+            .any(|span| span.writes(slots).iter().any(|w| *w == op.a || *w == op.b))
+        {
+            continue;
+        }
+        for operand in [op.a, op.b] {
+            let list = &mut uses[usize::from(operand)];
+            list.retain(|at| *at as usize != i);
+            let at = list.partition_point(|at| *at < j as u32);
+            if list.get(at) != Some(&(j as u32)) {
+                list.insert(at, j as u32);
+            }
+        }
+        uses[usize::from(word)].clear();
+        skip[i] = true;
+        folded[j] = Some((op.a, op.b));
+    }
+}
+
 struct Emitter<'a> {
     asm: Asm,
     /// Where each word is at the head of the block.
@@ -934,32 +1030,6 @@ impl Emitter<'_> {
         }
     }
 
-    /// `<alu> rax, value`.
-    fn alu(&mut self, alu: Alu, value: Val) {
-        match value {
-            Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
-                self.asm.alu_imm(alu, Rm::Reg(RAX), value as i32);
-            }
-            other => {
-                let rm = self.rm(other, RDX);
-                self.asm.alu(alu, RAX, rm);
-            }
-        }
-    }
-
-    /// `rax &= mask`, in its shortest form.
-    fn mask(&mut self, mask: u64) {
-        if mask == u64::MAX {
-        } else if mask == u64::from(u32::MAX) {
-            self.asm.mov32(RAX, RAX);
-        } else if i32::try_from(mask as i64).is_ok() {
-            self.asm.alu_imm(Alu::And, Rm::Reg(RAX), mask as i32);
-        } else {
-            self.asm.mov_imm(RDX, mask);
-            self.asm.alu(Alu::And, RAX, Rm::Reg(RDX));
-        }
-    }
-
     /// The result of the operation at `at` is in RAX: free the registers of
     /// the operands that are not read again, and give `dst` a register when
     /// it is read later.
@@ -972,6 +1042,39 @@ impl Emitter<'_> {
         }
         let reg = self.allocate(at);
         self.asm.mov(reg, Rm::Reg(RAX));
+        self.bind(dst, reg, true);
+    }
+
+    /// Whether the operand `word`, whose value is `value`, is in a register
+    /// that nothing reads after `at`: the result can be computed in it.
+    fn reusable(&mut self, word: Slot, value: Val, at: u32) -> bool {
+        matches!(value, Val::Reg(_)) && self.next_use(word, at).is_none()
+    }
+
+    /// The register of the pool that the result of the operation at `at`
+    /// is computed in, starting from the value of its operand `word`: the
+    /// register of that operand when nothing reads it later, else a new
+    /// one with a copy of it. So the result needs no move out of RAX. The
+    /// other operands of the operation are pinned already, and stay where
+    /// they are.
+    fn target(&mut self, word: Slot, value: Val, at: u32) -> Reg {
+        if let Val::Reg(reg) = value
+            && self.next_use(word, at).is_none()
+        {
+            return reg;
+        }
+        let reg = self.allocate(at);
+        self.load(reg, value);
+        reg
+    }
+
+    /// The result of the operation at `at` is in `reg`, from `target`: free
+    /// the registers of the operands that are not read again, and give
+    /// `reg` to `dst`, which is read later.
+    fn define_in(&mut self, dst: Slot, reads: &[Slot], at: u32, reg: Reg) {
+        self.release(reads, at);
+        self.unbind(dst);
+        debug_assert!(self.owner[usize::from(reg.0)].is_none(), "a free target");
         self.bind(dst, reg, true);
     }
 
@@ -1346,8 +1449,9 @@ impl Emitter<'_> {
 
     /// The stub of a side exit (J14): the outputs from where their words
     /// are, the PC, the instructions that did not run, and a jump that the
-    /// owner links. Every word goes to the frame first, so that an output
-    /// cannot write over the slot of an input that a later one reads.
+    /// owner links. The outputs go to the state straight from where their
+    /// words are (`write_state`, card #1213): only an input that an output
+    /// would write over goes through the frame.
     fn side_exit(&mut self, side: &Side, at: usize) {
         let Some(next) = self.shape.next else {
             return;
@@ -1362,26 +1466,7 @@ impl Emitter<'_> {
             self.asm
                 .alu_imm(Alu::Sub, Rm::Mem(R13, CONTEXT_ACCESSES), after as i32);
         }
-        for (_, place) in &side.outputs {
-            for word in [place.slot, place.slot + 1]
-                .into_iter()
-                .take(1 + usize::from(place.wide))
-            {
-                let w = self.words[usize::from(word)];
-                Self::home_code(&mut self.asm, word, w);
-            }
-        }
-        for (register, place) in &side.outputs {
-            let base = *register as i32 * 16;
-            self.asm.mov(RAX, Self::frame(place.slot));
-            self.asm.store(Rm::Mem(R15, base), RAX);
-            if place.wide {
-                self.asm.mov(RAX, Self::frame(place.slot + 1));
-                self.asm.store(Rm::Mem(R15, base + 8), RAX);
-            } else {
-                self.asm.store_imm(Rm::Mem(R15, base + 8), 0);
-            }
-        }
+        self.write_state(&side.outputs);
         let pc = i32::try_from(u64::from(next.pc) * 16).unwrap_or(i32::MAX);
         let distance = side.distance as i64 as i32;
         if distance != 0 {
@@ -1544,20 +1629,24 @@ impl Emitter<'_> {
         let b = self.value(op.b, at);
         let left = self.operand(fusion.left, at);
         let right = self.operand(fusion.right, at);
-        if let (Val::Imm(x), Val::Imm(y)) = (left, right) {
+        let t = if let (Val::Imm(x), Val::Imm(y)) = (left, right) {
             let holds = self.compare(fusion, Val::Imm(x), Val::Imm(y)) == Err(true);
-            self.load(RAX, if holds { a } else { b });
+            let (word, value) = if holds { (op.a, a) } else { (op.b, b) };
+            self.target(word, value, at)
         } else {
             // Every move comes before the comparison: a move of zero is an
-            // `xor`, which writes the flags.
+            // `xor`, which writes the flags. The result is computed in the
+            // register of `b` when nothing reads `b` later; the comparison
+            // reads its operands first, so it may be one of them.
             let rm = self.rm(a, RDX);
-            self.load(RAX, b);
+            let t = self.target(op.b, b, at);
             match self.compare(fusion, left, right) {
-                Ok(cond) => self.asm.cmov(cond, RAX, rm),
+                Ok(cond) => self.asm.cmov(cond, t, rm),
                 Err(_) => unreachable!("two constants are handled above"),
             }
-        }
-        self.define(op.dst, &all, at);
+            t
+        };
+        self.define_in(op.dst, &all, at, t);
         self.all = all;
     }
 
@@ -1582,24 +1671,95 @@ impl Emitter<'_> {
         }
     }
 
+    /// `dst = x + y` in 64 bits, with a `lea` where both are registers or
+    /// one is a register and the other a displacement. `scratch` holds a
+    /// constant that is no immediate. It is not `dst`.
+    fn sum(&mut self, dst: Reg, x: Val, y: Val, scratch: Reg) {
+        let disp = |value: u64| i32::try_from(value as i64).ok();
+        match (x, y) {
+            (Val::Reg(base), Val::Imm(value)) | (Val::Imm(value), Val::Reg(base))
+                if disp(value).is_some() =>
+            {
+                self.asm.lea(dst, base, disp(value).unwrap_or(0));
+            }
+            (Val::Reg(base), Val::Reg(index)) => self.asm.lea_index(dst, base, index, 0),
+            (Val::Imm(a), Val::Imm(b)) => self.asm.mov_imm(dst, a.wrapping_add(b)),
+            (x, y) => {
+                self.load(dst, x);
+                match y {
+                    Val::Imm(value) if disp(value).is_some() => {
+                        self.asm
+                            .alu_imm(Alu::Add, Rm::Reg(dst), disp(value).unwrap_or(0));
+                    }
+                    Val::Imm(value) => {
+                        self.asm.mov_imm(scratch, value);
+                        self.asm.alu(Alu::Add, dst, Rm::Reg(scratch));
+                    }
+                    Val::Reg(reg) => self.asm.alu(Alu::Add, dst, Rm::Reg(reg)),
+                    Val::Mem(memory) => self.asm.alu(Alu::Add, dst, memory),
+                }
+            }
+        }
+    }
+
+    /// Put the address of the access `op` into its word of the frame, for
+    /// a stub or the thunk, when the access folds an addition (`folds`):
+    /// its word is computed nowhere else. It uses RCX and RDX.
+    fn home_address(&mut self, op: &Op, address: Address) {
+        if let Address::Sum(x, y) = address {
+            self.sum(RDX, x, y, RCX);
+            self.asm.store(Self::frame(op.a), RDX);
+        }
+    }
+
     /// A load or a store of `bytes` bytes over the fast TLB (H7). The
-    /// address is the word `a`, the value of a store the word `b`, the
-    /// result of a load the word `dst`, and the leave `imm`. An access of 16
-    /// bytes is a pair of words (`LoadPair`, `StorePair`): the result in
-    /// `dst` and the word after it, the value in `b` (low) and `dst` (high).
-    /// It hits where its 16 bytes are in one page, and it is two accesses of
-    /// 8 bytes of the host.
-    fn access(&mut self, index: usize, op: &Op, reads: &[Slot], bytes: u8, store: bool) {
+    /// address is the word `a`, or the sum of the two words of the addition
+    /// that it folds (`fold`, card #1213), the value of a store the word
+    /// `b`, the result of a load the word `dst`, and the leave `imm`. An
+    /// access of 16 bytes is a pair of words (`LoadPair`, `StorePair`): the
+    /// result in `dst` and the word after it, the value in `b` (low) and
+    /// `dst` (high). It hits where its 16 bytes are in one page, and it is
+    /// two accesses of 8 bytes of the host. A load of one word that is read
+    /// later loads straight into the register of its word.
+    fn access(
+        &mut self,
+        index: usize,
+        op: &Op,
+        reads: &[Slot],
+        bytes: u8,
+        store: bool,
+        fold: Option<(Slot, Slot)>,
+    ) {
         let at = index as u32;
         let pair = bytes == 16;
         let logged = self.shape.memory == Memory::Logged;
-        let address = self.value(op.a, at);
+        let mut all = std::mem::take(&mut self.all);
+        all.clear();
+        all.extend_from_slice(reads);
+        let address = match fold {
+            Some((x, y)) => {
+                all.extend_from_slice(&[x, y]);
+                let x = self.value(x, at);
+                let y = self.value(y, at);
+                Address::Sum(x, y)
+            }
+            None => Address::Word(self.value(op.a, at)),
+        };
         let value = store.then(|| self.value(op.b, at));
         let high = (store && pair).then(|| self.value(op.dst, at));
+        // The register of the result of a load of one word.
+        let result = if !store && !pair && self.next_use(op.dst, at).is_some() {
+            self.allocate(at)
+        } else {
+            RAX
+        };
         let miss = self.asm.label();
         let join = self.asm.label();
         // RCX: the entry of the page in the table of the block.
-        self.load(RAX, address);
+        match address {
+            Address::Word(value) => self.load(RAX, value),
+            Address::Sum(x, y) => self.sum(RAX, x, y, RDX),
+        }
         self.asm.mov(RCX, Rm::Reg(RAX));
         self.asm.shift_imm(Shift::Shr, RCX, (12 - ENTRY_BITS) as u8);
         self.asm
@@ -1610,10 +1770,10 @@ impl Emitter<'_> {
         // The entry is at the place of the page of the first byte, so a tag
         // that equals the page of the last byte is also the page of the
         // first: an access that crosses into the next page misses.
-        self.asm.mov(RDX, Rm::Reg(RAX));
         if bytes > 1 {
-            self.asm
-                .alu_imm(Alu::Add, Rm::Reg(RDX), i32::from(bytes) - 1);
+            self.asm.lea(RDX, RAX, i32::from(bytes) - 1);
+        } else {
+            self.asm.mov(RDX, Rm::Reg(RAX));
         }
         self.asm.alu_imm(Alu::And, Rm::Reg(RDX), !0xfff);
         self.asm.alu(Alu::Cmp, RDX, Rm::Mem(RCX, TAG));
@@ -1649,11 +1809,13 @@ impl Emitter<'_> {
                 } else {
                     self.home_all(&[op.a, op.b]);
                 }
+                self.home_address(op, address);
                 self.thunk(index, LOGGED, false);
             }
             self.asm.cold(true);
             self.asm.bind(watched);
             self.home_all(&[op.a]);
+            self.home_address(op, address);
             self.thunk(index, WATCHED, false);
             self.asm.jmp(back);
             self.asm.cold(false);
@@ -1664,28 +1826,34 @@ impl Emitter<'_> {
                 self.asm.store(Self::frame(op.dst), RAX);
                 self.asm.store(Self::frame(op.dst + 1), RCX);
                 self.home_all(&[op.a]);
+                self.home_address(op, address);
                 self.thunk(index, LOGGED, false);
                 self.asm.mov(RAX, Self::frame(op.dst));
                 self.asm.mov(RCX, Self::frame(op.dst + 1));
             }
         } else {
-            self.asm.load_sized(RAX, Rm::Mem(RAX, 0), bytes);
+            self.asm.load_sized(result, Rm::Mem(RAX, 0), bytes);
             if logged {
-                self.asm.store(Self::frame(op.dst), RAX);
+                self.asm.store(Self::frame(op.dst), result);
                 self.home_all(&[op.a]);
+                self.home_address(op, address);
                 self.thunk(index, LOGGED, false);
-                self.asm.mov(RAX, Self::frame(op.dst));
+                self.asm.mov(result, Self::frame(op.dst));
             }
         }
         self.asm.bind(join);
-        // The miss, with the places of the words as they are here. The
-        // thunk writes the result of a load into its word of the frame.
+        // The miss, with the places of the words as they are here. RAX
+        // holds the address. The thunk writes the result of a load into its
+        // word of the frame.
         self.asm.cold(true);
         self.asm.bind(miss);
         self.home_all(reads);
+        if fold.is_some() {
+            self.asm.store(Self::frame(op.a), RAX);
+        }
         self.thunk(index, MISS, true);
         if !store {
-            self.asm.mov(RAX, Self::frame(op.dst));
+            self.asm.mov(result, Self::frame(op.dst));
             if pair {
                 self.asm.mov(RCX, Self::frame(op.dst + 1));
             }
@@ -1693,22 +1861,27 @@ impl Emitter<'_> {
         self.asm.jmp(join);
         self.asm.cold(false);
         if store {
-            self.release(reads, at);
+            self.release(&all, at);
         } else if pair {
             self.define_two(
                 Place {
                     slot: op.dst,
                     wide: true,
                 },
-                reads,
+                &all,
                 at,
             );
+        } else if result != RAX {
+            self.define_in(op.dst, &all, at, result);
         } else {
-            self.define(op.dst, reads, at);
+            self.define(op.dst, &all, at);
         }
+        self.all = all;
     }
 
-    /// One pure operation of one word, inline.
+    /// One pure operation of one word, inline. The result is computed in
+    /// the register that its word gets (`target`), and the comparisons,
+    /// which write AL, in RAX.
     fn pure(&mut self, index: usize, op: &Op, reads: &[Slot]) -> Result<(), Refused> {
         let at = index as u32;
         let width = op.aux;
@@ -1720,29 +1893,34 @@ impl Emitter<'_> {
             self.words[usize::from(op.dst)].home = Home::Frame;
             return Ok(());
         }
-        match op.code {
-            Code::Add | Code::Sub | Code::And | Code::Or | Code::Xor => {
+        let t = match op.code {
+            Code::Add | Code::Sub | Code::And | Code::Or | Code::Xor | Code::Mul => {
                 let a = self.value(op.a, at);
                 let b = self.value(op.b, at);
-                self.load(RAX, a);
-                let alu = match op.code {
-                    Code::Add if self.defect == Defect::AddSubtracts => Alu::Sub,
-                    Code::Add => Alu::Add,
-                    Code::Sub => Alu::Sub,
-                    Code::And => Alu::And,
-                    Code::Or => Alu::Or,
-                    _ => Alu::Xor,
-                };
-                self.alu(alu, b);
-                self.mask(op.imm);
-            }
-            Code::Mul => {
-                let a = self.value(op.a, at);
-                let b = self.value(op.b, at);
-                self.load(RAX, a);
-                let rm = self.rm(b, RDX);
-                self.asm.imul(RAX, rm);
-                self.mask(op.imm);
+                // A commutative operation is computed in the register of
+                // its second operand when only that one is free after it.
+                let swap = op.code != Code::Sub
+                    && op.a != op.b
+                    && !self.reusable(op.a, a, at)
+                    && self.reusable(op.b, b, at);
+                let (first, a, b) = if swap { (op.b, b, a) } else { (op.a, a, b) };
+                let t = self.target(first, a, at);
+                if op.code == Code::Mul {
+                    let rm = self.rm(b, RDX);
+                    self.asm.imul(t, rm);
+                } else {
+                    let alu = match op.code {
+                        Code::Add if self.defect == Defect::AddSubtracts => Alu::Sub,
+                        Code::Add => Alu::Add,
+                        Code::Sub => Alu::Sub,
+                        Code::And => Alu::And,
+                        Code::Or => Alu::Or,
+                        _ => Alu::Xor,
+                    };
+                    self.alu_on(alu, t, b);
+                }
+                self.mask_on(t, op.imm);
+                t
             }
             Code::ShiftLeft | Code::ShiftRight => {
                 let shift = if op.code == Code::ShiftLeft {
@@ -1754,21 +1932,28 @@ impl Emitter<'_> {
                 let b = self.value(op.b, at);
                 match b {
                     Val::Imm(count) if count < 64 => {
-                        self.load(RAX, a);
-                        self.asm.shift_imm(shift, RAX, count as u8);
+                        let t = self.target(op.a, a, at);
+                        self.asm.shift_imm(shift, t, count as u8);
+                        self.mask_on(t, op.imm);
+                        t
                     }
-                    Val::Imm(_) => self.asm.xor32(RAX, RAX),
+                    Val::Imm(_) => {
+                        let t = self.target(op.a, a, at);
+                        self.asm.xor32(t, t);
+                        t
+                    }
                     _ => {
-                        self.load(RAX, a);
                         self.load(RCX, b);
-                        self.asm.shift_cl(shift, RAX);
+                        let t = self.target(op.a, a, at);
+                        self.asm.shift_cl(shift, t);
                         // A count of 64 or more gives zero.
                         self.asm.xor32(RDX, RDX);
                         self.asm.alu_imm(Alu::Cmp, Rm::Reg(RCX), 64);
-                        self.asm.cmov(Cond::Ae, RAX, Rm::Reg(RDX));
+                        self.asm.cmov(Cond::Ae, t, Rm::Reg(RDX));
+                        self.mask_on(t, op.imm);
+                        t
                     }
                 }
-                self.mask(op.imm);
             }
             Code::ArithmeticShiftRight => {
                 if width == 0 || width > 64 {
@@ -1776,24 +1961,31 @@ impl Emitter<'_> {
                 }
                 let a = self.value(op.a, at);
                 let b = self.value(op.b, at);
-                self.load(RAX, a);
-                self.asm.shift_imm(Shift::Shl, RAX, 64 - width);
-                self.asm.shift_imm(Shift::Sar, RAX, 64 - width);
+                if !matches!(b, Val::Imm(_)) {
+                    self.load(RCX, b);
+                }
+                let t = self.target(op.a, a, at);
+                if width < 64 {
+                    self.asm.shift_imm(Shift::Shl, t, 64 - width);
+                    self.asm.shift_imm(Shift::Sar, t, 64 - width);
+                }
                 match b {
                     Val::Imm(count) => {
                         let count = count.min(u64::from(width) - 1) as u8;
-                        self.asm.shift_imm(Shift::Sar, RAX, count);
+                        if count != 0 {
+                            self.asm.shift_imm(Shift::Sar, t, count);
+                        }
                     }
                     _ => {
                         // The count is at most the width less one.
-                        self.load(RCX, b);
                         self.asm.mov_imm(RDX, u64::from(width) - 1);
                         self.asm.alu(Alu::Cmp, RCX, Rm::Reg(RDX));
                         self.asm.cmov(Cond::A, RCX, Rm::Reg(RDX));
-                        self.asm.shift_cl(Shift::Sar, RAX);
+                        self.asm.shift_cl(Shift::Sar, t);
                     }
                 }
-                self.mask(op.imm);
+                self.mask_on(t, op.imm);
+                t
             }
             Code::Equal | Code::NotEqual | Code::Less | Code::LessEqual | Code::IsZero => {
                 let a = self.value(op.a, at);
@@ -1821,26 +2013,32 @@ impl Emitter<'_> {
                     _ => Cond::Be,
                 };
                 self.asm.setcc_al(cond);
+                self.define(op.dst, reads, at);
+                return Ok(());
             }
             Code::BitNot | Code::Negate => {
                 let a = self.value(op.a, at);
-                self.load(RAX, a);
+                let t = self.target(op.a, a, at);
                 if op.code == Code::BitNot {
-                    self.asm.not(RAX);
+                    self.asm.not(t);
                 } else {
-                    self.asm.neg(RAX);
+                    self.asm.neg(t);
                 }
-                self.mask(op.imm);
+                self.mask_on(t, op.imm);
+                t
             }
             Code::SignExtend => {
                 if width == 0 || width > 64 {
                     return Err(Refused::Malformed);
                 }
                 let a = self.value(op.a, at);
-                self.load(RAX, a);
-                self.asm.shift_imm(Shift::Shl, RAX, 64 - width);
-                self.asm.shift_imm(Shift::Sar, RAX, 64 - width);
-                self.mask(op.imm);
+                let t = self.target(op.a, a, at);
+                if width < 64 {
+                    self.asm.shift_imm(Shift::Shl, t, 64 - width);
+                    self.asm.shift_imm(Shift::Sar, t, 64 - width);
+                }
+                self.mask_on(t, op.imm);
+                t
             }
             Code::LeadingZeros
             | Code::TrailingZeros
@@ -1860,24 +2058,24 @@ impl Emitter<'_> {
                     return Err(Refused::Form(op.code));
                 }
                 let a = self.value(op.a, at);
-                self.load(RAX, a);
-                self.mask(low(width));
+                let t = self.target(op.a, a, at);
+                self.mask_on(t, low(width));
                 match op.code {
                     Code::LeadingZeros => {
-                        self.asm.lzcnt(RAX, RAX);
+                        self.asm.lzcnt(t, t);
                         if width < 64 {
                             self.asm
-                                .alu_imm(Alu::Sub, Rm::Reg(RAX), i32::from(64 - width));
+                                .alu_imm(Alu::Sub, Rm::Reg(t), i32::from(64 - width));
                         }
                     }
                     Code::TrailingZeros => {
                         // TZCNT gives 64 for zero: at most the width.
-                        self.asm.tzcnt(RAX, RAX);
+                        self.asm.tzcnt(t, t);
                         self.asm.mov_imm(RDX, u64::from(width));
-                        self.asm.alu(Alu::Cmp, RAX, Rm::Reg(RDX));
-                        self.asm.cmov(Cond::A, RAX, Rm::Reg(RDX));
+                        self.asm.alu(Alu::Cmp, t, Rm::Reg(RDX));
+                        self.asm.cmov(Cond::A, t, Rm::Reg(RDX));
                     }
-                    Code::PopCount => self.asm.popcnt(RAX, RAX),
+                    Code::PopCount => self.asm.popcnt(t, t),
                     Code::ReverseBits => {
                         // The bits of each byte in the opposite order, by
                         // swapping halves of 1, 2 and 4 bits, then the
@@ -1887,32 +2085,36 @@ impl Emitter<'_> {
                             (2, 0x3333_3333_3333_3333),
                             (4, 0x0f0f_0f0f_0f0f_0f0f),
                         ] {
-                            self.asm.mov(RCX, Rm::Reg(RAX));
+                            self.asm.mov(RCX, Rm::Reg(t));
                             self.asm.shift_imm(Shift::Shr, RCX, count);
                             self.asm.mov_imm(RDX, mask);
                             self.asm.alu(Alu::And, RCX, Rm::Reg(RDX));
-                            self.asm.alu(Alu::And, RAX, Rm::Reg(RDX));
-                            self.asm.shift_imm(Shift::Shl, RAX, count);
-                            self.asm.alu(Alu::Or, RAX, Rm::Reg(RCX));
+                            self.asm.alu(Alu::And, t, Rm::Reg(RDX));
+                            self.asm.shift_imm(Shift::Shl, t, count);
+                            self.asm.alu(Alu::Or, t, Rm::Reg(RCX));
                         }
-                        self.asm.bswap(RAX);
-                        self.asm.shift_imm(Shift::Shr, RAX, 64 - width);
+                        self.asm.bswap(t);
+                        self.asm.shift_imm(Shift::Shr, t, 64 - width);
                     }
                     _ => {
-                        self.asm.bswap(RAX);
-                        self.asm.shift_imm(Shift::Shr, RAX, 64 - width);
+                        self.asm.bswap(t);
+                        self.asm.shift_imm(Shift::Shr, t, 64 - width);
                     }
                 }
-                self.mask(op.imm);
+                self.mask_on(t, op.imm);
+                t
             }
             Code::Slice => {
                 if width >= 64 {
                     return Err(Refused::Malformed);
                 }
                 let a = self.value(op.a, at);
-                self.load(RAX, a);
-                self.asm.shift_imm(Shift::Shr, RAX, width);
-                self.mask(op.imm);
+                let t = self.target(op.a, a, at);
+                if width != 0 {
+                    self.asm.shift_imm(Shift::Shr, t, width);
+                }
+                self.mask_on(t, op.imm);
+                t
             }
             Code::Concat => {
                 if width >= 64 {
@@ -1920,10 +2122,21 @@ impl Emitter<'_> {
                 }
                 let a = self.value(op.a, at);
                 let b = self.value(op.b, at);
-                self.load(RAX, a);
-                self.asm.shift_imm(Shift::Shl, RAX, width);
-                self.alu(Alu::Or, b);
-                self.mask(op.imm);
+                // The shift writes the register before the `or` reads `b`:
+                // a `b` that is `a` must not be in it.
+                let t = if op.a == op.b {
+                    let t = self.allocate(at);
+                    self.load(t, a);
+                    t
+                } else {
+                    self.target(op.a, a, at)
+                };
+                if width != 0 {
+                    self.asm.shift_imm(Shift::Shl, t, width);
+                }
+                self.alu_on(Alu::Or, t, b);
+                self.mask_on(t, op.imm);
+                t
             }
             Code::Select => {
                 let condition = Slot::try_from(op.imm).map_err(|_| Refused::Malformed)?;
@@ -1931,15 +2144,19 @@ impl Emitter<'_> {
                 let b = self.value(op.b, at);
                 let c = self.value(condition, at);
                 match c {
-                    Val::Imm(value) => self.load(RAX, if value != 0 { a } else { b }),
+                    Val::Imm(value) => {
+                        let (word, value) = if value != 0 { (op.a, a) } else { (op.b, b) };
+                        self.target(word, value, at)
+                    }
                     _ => {
                         // Every move comes before the test: a move of zero
                         // is an `xor`, which writes the flags.
                         let c = self.reg(c, RCX);
                         let rm = self.rm(a, RDX);
-                        self.load(RAX, b);
+                        let t = self.target(op.b, b, at);
                         self.asm.test(c, c);
-                        self.asm.cmov(Cond::Ne, RAX, rm);
+                        self.asm.cmov(Cond::Ne, t, rm);
+                        t
                     }
                 }
             }
@@ -1947,8 +2164,8 @@ impl Emitter<'_> {
                 let high = op.dst + 1;
                 if self.next_use(op.dst, at).is_some() {
                     let a = self.value(op.a, at);
-                    self.load(RAX, a);
-                    self.define(op.dst, reads, at);
+                    let t = self.target(op.a, a, at);
+                    self.define_in(op.dst, reads, at, t);
                 } else {
                     self.release(reads, at);
                     self.unbind(op.dst);
@@ -1962,8 +2179,8 @@ impl Emitter<'_> {
                 return Ok(());
             }
             _ => return Err(Refused::Malformed),
-        }
-        self.define(op.dst, reads, at);
+        };
+        self.define_in(op.dst, reads, at, t);
         Ok(())
     }
 
@@ -1976,7 +2193,7 @@ impl Emitter<'_> {
         self.value(place.slot + Slot::from(high), at)
     }
 
-    /// `<alu> dst, value` for RAX or RCX, through RDX where it must.
+    /// `<alu> dst, value`, through RDX where it must. `dst` is not RDX.
     fn alu_on(&mut self, alu: Alu, dst: Reg, value: Val) {
         match value {
             Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
@@ -2244,20 +2461,6 @@ impl Emitter<'_> {
         true
     }
 
-    /// Write `value` to `target`, through RAX where it must.
-    fn put(&mut self, target: Rm, value: Val) {
-        match value {
-            Val::Reg(reg) => self.asm.store(target, reg),
-            Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
-                self.asm.store_imm(target, value as i32);
-            }
-            other => {
-                self.load(RAX, other);
-                self.asm.store(target, RAX);
-            }
-        }
-    }
-
     /// The value of `word` as it is now, without a new register.
     fn current(&self, word: Slot) -> Val {
         let w = self.words[usize::from(word)];
@@ -2444,45 +2647,85 @@ impl Emitter<'_> {
         [a, b]
     }
 
-    /// The outputs to the state.
+    /// The outputs of the end of the block to the state.
     fn write_outputs(&mut self) {
-        let outputs = self.shape.outputs;
+        self.write_state(self.shape.outputs);
+    }
+
+    /// Whether the register slot `register` holds one word (`Shape::narrow`).
+    fn narrow(&self, register: u32) -> bool {
+        register < 128 && self.shape.narrow >> register & 1 == 1
+    }
+
+    /// Write `outputs` to the state, each word from where it is now: a
+    /// register, a constant, the frame or the slot of an input. The code
+    /// changes no register but RAX and RDX, and the places of the words do
+    /// not change, so a stub can write them too (a side exit, card #1213).
+    /// An input that is still in a slot that an output writes, other than
+    /// its own, goes to the frame first. A narrow slot gets no store to its
+    /// high half.
+    fn write_state(&mut self, outputs: &[(u32, Place)]) {
         let targets = || {
             outputs.iter().map(|(register, _)| {
                 let start = *register as i32 * 16;
                 (start, start + 16)
             })
         };
-        // An input that is still in its slot is read before an output
-        // writes that slot, unless the output writes it to itself.
-        for (register, place) in outputs {
-            for (half, word) in [(0, place.slot), (8, place.slot + 1)] {
-                if half == 8 && !place.wide {
-                    continue;
-                }
+        let words = &self.words;
+        let moved = |register: u32, half: i32, word: Slot| {
+            let w = words[usize::from(word)];
+            matches!((w.reg, w.home), (None, Home::Slot(offset))
+                if offset != register as i32 * 16 + half
+                    && targets().any(|(start, end)| (start..end).contains(&offset)))
+        };
+        // Each half of an output: its slot, its offset in the slot, its
+        // word, and whether that word goes through the frame.
+        let halves = || {
+            outputs.iter().flat_map(move |(register, place)| {
+                let high = place.wide.then(|| (*register, 8, place.slot + 1));
+                [Some((*register, 0, place.slot)), high]
+                    .into_iter()
+                    .flatten()
+                    .map(move |(register, half, word)| {
+                        (register, half, word, moved(register, half, word))
+                    })
+            })
+        };
+        for (_, _, word, moved) in halves() {
+            if moved {
                 let w = self.words[usize::from(word)];
-                if let (None, Home::Slot(offset)) = (w.reg, w.home)
-                    && offset != *register as i32 * 16 + half
-                    && targets().any(|(start, end)| (start..end).contains(&offset))
-                {
-                    self.materialize(word);
-                }
+                Self::home_code(&mut self.asm, word, w);
             }
         }
         for (register, place) in outputs {
             let base = *register as i32 * 16;
-            for (half, word) in [(0, place.slot), (8, place.slot + 1)] {
-                let target = Rm::Mem(R15, base + half);
-                if half == 8 && !place.wide {
-                    self.asm.store_imm(target, 0);
-                    continue;
+            if !place.wide && !self.narrow(*register) {
+                self.asm.store_imm(Rm::Mem(R15, base + 8), 0);
+            }
+        }
+        for (register, half, word, moved) in halves() {
+            let target = Rm::Mem(R15, register as i32 * 16 + half);
+            let w = self.words[usize::from(word)];
+            let value = if moved {
+                Val::Mem(Self::frame(word))
+            } else if w.reg.is_none() && w.home == Home::Slot(register as i32 * 16 + half) {
+                continue;
+            } else {
+                self.current(word)
+            };
+            match value {
+                Val::Reg(reg) => self.asm.store(target, reg),
+                Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
+                    self.asm.store_imm(target, value as i32);
                 }
-                let w = self.words[usize::from(word)];
-                if w.reg.is_none() && w.home == Home::Slot(base + half) {
-                    continue;
+                Val::Imm(value) => {
+                    self.asm.mov_imm(RAX, value);
+                    self.asm.store(target, RAX);
                 }
-                let value = self.current(word);
-                self.put(target, value);
+                Val::Mem(memory) => {
+                    self.asm.mov(RAX, memory);
+                    self.asm.store(target, RAX);
+                }
             }
         }
     }
@@ -2566,6 +2809,9 @@ pub struct Scratch {
     /// whether the emitter skips it (H8a).
     fused: Vec<Option<Fusion>>,
     skip: Vec<bool>,
+    /// For each inline access, the operands of the addition that it takes
+    /// into its address (card #1213).
+    folded: Vec<Option<(Slot, Slot)>>,
     all: Vec<Slot>,
 }
 
@@ -2694,6 +2940,16 @@ pub fn emit(
             &mut scratch.skip,
         );
     }
+    scratch.folded.clear();
+    scratch.folded.resize(count, None);
+    folds(
+        shape,
+        &scratch.slots,
+        &scratch.spans,
+        &mut scratch.uses[..words],
+        &mut scratch.folded,
+        &mut scratch.skip,
+    );
     let mut asm = std::mem::take(&mut scratch.asm);
     asm.clear();
     scratch.sites.clear();
@@ -2729,6 +2985,7 @@ pub fn emit(
         &scratch.slots,
         &scratch.spans,
         &scratch.fused,
+        &scratch.folded,
         &scratch.skip,
     );
     let fused = scratch
@@ -2756,6 +3013,7 @@ impl Emitter<'_> {
         slots: &[Slot],
         spans: &[Span],
         fused: &[Option<Fusion>],
+        folded: &[Option<(Slot, Slot)>],
         skip: &[bool],
     ) -> Result<(), Refused> {
         let shape = self.shape;
@@ -2807,7 +3065,7 @@ impl Emitter<'_> {
                 _ => None,
             };
             if let Some((bytes, store)) = inline_access(op, shape.memory) {
-                self.access(index, op, reads, bytes, store);
+                self.access(index, op, reads, bytes, store, folded[index]);
             } else if let Some(lazy) = lazy {
                 self.lazy_condition(index, lazy, reads);
             } else if op.code == Code::Generic {

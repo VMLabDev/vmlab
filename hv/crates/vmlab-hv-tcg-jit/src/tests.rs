@@ -18,6 +18,9 @@ use vmlab_hv_tcg_ir::native::{Binary, ScalarType, Unary};
 const RAM: u64 = 0x7000_0000;
 const PAGES: usize = 4;
 const WATCHED_PAGE: usize = 2;
+/// The slots of the random blocks that hold one word (`Shape::narrow`):
+/// every other one. Their high halves start at 0.
+const NARROW: u128 = 0x5555;
 
 /// Where an access of `bytes` at `va` is in the memory of the tests, when it
 /// is there.
@@ -381,6 +384,8 @@ struct Block {
     inputs: Vec<(Place, u32)>,
     outputs: Vec<(u32, Place)>,
     memory: Memory,
+    /// `Shape::narrow`.
+    narrow: u128,
 }
 
 /// The block in the interpreter, on `ram`: the slots after it, and the
@@ -466,6 +471,7 @@ fn compiled_on(
         next: None,
         memory: block.memory,
         sides: &[],
+        narrow: block.narrow,
     };
     let entry = jit.compile(&shape).expect("a block that the emitter takes");
     let mut frame = block.frame.clone();
@@ -569,6 +575,7 @@ fn every_inline_form_computes_what_the_interpreter_computes() {
                     },
                 )],
                 memory: Memory::Thunk,
+                narrow: 0,
             };
             let mut slots = [0u128; 4];
             for slot in &mut slots {
@@ -1024,6 +1031,7 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
             .collect(),
         outputs,
         memory,
+        narrow: NARROW,
     }
 }
 
@@ -1194,6 +1202,7 @@ fn comparisons_read_as_host_flags_give_what_the_interpreter_gives() {
                             inputs: vec![(word(1), 0), (word(2), 1), (word(9), 2), (word(10), 3)],
                             outputs: vec![(0, word(11)), (1, word(1))],
                             memory: Memory::Thunk,
+                            narrow: 0,
                         };
                         let mut slots = [
                             u128::from(x),
@@ -1307,6 +1316,7 @@ fn lazy_conditions_run_their_forms_inline_and_call_for_other_kinds() {
                     inputs: vec![(word(1), 0), (word(2), 1), (word(3), 2)],
                     outputs: vec![(0, word(5)), (1, word(2))],
                     memory: Memory::Thunk,
+                    narrow: 0,
                 };
                 let mut slots = [u128::from(kind), u128::from(a), u128::from(b)];
                 let mut expected = slots;
@@ -1360,6 +1370,7 @@ fn a_lazy_condition_for_another_code_is_a_call() {
         inputs: vec![(word(1), 0), (word(2), 1), (word(3), 2)],
         outputs: vec![(0, word(5))],
         memory: Memory::Thunk,
+        narrow: 0,
     };
     let mut slots = [1u128, 2, 3];
     let (_, _, thunk_calls) = compiled(&mut jit, &block, &mut slots, 100);
@@ -1412,6 +1423,7 @@ fn the_head_of_a_block_takes_its_count_from_the_budget() {
             },
         )],
         memory: Memory::Thunk,
+        narrow: 0,
     };
     let mut slots = [0u128; 1];
     let (code, _, _) = compiled(&mut jit, &block, &mut slots, 0);
@@ -1460,6 +1472,7 @@ fn a_form_that_the_host_lacks_is_refused() {
         next: None,
         memory: Memory::Thunk,
         sides: &[],
+        narrow: 0,
     };
     assert_eq!(jit.compile(&shape), Err(Refused::Form(Code::PopCount)));
     let rbit = Op {
@@ -1495,6 +1508,7 @@ fn a_full_region_starts_a_new_generation() {
             next: None,
             memory: Memory::Thunk,
             sides: &[],
+            narrow: 0,
         };
         let entry = jit.compile(&shape).expect("a block");
         let first = *first.get_or_insert(entry);
@@ -1529,6 +1543,7 @@ fn the_perf_map_names_the_trampoline_and_each_block() {
         next: None,
         memory: Memory::Thunk,
         sides: &[],
+        narrow: 0,
     };
     // Off: nothing is written.
     let entry = jit.compile(&shape).expect("a block");
@@ -1570,6 +1585,7 @@ fn written_words_are_the_results_and_the_inputs_and_the_rest_are_constants() {
             next: None,
             memory: Memory::Thunk,
             sides: &[],
+            narrow: 0,
         };
         let written = crate::emit::written(&shape).expect("a block");
         assert_eq!(written.len(), block.frame.len());
@@ -1633,6 +1649,7 @@ fn a_seeded_defect_makes_an_add_subtract() {
         next: None,
         memory: Memory::Thunk,
         sides: &[],
+        narrow: 0,
     };
     for (defect, expected) in [(crate::Defect::None, 8), (crate::Defect::AddSubtracts, 2)] {
         let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
@@ -1726,6 +1743,7 @@ impl Looping {
             next: Some(Next { pc: 1, kind }),
             memory: Memory::Thunk,
             sides: &[],
+            narrow: 0,
         };
         jit.compile(&shape).expect("a block that the emitter takes")
     }
@@ -1972,8 +1990,23 @@ fn pattern(random: &mut Random) -> Vec<u8> {
 
 #[test]
 fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
+    access_rounds(0x3e_0003, false);
+}
+
+/// Card #1213: loads and stores whose address an `Add` before them
+/// computes, which the emitter takes into the access, leave what the
+/// interpreter leaves: on a hit, on a miss, logged, into the watched page,
+/// and through their leave.
+#[test]
+fn loads_and_stores_that_fold_their_address_leave_what_the_interpreter_leaves() {
+    access_rounds(0x3e_1213, true);
+}
+
+/// Random blocks with loads and stores over the fast TLB against the
+/// interpreter, with the addresses of `with_sums` when `fold`.
+fn access_rounds(seed: u64, fold: bool) {
     let mut jit = Jit::with_capacity(16 << 20).expect("a code region");
-    let mut random = Random(0x3e_0003);
+    let mut random = Random(seed);
     let (mut hits, mut misses, mut watched, mut left) = (0u64, 0u64, 0u64, 0);
     let mut unaligned = 0u64;
     for round in 0..3000 {
@@ -1983,7 +2016,10 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
         } else {
             Memory::Inline
         };
-        let block = random_block_with(&mut random, count, memory);
+        let mut block = random_block_with(&mut random, count, memory);
+        if fold {
+            block = with_sums(&mut random, block);
+        }
         let accesses = block
             .ops
             .iter()
@@ -2065,6 +2101,7 @@ fn access_block(ops: Vec<Op>, frame: Vec<u64>, result: Slot, memory: Memory) -> 
             },
         )],
         memory,
+        narrow: 0,
     }
 }
 
@@ -2093,6 +2130,7 @@ fn run_on_tables(
         next: None,
         memory: block.memory,
         sides: &[],
+        narrow: 0,
     };
     let entry = jit.compile(&shape).expect("a block");
     let mut frame = block.frame.clone();
@@ -2325,6 +2363,7 @@ fn every_generic_form_computes_what_the_interpreter_computes() {
             inputs: (1..7).map(|n| (word(n), u32::from(n))).collect(),
             outputs: vec![(0, generic.dst())],
             memory: Memory::Thunk,
+            narrow: 0,
         };
         let mut slots = [0u128; 7];
         for slot in &mut slots[1..] {
@@ -2376,6 +2415,7 @@ fn a_direct_call_runs_its_function_and_not_the_thunk() {
         inputs: vec![(word(1), 1), (word(2), 2)],
         outputs: vec![(0, word(3)), (3, word(4))],
         memory: Memory::Thunk,
+        narrow: 0,
     };
     let slots = [0, 0x1234, 0x5678_9abc_def0, 7];
     let mut expected = slots;
@@ -2439,6 +2479,7 @@ fn a_register_call_takes_its_words_in_registers() {
             inputs: (1..=6).map(|n| (word(n), u32::from(n))).collect(),
             outputs: (0..6).map(|n| (n, word(10 + n as Slot))).collect(),
             memory: Memory::Thunk,
+            narrow: 0,
         };
         let slots: Vec<u128> = (0..8).map(|n| 0x1111_2222_3333_4444 * (n + 1)).collect();
         let mut expected = slots.clone();
@@ -2449,5 +2490,122 @@ fn a_register_call_takes_its_words_in_registers() {
         assert_eq!((ran.code, &got), (DONE, &expected), "fits: {fits}");
         let calls = if fits { (0, 0) } else { (0, 1) };
         assert_eq!((ran.thunk_calls, ran.direct_calls), calls, "fits: {fits}");
+    }
+}
+
+/// `block` with the constant address of most of its loads and stores
+/// computed before the access by an `Add`, as the lifter computes a base
+/// register plus an offset (card #1213): a base and a displacement in either
+/// order, small, large or past 32 bits, or a base and an index. The base and
+/// the index are results of an operation, so that they are in registers.
+/// Some leaves read the sum, which keeps it from the access, or the base,
+/// which keeps the base alive past it.
+fn with_sums(random: &mut Random, mut block: Block) -> Block {
+    fn push(frame: &mut Vec<u64>, value: u64) -> Slot {
+        frame.push(value);
+        (frame.len() - 1) as Slot
+    }
+    // A word that no constant holds: the XOR of two constants.
+    fn computed(frame: &mut Vec<u64>, out: &mut Vec<Op>, value: u64, random: &mut Random) -> Slot {
+        let key = random.value();
+        let (a, b) = (push(frame, value ^ key), push(frame, key));
+        let dst = push(frame, 0);
+        out.push(Op {
+            code: Code::Xor,
+            aux: 0,
+            dst,
+            a,
+            b,
+            imm: u64::MAX,
+        });
+        dst
+    }
+    let ops = std::mem::take(&mut block.ops);
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        if access_size(op.code).is_none() || random.below(5) == 0 {
+            out.push(op);
+            continue;
+        }
+        let address = block.frame_value(op.a);
+        let displacement = match random.below(4) {
+            0 => 0,
+            1 => random.below(256),
+            2 => random.below(1 << 20).wrapping_sub(1 << 19),
+            _ => random.value(),
+        };
+        let frame = &mut block.frame;
+        let base = computed(frame, &mut out, address.wrapping_sub(displacement), random);
+        let other = if random.below(3) == 0 {
+            computed(frame, &mut out, displacement, random)
+        } else {
+            push(frame, displacement)
+        };
+        let sum = push(frame, 0);
+        let (a, b) = if random.below(2) == 0 {
+            (base, other)
+        } else {
+            (other, base)
+        };
+        out.push(Op {
+            code: Code::Add,
+            aux: 0,
+            dst: sum,
+            a,
+            b,
+            imm: u64::MAX,
+        });
+        match random.below(6) {
+            0 => block.leaves[op.imm as usize].push(sum),
+            1 => block.leaves[op.imm as usize].push(base),
+            _ => {}
+        }
+        out.push(Op { a: sum, ..op });
+    }
+    block.ops = out;
+    block
+}
+
+impl Block {
+    /// The constant of the word `slot` of the frame.
+    fn frame_value(&self, slot: Slot) -> u64 {
+        self.frame[usize::from(slot)]
+    }
+}
+
+/// Card #1213: an output of one word to a narrow slot writes its low half
+/// and leaves the high half, which the owner keeps at 0, as it is; to any
+/// other slot it writes the high half with 0. A wide output writes both.
+#[test]
+fn an_output_to_a_narrow_slot_makes_no_store_to_its_high_half() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    for narrow in [0u128, 0b11] {
+        let block = Block {
+            ops: Vec::new(),
+            generics: Vec::new(),
+            frame: vec![0, 5, 6, 7],
+            calls: Vec::new(),
+            leaves: Vec::new(),
+            inputs: Vec::new(),
+            outputs: vec![
+                (0, word(1)),
+                (
+                    1,
+                    Place {
+                        slot: 2,
+                        wide: true,
+                    },
+                ),
+                (2, word(1)),
+            ],
+            memory: Memory::Thunk,
+            narrow,
+        };
+        let high = 0xdead_u128 << 64;
+        let mut slots = [high; 3];
+        let (code, _, _) = compiled(&mut jit, &block, &mut slots, 10);
+        assert_eq!(code, DONE);
+        let kept = if narrow & 1 != 0 { high } else { 0 };
+        assert_eq!(slots, [kept | 5, 7 << 64 | 6, 5], "narrow {narrow:#b}");
     }
 }
