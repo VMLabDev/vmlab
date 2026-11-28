@@ -1721,6 +1721,7 @@ impl Looping {
                 jumps: true,
                 verify: false,
                 serve: self.serve,
+                terminal: false,
             }),
             next: Some(Next { pc: 1, kind }),
             memory: Memory::Thunk,

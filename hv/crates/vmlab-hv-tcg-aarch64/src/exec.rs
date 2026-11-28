@@ -2583,6 +2583,14 @@ struct Env<'a, M> {
     lookup: Option<JumpLookup>,
     /// The misses that it served with code.
     served: u64,
+    /// The last instructions of blocks that the thunk ran (card T3-D2), by
+    /// `terminal_kind`: those after which the run went on, and those after
+    /// which it left with `TRAPPED`. The clears and the changes of the
+    /// address space of the jump cache that it made then.
+    terminals: [u64; TERMINAL_KINDS],
+    trapped: [u64; TERMINAL_KINDS],
+    clears: u64,
+    spaces: u64,
 }
 
 /// What a run of compiled code serves a miss of the jump cache from (card
@@ -2596,6 +2604,326 @@ struct JumpLookup {
     epoch: u64,
     changes: u64,
     check: u32,
+    /// What the thunk runs the last instruction of a block with (card
+    /// T3-D2), when the run serves those.
+    terminal: Option<Terminal>,
+}
+
+/// What the thunk needs of the CPU to run the last instruction of a block
+/// as the loop runs it, and to go on to the next block as the loop would
+/// (card T3-D2, `serve_terminal`).
+#[derive(Clone, Copy)]
+struct Terminal {
+    /// The write generation of the memory and `Memory::own_generation` at
+    /// the last `Cpu::settle`, which no run moves: an exception and an
+    /// exception return settle, and the thunk runs them only where that
+    /// would start no new epoch.
+    generation: u64,
+    own_generation: u64,
+    /// The system counter, and the interrupt lines: those of a machine,
+    /// else the levels that the owner set before the run.
+    clock: Clock,
+    lines: *const Lines,
+    irq: bool,
+    fiq: bool,
+    /// `Cpu::exceptions`, `Cpu::taken` and `Chaining::seen`, which the
+    /// thunk moves as the loop would. Nothing else touches them while the
+    /// code runs.
+    exceptions: *mut u64,
+    taken: *mut Option<Taken>,
+    seen: *mut u64,
+}
+
+/// The kinds of the last instruction of a block that the loop ends itself
+/// (H5c), for the counts of card T3-D2: the index of `terminal_kind`.
+pub const TERMINAL_KINDS: usize = 15;
+
+/// The name of each kind of `terminal_kind`, for the debug log.
+pub const TERMINAL_KIND_NAMES: [&str; TERMINAL_KINDS] = [
+    "MSR TTBR0_EL1",
+    "MSR TTBR1_EL1",
+    "MSR other",
+    "MRS",
+    "ERET",
+    "SVC",
+    "other exception",
+    "MSR PSTATE",
+    "DC ZVA",
+    "TLBI",
+    "other SYS",
+    "WFI",
+    "WFE",
+    "CLREX",
+    "HVC SMC unknown",
+];
+
+/// The kind of the last instruction `trap` of a block (`TERMINAL_KIND_NAMES`).
+fn terminal_kind(trap: &Trap) -> usize {
+    match *trap {
+        Trap::Msr { encoding, .. } => match sysreg::find(encoding) {
+            Some(reg::TTBR0_EL1) => 0,
+            Some(reg::TTBR1_EL1) => 1,
+            _ => 2,
+        },
+        Trap::Mrs { .. } => 3,
+        Trap::Eret => 4,
+        Trap::Exception(Exception::SupervisorCall(_)) => 5,
+        Trap::Exception(_) => 6,
+        Trap::MsrPstate { .. } => 7,
+        Trap::Sys { encoding, .. } => match (encoding >> 11 & 7, encoding >> 7 & 15) {
+            _ if encoding == 3 << 11 | 7 << 7 | 4 << 3 | 1 => 8,
+            (0, 8) => 9,
+            _ => 10,
+        },
+        Trap::Wfi => 11,
+        Trap::Wfe => 12,
+        Trap::ClearExclusive => 13,
+        Trap::Hvc(_) | Trap::Smc(_) | Trap::Unknown(_) => 14,
+    }
+}
+
+/// Run the last instruction of the block `tag` that left with `TERMINAL`
+/// (card T3-D2) as `Cpu::trap` runs it, where that needs nothing that only
+/// the loop holds: not an instruction that a machine claims (an unknown
+/// word, a hypercall, a register of its hooks), not `WFI`, not a write of a
+/// timer register, and not a register that the CPU notes as missing. An
+/// exception and an exception return settle the caches first in the loop:
+/// they run here only where nothing was written that the CPU has not seen.
+/// Then go on to the next block as `serve_next` finds it.
+///
+/// 0: nothing ran, and the block leaves with `DONE` for the loop to run
+/// the instruction. `jit::TRAPPED`: it ran, and the run leaves. Else the
+/// code of the next block.
+///
+/// # Safety
+/// As for `serve_jump`, and `terminal` holds pointers into the CPU that
+/// nothing else touches while the code runs.
+unsafe fn serve_terminal<M: Memory>(env: &mut Env<M>, tag: *mut std::ffi::c_void) -> u64 {
+    let Some(lookup) = env.lookup else {
+        return 0;
+    };
+    let Some(terminal) = lookup.terminal else {
+        return 0;
+    };
+    // SAFETY: the caller's promise.
+    let from = unsafe { &*tag.cast::<Compiled>() };
+    let Some((_, trap)) = from.terminal else {
+        return 0;
+    };
+    // What `Cpu::settle` would find now: a new epoch, which the loop
+    // starts. Every kind is held to it, so that a fault of an operation
+    // can be taken here too.
+    let own = match env.memory.own_generation() {
+        Some(count) => count.wrapping_sub(terminal.own_generation),
+        None => env.side.own_writes,
+    };
+    if env.side.code_written
+        || env.memory.generation() != terminal.generation.wrapping_add(own)
+    {
+        return 0;
+    }
+    // SAFETY: the state of the CPU, which compiled code does not touch
+    // while it calls.
+    let state = unsafe { &mut *env.state };
+    let (irq, fiq) = if terminal.lines.is_null() {
+        (terminal.irq, terminal.fiq)
+    } else {
+        // SAFETY: the lines of the CPU live while it runs.
+        let lines = unsafe { &*terminal.lines };
+        (
+            lines.irq.load(Ordering::Acquire),
+            lines.fiq.load(Ordering::Acquire),
+        )
+    };
+    let pc = state.pc();
+    let next = pc.wrapping_add(4);
+    let el0 = state.context.el == 0;
+    let sctlr = state.system.regs[reg::SCTLR_EL1];
+    let done = match trap {
+        Trap::Exception(exception) => Err(exception),
+        Trap::Unknown(_) | Trap::Hvc(_) | Trap::Smc(_) | Trap::Wfi => return 0,
+        Trap::Eret if el0 => Err(Exception::Undefined),
+        Trap::Eret => {
+            exception::exception_return(state);
+            env.side.exclusive = None;
+            Ok(None)
+        }
+        Trap::ClearExclusive => {
+            env.side.exclusive = None;
+            Ok(Some(next))
+        }
+        Trap::Wfe if el0 && sctlr & sctlr::NTWE == 0 => Err(Exception::WaitTrap(true)),
+        Trap::Wfe => Ok(Some(next)),
+        Trap::Mrs { encoding, rt } | Trap::Msr { encoding, rt } => {
+            let write = matches!(trap, Trap::Msr { .. });
+            let Some(row) = sysreg::find(encoding) else {
+                return 0;
+            };
+            match sysreg::check(row, write, state) {
+                Ok(()) if write && timer_row(row) => return 0,
+                Ok(()) => {
+                    let environment = Environment {
+                        count: terminal.clock.count(),
+                        irq,
+                        fiq,
+                    };
+                    access_register(state, env.side, &environment, row, rt, write);
+                    Ok(Some(next))
+                }
+                Err(Denied::Undefined) => return 0,
+                Err(Denied::Trapped) => Err(Exception::SystemTrap(sysreg::trap_iss(
+                    encoding,
+                    rt.into(),
+                    write,
+                ))),
+                Err(Denied::Fp) => Err(Exception::FpAccess),
+            }
+        }
+        Trap::MsrPstate { field, immediate } => {
+            pstate(state, field, immediate).map(|()| Some(next))
+        }
+        Trap::Sys { encoding, rt, read } => {
+            match operation(state, env.side, env.memory, encoding, rt, read) {
+                Ok(Some(done)) => done.map(|()| Some(next)),
+                Ok(None) => return 0,
+                Err(stop) => {
+                    env.stop = Some(stop);
+                    return THUNK_LEFT;
+                }
+            }
+        }
+    };
+    match done {
+        Ok(Some(next)) => state.set_pc(next),
+        Ok(None) => {}
+        Err(exception) => {
+            let cause = Cause::Exception(exception);
+            exception::enter(state, cause, pc);
+            // SAFETY: the caller's promise.
+            unsafe {
+                *terminal.exceptions += 1;
+                *terminal.taken = Some(Taken {
+                    cause,
+                    from: pc,
+                    to: state.pc(),
+                });
+            }
+        }
+    }
+    let kind = terminal_kind(&trap);
+    // SAFETY: the caller's promise.
+    let code = unsafe { serve_next(env, lookup, terminal, irq, fiq) };
+    if code == 0 {
+        env.trapped[kind] += 1;
+        jit::TRAPPED
+    } else {
+        env.terminals[kind] += 1;
+        code
+    }
+}
+
+/// The code of the block at the PC after the thunk ran the last
+/// instruction of a block (card T3-D2), when the loop would run that code
+/// next without a step of its own, else 0. The loop takes its mail, looks
+/// at the code again after a store into it, reads the interrupt lines and
+/// takes an interrupt or the illegal state, and leaves for its owner;
+/// before a run it empties the jump cache or moves its address space for
+/// a change of the translation (`execute`). Here the same, and the level
+/// of the new context goes into the context of the run: the tables of the
+/// fast TLB, and the level of the accesses of the thunk. The block is found
+/// as `serve_jump` finds it, in the context of the state now.
+///
+/// # Safety
+/// As for `serve_terminal`.
+unsafe fn serve_next<M: Memory>(
+    env: &mut Env<M>,
+    lookup: JumpLookup,
+    terminal: Terminal,
+    irq: bool,
+    fiq: bool,
+) -> u64 {
+    env.side.take_mail();
+    if env.side.code_written {
+        return 0;
+    }
+    // SAFETY: the caller's promise.
+    let state = unsafe { &*env.state };
+    if state.il || exception::pending(state, irq, fiq).is_some() {
+        return 0;
+    }
+    if !terminal.lines.is_null() {
+        // SAFETY: as in `serve_terminal`.
+        let lines = unsafe { &*terminal.lines };
+        if lines.leave.load(Ordering::Relaxed) {
+            return 0;
+        }
+    }
+    // SAFETY: the caller's promise. Only the entries and the cells of the
+    // jump cache are touched.
+    let (cache, jit) = unsafe { (&*lookup.blocks, &*lookup.jit) };
+    let changes = env.side.mmu.changes();
+    if changes != lookup.changes {
+        let jumps = env.side.mmu.jump_changes();
+        // SAFETY: the caller's promise.
+        let seen = unsafe { &mut *terminal.seen };
+        if *seen != jumps {
+            jit.clear_jumps_shared();
+            env.clears += 1;
+            *seen = jumps;
+        }
+        if jit.set_jump_space_shared(env.side.mmu.asid()) {
+            env.spaces += 1;
+        }
+        // SAFETY: the context of the run, which compiled code does not
+        // hold while it calls.
+        unsafe { (*env.context).jump_generation = jit.jump_tag() };
+        // The jump cache holds the translation of now: a miss can be
+        // served again.
+        if let Some(lookup) = &mut env.lookup {
+            lookup.changes = changes;
+        }
+    }
+    let context = state.context;
+    let user = context.el == 0;
+    if user != env.side.user {
+        env.side.user = user;
+        if jit.memory() != jit::Memory::Thunk
+            && let Some(fast) = env.side.mmu.fast()
+        {
+            let level = usize::from(!user);
+            // SAFETY: as above.
+            unsafe {
+                (*env.context).reads = fast.table(level, false);
+                (*env.context).writes = if env.side.exclusive.is_none() {
+                    fast.table(level, true)
+                } else {
+                    jit::tlb::EMPTY_TABLE.as_ptr()
+                };
+            }
+        }
+    }
+    let pc = state.pc();
+    if pc & 3 != 0 || !mmu::canonical(pc) {
+        return 0;
+    }
+    let need = mmu::needed(Kind::Execute, user);
+    let Some((phys, _)) = env.side.mmu.hit(pc, 4, need) else {
+        return 0;
+    };
+    let Some(block) = cache.entries[Cache::index(phys)].as_deref() else {
+        return 0;
+    };
+    if block.phys != phys
+        || block.context != context
+        || block.epoch != lookup.epoch
+        || block.checks < lookup.check
+    {
+        return 0;
+    }
+    match block.code {
+        Some(code) if jit.fill_shared(pc, context_key(context), &code) => code.address,
+        _ => 0,
+    }
 }
 
 /// Serve a miss of the jump cache from the thunk (`jit::JUMP`, card J10):
@@ -2679,6 +3007,10 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
     if index == jit::JUMP {
         // SAFETY: as above.
         return unsafe { serve_jump(env, tag) };
+    }
+    if index == jit::TERMINAL {
+        // SAFETY: as above.
+        return unsafe { serve_terminal(env, tag) };
     }
     // SAFETY: as above: the block is alive while its code runs.
     let compiled = unsafe { &mut *tag.cast::<Compiled>() };
@@ -2880,8 +3212,9 @@ unsafe extern "sysv64" fn replay_thunk<M: Memory>(
     index: u64,
     tag: *mut std::ffi::c_void,
 ) -> u64 {
-    // A replay checks one block, and serves no miss of the jump cache.
-    if index == jit::JUMP {
+    // A replay checks one block, and serves no miss of the jump cache and
+    // no last instruction (the loop runs it).
+    if index == jit::JUMP || index == jit::TERMINAL {
         return 0;
     }
     // SAFETY: the caller's promise. The references end before `thunk`
@@ -3161,6 +3494,7 @@ impl Compiled {
         jumps: bool,
         verify: bool,
         serve: bool,
+        terminal: bool,
     ) {
         // What a leave reads from the frame: its outputs, its address, and
         // every word that its own operations read (card S4). A word that
@@ -3257,6 +3591,7 @@ impl Compiled {
             jumps,
             verify,
             serve,
+            terminal: terminal && self.terminal.is_some(),
         };
         let shape = jit::Shape {
             ops: &self.ops,
@@ -3383,6 +3718,11 @@ struct Chaining {
     /// A miss of the jump cache is served from the thunk where it can be
     /// (card J10), unless `VMLAB_HV_JIT_SERVE` is `0`, `off` or `false`.
     serve: bool,
+    /// The last instruction of a block that the loop ends itself is run
+    /// from the thunk where it can, and the run goes on (card T3-D2),
+    /// unless `VMLAB_HV_JIT_TERMINAL` is `0`, `off` or `false`. Only where
+    /// `serve` is on.
+    terminal: bool,
     /// Hits that named other code than the lookup found.
     mismatches: u64,
     pending: Option<Pending>,
@@ -3449,6 +3789,10 @@ unsafe fn run_chained<M: Memory>(
         replay,
         lookup,
         served: 0,
+        terminals: [0; TERMINAL_KINDS],
+        trapped: [0; TERMINAL_KINDS],
+        clears: 0,
+        spaces: 0,
     };
     let thunk: jit::Thunk = if env.replay.is_some() {
         replay_thunk::<M>
@@ -3498,6 +3842,13 @@ unsafe fn run_chained<M: Memory>(
     let failed = env.failed.take();
     let stop = env.stop.take();
     counts.jump_served += env.served;
+    for kind in 0..TERMINAL_KINDS {
+        counts.terminal_served[kind] += env.terminals[kind];
+        counts.terminal_returns[kind] += env.trapped[kind];
+        counts.returns_trapped += env.trapped[kind];
+    }
+    counts.shared_clears += env.clears;
+    counts.shared_spaces += env.spaces;
     // SAFETY: as above.
     let kicked = unsafe { jit::seat::kicked(context) };
     // SAFETY: as above.
@@ -3530,8 +3881,9 @@ unsafe fn run_chained<M: Memory>(
         jit::DONE => {
             // The exit of a block that the loop ends itself (H5c), else of
             // one whose next PC is a constant distance or that has no link.
-            if last.terminal.is_some() {
+            if let Some((_, trap)) = &last.terminal {
                 counts.returns_terminal += 1;
+                counts.terminal_returns[terminal_kind(trap)] += 1;
             } else {
                 counts.returns_done += 1;
             }
@@ -3542,6 +3894,14 @@ unsafe fn run_chained<M: Memory>(
                 pending: None,
             }
         }
+        // The thunk ran the last instruction of `last` (card T3-D2): the
+        // loop has nothing of it left to run.
+        jit::TRAPPED => Ran {
+            count: taken,
+            halt: None,
+            terminal: None,
+            pending: None,
+        },
         jit::BUDGET if taken == 0 => return None,
         // The run stopped at the head of `last`, which did not run: the PC
         // is its entry.
@@ -3994,6 +4354,19 @@ pub struct JitCounts {
     /// its budget spent, or kicked by another thread (H10c).
     pub returns_terminal: u64,
     pub returns_done: u64,
+    /// The last instructions of blocks that the loop ends itself (H5c), by
+    /// `terminal_kind` (card T3-D2): those after which the run returned to
+    /// the loop (`returns_terminal` and `returns_trapped`), and those that
+    /// the thunk ran with the run going on. `returns_trapped`: those that
+    /// the thunk ran, after which the run left for want of a next block.
+    pub terminal_returns: [u64; TERMINAL_KINDS],
+    pub terminal_served: [u64; TERMINAL_KINDS],
+    pub returns_trapped: u64,
+    /// Clears and changes of the address space of the jump cache that the
+    /// thunk made after a last instruction (card T3-D2): `clears` and the
+    /// stats of the JIT hold them too.
+    pub shared_clears: u64,
+    pub shared_spaces: u64,
     pub returns_budget: u64,
     pub returns_kicked: u64,
     /// Changes of the translation that kept the jump cache, because a new
@@ -4099,6 +4472,9 @@ struct JitRun<'a> {
     blocks: *mut Cache,
     /// The lists that a compile hands to the emitter.
     buffers: &'a mut ShapeBuffers,
+    /// What the thunk runs the last instruction of a block with (card
+    /// T3-D2). Its `seen` is set here.
+    terminal: Terminal,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -4128,6 +4504,7 @@ unsafe fn execute<M: Memory>(
         seat,
         blocks,
         buffers,
+        terminal,
     } = run;
     let Some(jit) = jit.as_mut() else {
         // SAFETY: the caller's promise.
@@ -4183,6 +4560,7 @@ unsafe fn execute<M: Memory>(
                 chaining.jumps && !single,
                 chaining.verify,
                 chaining.serve,
+                chaining.terminal && chaining.serve && !chaining.verify && !single,
             );
         }
         if let Some(pending) = pending
@@ -4222,9 +4600,14 @@ unsafe fn execute<M: Memory>(
     // SAFETY: as above.
     let code = unsafe { (*block).code }.filter(|entry| jit.current(entry));
     if let Some(entry) = code {
+        let served = (counts.shared_clears, counts.shared_spaces);
+        let terminal = chaining.terminal.then_some(Terminal {
+            seen: &raw mut chaining.seen,
+            ..terminal
+        });
         // SAFETY: the caller's promise, and the CPU unlinks a block before
         // it drops it.
-        if let Some(ran) = unsafe {
+        let ran = unsafe {
             run_chained(
                 block,
                 &entry,
@@ -4242,9 +4625,15 @@ unsafe fn execute<M: Memory>(
                     epoch,
                     changes: mmu,
                     check,
+                    terminal,
                 }),
             )
-        } {
+        };
+        jit.count_shared(
+            counts.shared_clears - served.0,
+            counts.shared_spaces - served.1,
+        );
+        if let Some(ran) = ran {
             counts.exit(&ran.halt);
             if ran.pending.is_some() {
                 chaining.epoch = epoch;
@@ -4627,6 +5016,10 @@ impl<M: Memory> Cpu<M> {
                     std::env::var("VMLAB_HV_JIT_SERVE").as_deref(),
                     Ok("0" | "off" | "false")
                 ),
+                terminal: !matches!(
+                    std::env::var("VMLAB_HV_JIT_TERMINAL").as_deref(),
+                    Ok("0" | "off" | "false")
+                ),
                 mismatches: 0,
                 pending: None,
                 epoch: 0,
@@ -4964,52 +5357,16 @@ impl<M: Memory> Cpu<M> {
             Err(Denied::Fp) => return Err(Exception::FpAccess),
         }
         let environment = self.environment();
-        if write {
-            if matches!(
-                sysreg::ROWS[row].kind,
-                sysreg::Kind::Special(
-                    sysreg::Special::TimerControl(_)
-                        | sysreg::Special::TimerCompare(_)
-                        | sysreg::Special::TimerValue(_)
-                )
-            ) {
-                self.timer_written = true;
-            }
-            sysreg::write(row, &mut self.state, &environment, value);
-            self.state.refresh();
-            self.side.mmu.sync(&self.state);
-        } else if rt != 31 {
-            let value = sysreg::read(row, &self.state, &environment);
-            self.state.set_x(usize::from(rt), value);
+        if write && timer_row(row) {
+            self.timer_written = true;
         }
+        access_register(&mut self.state, &mut self.side, &environment, row, rt, write);
         Ok(())
     }
 
     /// `MSR` of a PSTATE field with an immediate.
     fn pstate(&mut self, field: PstateField, immediate: u8) -> Result<(), Exception> {
-        let el0 = self.state.context.el == 0;
-        match field {
-            PstateField::SpSel if el0 => return Err(Exception::Undefined),
-            PstateField::SpSel => self.state.context.sp_sel = immediate & 1 != 0,
-            PstateField::DaifSet | PstateField::DaifClr => {
-                if el0 && self.state.system.regs[reg::SCTLR_EL1] & sctlr::UMA == 0 {
-                    // op0 0, op1 3, CRn 4, CRm the immediate, Rt 31, a write.
-                    // QEMU reports op1 in the place of op2 and op2 in the
-                    // place of op1 for this form (the lockstep of card C6
-                    // found ESR_EL1 0x620793f6 for `MSR DAIFSet, #11`). We
-                    // follow it (DESIGN.md P2, U1).
-                    let op2 = if field == PstateField::DaifSet { 6 } else { 7 };
-                    let iss = 3 << 17 | op2 << 14 | 4 << 10 | 31 << 5 | u32::from(immediate) << 1;
-                    return Err(Exception::SystemTrap(iss));
-                }
-                if field == PstateField::DaifSet {
-                    self.state.daif |= immediate;
-                } else {
-                    self.state.daif &= !immediate;
-                }
-            }
-        }
-        Ok(())
+        pstate(&mut self.state, field, immediate)
     }
 
     /// `SYS` (or `SYSL` when `read`) of the operation op1:CRn:CRm:op2 with
@@ -5021,112 +5378,14 @@ impl<M: Memory> Cpu<M> {
         rt: u8,
         read: bool,
     ) -> Result<Result<(), Exception>, Stop> {
-        let el0 = self.state.context.el == 0;
-        let sctlr = self.state.system.regs[reg::SCTLR_EL1];
-        let value = match rt {
-            31 => 0,
-            n => self.state.x(usize::from(n)),
-        };
-        // op0 of a `SYS` is 1.
-        let trapped = Exception::SystemTrap(sysreg::trap_iss(0x4000 | encoding, rt.into(), !read));
-        let split = (
-            encoding >> 11 & 7,
-            encoding >> 7 & 15,
-            encoding >> 3 & 15,
-            encoding & 7,
-        );
-        let done = match split {
-            _ if read => None,
-            // IC IALLUIS and IALLU, DC IVAC, ISW, CSW and CISW: the caches
-            // of this CPU hold nothing that an operation could drop. The
-            // blocks follow the memory by their code stamps.
-            (0, 7, 1 | 5, 0) | (0, 7, 6, 1 | 2) | (0, 7, 10 | 14, 2) if !el0 => Some(Ok(())),
-            // IC IVAU, DC CVAC, CVAU and CIVAC: EL0 runs them with
-            // SCTLR_EL1.UCI.
-            (3, 7, 5, 1) | (3, 7, 10 | 11 | 14, 1) => Some(if el0 && sctlr & sctlr::UCI == 0 {
-                Err(trapped)
-            } else {
-                Ok(())
-            }),
-            // DC ZVA: EL0 runs it with SCTLR_EL1.DZE.
-            (3, 7, 4, 1) => Some(if el0 && sctlr & sctlr::DZE == 0 {
-                Err(trapped)
-            } else {
-                match self.side.zero(&mut self.memory, value, el0) {
-                    Ok(()) => Ok(()),
-                    Err(Fault::Abort(fault, address)) => Err(Exception::DataAbort {
-                        status: fault.status(),
-                        write: true,
-                        cache: false,
-                        address,
-                    }),
-                    Err(Fault::Host(message)) => return Err(Stop::Host(message)),
-                }
-            }),
-            // AT S1E1R, S1E1W, S1E0R and S1E0W: the result is in PAR_EL1.
-            (0, 7, 8, op2 @ 0..=3) if !el0 => {
-                let kind = if op2 & 1 == 0 {
-                    Kind::Read
-                } else {
-                    Kind::Write
-                };
-                let par = match self.side.mmu.walk(&mut self.memory, value, false) {
-                    Ok(page) if page.flags & mmu::needed(kind, op2 & 2 != 0) != 0 => {
-                        mmu::par_of(&page)
-                    }
-                    Ok(page) => mmu::par_fault(mmu::Fault {
-                        kind: mmu::FaultKind::Permission,
-                        level: page.level,
-                    }),
-                    // A descriptor that the memory does not hold is an
-                    // exception and no result: QEMU takes the abort.
-                    Err(Miss::Fault(fault)) if fault.kind == mmu::FaultKind::ExternalOnWalk => {
-                        return Ok(Err(Exception::DataAbort {
-                            status: fault.status(),
-                            // The abort of an address translation
-                            // instruction says "write", also for a read.
-                            write: true,
-                            cache: true,
-                            address: value,
-                        }));
-                    }
-                    Err(Miss::Fault(fault)) => mmu::par_fault(fault),
-                    Err(Miss::Host(message)) => return Err(Stop::Host(message)),
-                };
-                self.state.system.regs[reg::PAR_EL1] = par;
-                Some(Ok(()))
-            }
-            // TLBI of the EL1&0 regime, on this CPU (CRm 7) or on all of
-            // them (CRm 3, the Inner Shareable domain): the second kind goes
-            // to the other CPUs of the machine too.
-            (0, 8, crm @ (3 | 7), op2) if !el0 => {
-                let asid = (value >> 48) as u16;
-                let invalidation = match op2 {
-                    // VMALLE1.
-                    0 => Invalidation::All,
-                    // VAE1 and VALE1: one address of one ASID.
-                    1 | 5 => Invalidation::Page {
-                        argument: value,
-                        asid: Some(asid),
-                    },
-                    // ASIDE1.
-                    2 => Invalidation::Asid(asid),
-                    // VAAE1 and VAALE1: one address of every ASID.
-                    3 | 7 => Invalidation::Page {
-                        argument: value,
-                        asid: None,
-                    },
-                    _ => return self.unknown_operation(encoding, read),
-                };
-                self.invalidate(invalidation);
-                if crm == 3 {
-                    self.broadcast(invalidation);
-                }
-                Some(Ok(()))
-            }
-            _ => None,
-        };
-        match done {
+        match operation(
+            &mut self.state,
+            &mut self.side,
+            &mut self.memory,
+            encoding,
+            rt,
+            read,
+        )? {
             Some(done) => Ok(done),
             None => self.unknown_operation(encoding, read),
         }
@@ -5620,6 +5879,7 @@ impl<M: Memory> Cpu<M> {
             return Err(host("the block cache lost a block"));
         };
         let block: *mut Compiled = &mut **block;
+        let terminal = self.terminal_run();
         // SAFETY: the block is in its cache and nothing else refers to it.
         // The blocks that compiled code chains to are alive: a dropped one
         // was unlinked just above.
@@ -5644,6 +5904,7 @@ impl<M: Memory> Cpu<M> {
                     },
                     blocks: &raw mut self.blocks,
                     buffers: &mut self.shape_buffers,
+                    terminal,
                 },
                 pending,
                 self.epoch,
@@ -5655,6 +5916,26 @@ impl<M: Memory> Cpu<M> {
         // The loop runs the last instruction at the PC that the block left.
         let terminal = ran.terminal.map(|trap| (self.state.pc(), trap));
         Ok((ran.count, self.finish(ran.halt, terminal)))
+    }
+
+    /// What the thunk of a run needs of the CPU to run the last instruction
+    /// of a block (card T3-D2). `execute` sets `seen`.
+    #[inline(always)]
+    fn terminal_run(&mut self) -> Terminal {
+        Terminal {
+            generation: self.generation,
+            own_generation: self.own_generation,
+            clock: self.clock,
+            lines: self
+                .lines
+                .as_deref()
+                .map_or(std::ptr::null(), |lines| lines as *const Lines),
+            irq: self.irq,
+            fiq: self.fiq,
+            exceptions: &raw mut self.exceptions,
+            taken: &raw mut self.taken,
+            seen: std::ptr::null_mut(),
+        }
     }
 
     /// The budget of one run of compiled code, of `left` instructions: a
@@ -5800,6 +6081,7 @@ impl<M: Memory> Cpu<M> {
                 && u64::from(block.instructions) <= left
             {
                 let block: *mut Compiled = &mut **block;
+                let terminal = self.terminal_run();
                 // SAFETY: the block is in its cache and nothing else refers
                 // to it. The CPU unlinks every block before it drops one.
                 let ran = unsafe {
@@ -5823,6 +6105,7 @@ impl<M: Memory> Cpu<M> {
                             },
                             blocks: &raw mut self.blocks,
                             buffers: &mut self.shape_buffers,
+                            terminal,
                         },
                         pending,
                         self.epoch,
@@ -5896,6 +6179,194 @@ impl<M: Memory> Cpu<M> {
         }
         Stop::Budget
     }
+}
+
+
+/// Whether the register of `row` is one of the generic timer's, whose write
+/// the owner of a machine CPU must see at once (`Cpu::timer_written`).
+fn timer_row(row: usize) -> bool {
+    matches!(
+        sysreg::ROWS[row].kind,
+        sysreg::Kind::Special(
+            sysreg::Special::TimerControl(_)
+                | sysreg::Special::TimerCompare(_)
+                | sysreg::Special::TimerValue(_)
+        )
+    )
+}
+
+/// `MSR` (`write`) or `MRS` of the register of `row`, which `sysreg::check`
+/// let through: what the loop and the thunk (card T3-D2) both run.
+fn access_register(
+    state: &mut State,
+    side: &mut Side,
+    environment: &Environment,
+    row: usize,
+    rt: u8,
+    write: bool,
+) {
+    if write {
+        let value = match rt {
+            31 => 0,
+            n => state.x(usize::from(n)),
+        };
+        sysreg::write(row, state, environment, value);
+        state.refresh();
+        side.mmu.sync(state);
+    } else if rt != 31 {
+        let value = sysreg::read(row, state, environment);
+        state.set_x(usize::from(rt), value);
+    }
+}
+
+/// `MSR` of a PSTATE field with an immediate: what the loop and the thunk
+/// (card T3-D2) both run.
+fn pstate(state: &mut State, field: PstateField, immediate: u8) -> Result<(), Exception> {
+    let el0 = state.context.el == 0;
+    match field {
+        PstateField::SpSel if el0 => return Err(Exception::Undefined),
+        PstateField::SpSel => state.context.sp_sel = immediate & 1 != 0,
+        PstateField::DaifSet | PstateField::DaifClr => {
+            if el0 && state.system.regs[reg::SCTLR_EL1] & sctlr::UMA == 0 {
+                // op0 0, op1 3, CRn 4, CRm the immediate, Rt 31, a write.
+                // QEMU reports op1 in the place of op2 and op2 in the
+                // place of op1 for this form (the lockstep of card C6
+                // found ESR_EL1 0x620793f6 for `MSR DAIFSet, #11`). We
+                // follow it (DESIGN.md P2, U1).
+                let op2 = if field == PstateField::DaifSet { 6 } else { 7 };
+                let iss = 3 << 17 | op2 << 14 | 4 << 10 | 31 << 5 | u32::from(immediate) << 1;
+                return Err(Exception::SystemTrap(iss));
+            }
+            if field == PstateField::DaifSet {
+                state.daif |= immediate;
+            } else {
+                state.daif &= !immediate;
+            }
+        }
+    }
+    Ok(())
+}
+
+
+/// `SYS` (or `SYSL` when `read`) of the operation op1:CRn:CRm:op2 with
+/// the register `rt`: a cache, TLB or address translation operation.
+/// What the loop and the thunk (card T3-D2) both run. `None`: an operation
+/// that this CPU does not have, which changed nothing. The inner `Err`: the
+/// exception that it takes.
+fn operation<M: Memory>(
+    state: &mut State,
+    side: &mut Side,
+    memory: &mut M,
+    encoding: u16,
+    rt: u8,
+    read: bool,
+) -> Result<Option<Result<(), Exception>>, Stop> {
+    let el0 = state.context.el == 0;
+    let sctlr = state.system.regs[reg::SCTLR_EL1];
+    let value = match rt {
+        31 => 0,
+        n => state.x(usize::from(n)),
+    };
+    // op0 of a `SYS` is 1.
+    let trapped = Exception::SystemTrap(sysreg::trap_iss(0x4000 | encoding, rt.into(), !read));
+    let split = (
+        encoding >> 11 & 7,
+        encoding >> 7 & 15,
+        encoding >> 3 & 15,
+        encoding & 7,
+    );
+    let done = match split {
+        _ if read => None,
+        // IC IALLUIS and IALLU, DC IVAC, ISW, CSW and CISW: the caches
+        // of this CPU hold nothing that an operation could drop. The
+        // blocks follow the memory by their code stamps.
+        (0, 7, 1 | 5, 0) | (0, 7, 6, 1 | 2) | (0, 7, 10 | 14, 2) if !el0 => Some(Ok(())),
+        // IC IVAU, DC CVAC, CVAU and CIVAC: EL0 runs them with
+        // SCTLR_EL1.UCI.
+        (3, 7, 5, 1) | (3, 7, 10 | 11 | 14, 1) => Some(if el0 && sctlr & sctlr::UCI == 0 {
+            Err(trapped)
+        } else {
+            Ok(())
+        }),
+        // DC ZVA: EL0 runs it with SCTLR_EL1.DZE.
+        (3, 7, 4, 1) => Some(if el0 && sctlr & sctlr::DZE == 0 {
+            Err(trapped)
+        } else {
+            match side.zero(memory, value, el0) {
+                Ok(()) => Ok(()),
+                Err(Fault::Abort(fault, address)) => Err(Exception::DataAbort {
+                    status: fault.status(),
+                    write: true,
+                    cache: false,
+                    address,
+                }),
+                Err(Fault::Host(message)) => return Err(Stop::Host(message)),
+            }
+        }),
+        // AT S1E1R, S1E1W, S1E0R and S1E0W: the result is in PAR_EL1.
+        (0, 7, 8, op2 @ 0..=3) if !el0 => {
+            let kind = if op2 & 1 == 0 {
+                Kind::Read
+            } else {
+                Kind::Write
+            };
+            let par = match side.mmu.walk(memory, value, false) {
+                Ok(page) if page.flags & mmu::needed(kind, op2 & 2 != 0) != 0 => {
+                    mmu::par_of(&page)
+                }
+                Ok(page) => mmu::par_fault(mmu::Fault {
+                    kind: mmu::FaultKind::Permission,
+                    level: page.level,
+                }),
+                // A descriptor that the memory does not hold is an
+                // exception and no result: QEMU takes the abort.
+                Err(Miss::Fault(fault)) if fault.kind == mmu::FaultKind::ExternalOnWalk => {
+                    return Ok(Some(Err(Exception::DataAbort {
+                        status: fault.status(),
+                        // The abort of an address translation
+                        // instruction says "write", also for a read.
+                        write: true,
+                        cache: true,
+                        address: value,
+                    })));
+                }
+                Err(Miss::Fault(fault)) => mmu::par_fault(fault),
+                Err(Miss::Host(message)) => return Err(Stop::Host(message)),
+            };
+            state.system.regs[reg::PAR_EL1] = par;
+            Some(Ok(()))
+        }
+        // TLBI of the EL1&0 regime, on this CPU (CRm 7) or on all of
+        // them (CRm 3, the Inner Shareable domain): the second kind goes
+        // to the other CPUs of the machine too.
+        (0, 8, crm @ (3 | 7), op2) if !el0 => {
+            let asid = (value >> 48) as u16;
+            let invalidation = match op2 {
+                // VMALLE1.
+                0 => Invalidation::All,
+                // VAE1 and VALE1: one address of one ASID.
+                1 | 5 => Invalidation::Page {
+                    argument: value,
+                    asid: Some(asid),
+                },
+                // ASIDE1.
+                2 => Invalidation::Asid(asid),
+                // VAAE1 and VAALE1: one address of every ASID.
+                3 | 7 => Invalidation::Page {
+                    argument: value,
+                    asid: None,
+                },
+                _ => return Ok(None),
+            };
+            side.invalidate(invalidation);
+            if crm == 3 {
+                side.broadcast(Some(invalidation));
+            }
+            Some(Ok(()))
+        }
+        _ => None,
+    };
+    Ok(done)
 }
 
 #[cfg(test)]
@@ -6453,6 +6924,114 @@ mod tests {
         assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x3a00_0000);
         assert_eq!(cpu.state.system.regs[reg::SPSR_EL1], 0x0010_03c5);
         assert_eq!(cpu.state.cpsr(), 0x3c5);
+    }
+
+    /// A CPU for the tests of card T3-D2: the interpreter, or the JIT with
+    /// chaining and the misses of the jump cache served, with the last
+    /// instructions of blocks served in code or not.
+    fn terminal_cpu(words: &[u32], jit: Option<bool>) -> Cpu<FlatMemory> {
+        let mut cpu = with_vectors(words);
+        if let Some(terminal) = jit {
+            cpu.set_jit(true).unwrap();
+            cpu.set_chaining(true).unwrap();
+            cpu.chaining.serve = true;
+            cpu.chaining.terminal = terminal;
+        }
+        cpu
+    }
+
+    /// What the tests of card T3-D2 compare between the interpreter and
+    /// the JIT.
+    fn terminal_view(cpu: &Cpu<FlatMemory>) -> Vec<u64> {
+        let regs = &cpu.state.system.regs;
+        let mut view: Vec<u64> = (0..4).map(|n| cpu.state.x(n)).collect();
+        view.extend([
+            cpu.state.pc(),
+            u64::from(cpu.state.cpsr()),
+            cpu.state.sp(),
+            cpu.instructions,
+            cpu.exceptions,
+            regs[reg::ESR_EL1],
+            regs[reg::ELR_EL1],
+            regs[reg::SPSR_EL1],
+            regs[reg::TTBR0_EL1],
+        ]);
+        view
+    }
+
+    #[test]
+    fn system_calls_and_their_returns_are_served_in_compiled_code() {
+        // EL0: add x0, x0, #1 ; svc #7 ; b -8. The handler: add x1, x1, #1 ;
+        // msr ttbr0_el1, x1 ; mrs x3, cntvct_el0 ; eret. The table base moves
+        // at every call, and empties the jump cache each time.
+        let make = |jit| {
+            let mut cpu = terminal_cpu(&[0x9100_0400, SVC_7, 0x17ff_fffe], jit);
+            handler(
+                &mut cpu,
+                &[0x9100_0421, msr("TTBR0_EL1", 1), mrs(3, "CNTVCT_EL0"), ERET],
+            );
+            cpu.clock = Clock::Manual(77);
+            assert!(cpu.state.set_cpsr(0));
+            cpu.state.slots[slot::SP_EL0] = 0x1000;
+            cpu.state.slots[slot::SP_EL1] = 0x2000;
+            cpu
+        };
+        let mut interpreted = make(None);
+        let mut served = make(Some(true));
+        let mut returned = make(Some(false));
+        for cpu in [&mut interpreted, &mut served, &mut returned] {
+            assert_eq!(cpu.run(4000), Stop::Budget);
+        }
+        assert_eq!(interpreted.state.x(3), 77);
+        assert!(interpreted.state.x(1) > 500, "{}", interpreted.state.x(1));
+        for cpu in [&served, &returned] {
+            assert_eq!(terminal_view(cpu), terminal_view(&interpreted));
+            assert_eq!(cpu.taken, interpreted.taken);
+        }
+        let (served, returned) = (served.jit_counts(), returned.jit_counts());
+        let sum = |counts: &[u64; TERMINAL_KINDS]| counts.iter().sum::<u64>();
+        assert_eq!(sum(&returned.terminal_served), 0, "{returned:?}");
+        assert!(returned.returns_terminal > 2000, "{returned:?}");
+        // Four of every seven instructions end a block: each is served but
+        // those of the first round, which compiles the blocks.
+        assert!(sum(&served.terminal_served) > 2000, "{served:?}");
+        assert!(sum(&served.terminal_returns) < 20, "{served:?}");
+        assert!(served.compiled_runs < 20, "{served:?}");
+        for kind in [0, 3, 4, 5] {
+            assert!(served.terminal_served[kind] > 500, "{kind}: {served:?}");
+        }
+        assert!(served.shared_clears > 500, "{served:?}");
+    }
+
+    #[test]
+    fn an_interrupt_that_a_served_instruction_unmasks_is_taken_by_the_loop() {
+        // EL1: add x0, x0, #1 ; dc zva, x2 ; msr daifclr, #2 ; add x1, x1, #1 ;
+        // b -16, with the IRQ line high. The vector of an IRQ from EL1 with
+        // SP_EL1: add x2, x2, #1 ; b -4.
+        let make = |jit| {
+            let mut cpu = terminal_cpu(
+                &[0x9100_0400, 0xd50b_7422, 0xd503_42ff, 0x9100_0421, 0x17ff_fffc],
+                jit,
+            );
+            for (index, word) in [0x9100_0442u32, 0x17ff_ffff].iter().enumerate() {
+                cpu.memory
+                    .write(VECTORS + 0x280 + 4 * index as u64, &word.to_le_bytes())
+                    .unwrap();
+            }
+            cpu.state.set_x(2, BASE + 0x1800);
+            cpu.irq = true;
+            cpu
+        };
+        let mut interpreted = make(None);
+        let mut served = make(Some(true));
+        for cpu in [&mut interpreted, &mut served] {
+            assert_eq!(cpu.run(300), Stop::Budget);
+        }
+        assert_eq!(terminal_view(&served), terminal_view(&interpreted));
+        assert_eq!(served.taken, interpreted.taken);
+        assert_eq!(interpreted.exceptions, 1);
+        assert_eq!(interpreted.state.x(1), 0);
+        assert!(interpreted.state.x(2) > 100);
     }
 
     #[test]
