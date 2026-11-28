@@ -356,7 +356,10 @@ fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
         ));
     };
     if h.machine != "virt" {
-        refuse(&format!("machine = \"{}\"", h.machine), "use the `virt` machine");
+        refuse(
+            &format!("machine = \"{}\"", h.machine),
+            "use the `virt` machine",
+        );
     }
     if h.firmware != Some(crate::profiles::FirmwareKind::Ovmf) {
         refuse("a firmware other than UEFI (AAVMF)", "use UEFI firmware");
@@ -377,7 +380,10 @@ fn virt_hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
         refuse("a `gpu {}` block", "remove it");
     }
     if h.usb {
-        refuse("`usb = true` (an xHCI for passthrough)", "set `usb = false`");
+        refuse(
+            "`usb = true` (an xHCI for passthrough)",
+            "set `usb = false`",
+        );
     }
     if h.tpm {
         refuse("a TPM", "set `tpm = false`");
@@ -1373,7 +1379,9 @@ mod tests {
         );
         let args = vmlab_refusals(file.lab.machine("args").unwrap(), &kvm_host(), None);
         assert!(
-            args.len() == 1 && args[0].contains("`qemu_args`") && args[0].contains("hypervisor = \"qemu\""),
+            args.len() == 1
+                && args[0].contains("`qemu_args`")
+                && args[0].contains("hypervisor = \"qemu\""),
             "{args:?}"
         );
         let arm_host = HostFacts {
@@ -1381,7 +1389,10 @@ mod tests {
             kvm: true,
         };
         let why = vmlab_refusals(file.lab.machine("plain").unwrap(), &arm_host, None);
-        assert!(why.len() == 1 && why[0].contains("x86_64 host only"), "{why:?}");
+        assert!(
+            why.len() == 1 && why[0].contains("x86_64 host only"),
+            "{why:?}"
+        );
     }
 
     /// Automatic selection puts an aarch64 VM on vmlab-hv, and on QEMU only
@@ -1429,7 +1440,11 @@ mod tests {
             "{kept:?}"
         );
         let pinned = file.lab.machine("pinned").unwrap();
-        for existing in [None, Some(HypervisorKind::Qemu), Some(HypervisorKind::Vmlab)] {
+        for existing in [
+            None,
+            Some(HypervisorKind::Qemu),
+            Some(HypervisorKind::Vmlab),
+        ] {
             let picked = none.select(pinned, &kvm_host(), None, existing);
             assert_eq!(
                 (picked.kind, picked.source),

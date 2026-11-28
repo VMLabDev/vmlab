@@ -928,7 +928,9 @@ fn virt(
         // An emulated machine's NIC takes the stream: a vhost backend would
         // write guest RAM past the emulator's translated-code tracking.
         let NicBackend::Stream { sock } = &nic.backend else {
-            bail!("vm \"{name}\": vmlab-hv attaches an emulated machine's NIC by stream socket only, not a TAP");
+            bail!(
+                "vm \"{name}\": vmlab-hv attaches an emulated machine's NIC by stream socket only, not a TAP"
+            );
         };
         nics.push(Nic {
             model: NicModel::Virtio,
@@ -1215,8 +1217,7 @@ mod tests {
         let v = crate::qemu::resolve::testing::vm(&format!(
             "vm \"t\" {{ template = \"scratch\" arch = \"aarch64\" disk = 10GiB {body} }}"
         ));
-        crate::qemu::resolve_vm(&v, None, &crate::profiles::ProfileSet::shipped().unwrap())
-            .unwrap()
+        crate::qemu::resolve_vm(&v, None, &crate::profiles::ProfileSet::shipped().unwrap()).unwrap()
     }
 
     fn aavmf_paths() -> VmPaths {
@@ -1245,13 +1246,24 @@ mod tests {
         );
         assert_eq!((d.vcpus, d.name.as_str()), (2, "vmlab:l/t"));
         assert_eq!(d.console_pci, at(1));
-        let slots: Vec<_> = d.disks.iter().map(|disk| (disk.id.as_str(), disk.pci)).collect();
+        let slots: Vec<_> = d
+            .disks
+            .iter()
+            .map(|disk| (disk.id.as_str(), disk.pci))
+            .collect();
         assert_eq!(slots, [("disk0", at(2)), ("disk1", at(3)), ("cd0", at(4))]);
-        assert!(d.disks.iter().all(|disk| disk.bus == DiskBus::Virtio && !disk.cdrom));
+        assert!(
+            d.disks
+                .iter()
+                .all(|disk| disk.bus == DiskBus::Virtio && !disk.cdrom)
+        );
         assert!(d.disks[0].vmstate && !d.disks[0].read_only);
         assert!(d.disks[2].read_only && d.disks[2].format == DiskFormat::Raw);
         assert_eq!(d.nics[0].pci, at(5));
-        assert!(matches!(d.nics[0].attachment, NicAttachment::StreamVnet { .. }));
+        assert!(matches!(
+            d.nics[0].attachment,
+            NicAttachment::StreamVnet { .. }
+        ));
         assert!(d.nics[0].rom.is_none());
         assert!(d.display.is_none() && d.tablet.is_none() && d.usb.is_none());
         assert_eq!(d.ports[0].name, vmlab_agent_proto::PORT_NAME);
@@ -1267,10 +1279,16 @@ mod tests {
         };
         assert_eq!(*firmware, FirmwareKind::Aavmf);
         assert_eq!(code, Path::new("/fw/aarch64/AAVMF_CODE.fd"));
-        assert_eq!(vars.as_deref(), Some(Path::new("/lab/.vmlab/vms/v/AAVMF_VARS.fd")));
+        assert_eq!(
+            vars.as_deref(),
+            Some(Path::new("/lab/.vmlab/vms/v/AAVMF_VARS.fd"))
+        );
         assert!(bootorder.is_empty());
         let json = serde_json::to_string(&d).unwrap();
-        assert_eq!(serde_json::from_str::<MachineDescription>(&json).unwrap(), d);
+        assert_eq!(
+            serde_json::from_str::<MachineDescription>(&json).unwrap(),
+            d
+        );
     }
 
     /// What the emulated machine cannot take is refused before a spawn: KVM,
@@ -1278,9 +1296,8 @@ mod tests {
     #[test]
     fn what_an_aarch64_launch_cannot_describe_is_refused() {
         let r = aarch64(r#"profile = "linux-modern""#);
-        let refused = |paths: &VmPaths, accel| {
-            vm("l", &r, paths, accel, &roms()).unwrap_err().to_string()
-        };
+        let refused =
+            |paths: &VmPaths, accel| vm("l", &r, paths, accel, &roms()).unwrap_err().to_string();
         assert!(refused(&aavmf_paths(), QemuAccel::Kvm).contains("emulator"));
         let mut tap = aavmf_paths();
         tap.nics[0].backend = NicBackend::TapQueues {
