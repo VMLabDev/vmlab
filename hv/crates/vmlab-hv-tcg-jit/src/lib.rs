@@ -302,8 +302,11 @@ pub struct Stats {
     pub lazy: u64,
 }
 
-/// The default size of the code region of one CPU (H13b).
-pub const REGION_BYTES: usize = 64 << 20;
+/// The default size of the code region of one CPU (H13b). 256 MiB holds
+/// the code that a Debian boot compiles the first time, so it drops a part
+/// once at most (3e DESIGN.md T3-D3). The memfd keeps each page that it
+/// wrote: up to this much host memory for each vCPU.
+pub const REGION_BYTES: usize = 256 << 20;
 
 type Enter = unsafe extern "sysv64" fn(*mut Context, u64, *mut u128, *mut u64) -> u64;
 
