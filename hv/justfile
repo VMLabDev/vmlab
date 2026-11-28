@@ -132,6 +132,72 @@ tcg-a64-boot-lockstep firmware='../guest/dist/firmware/aarch64' until='Shell>' r
 	if [ "{{max}}" != 0 ]; then args+=(--max-instructions "{{max}}"); fi
 	cargo run --release -p vmlab-hv-vmm --example a64_boot_lockstep -- "${args[@]}"
 
+# Run K4 of 3e (card #1187): the boot lockstep of an aarch64 template against QEMU from the reset to agent ready, the follower taking from the stream what the leader's disk and agent port wrote into RAM; keep is the directory that takes run.log, summary.txt (the first CPU difference: instruction, PC, registers) and the serial logs, template the disk.qcow2 (empty: the newest debian-13 of the template store), max ends the run after that many instructions (0: no limit), resync is how many CPU differences the run goes past. It runs about ten hours, off the merge bar: scripts/k4-nightly.sh is the nightly job
+[group('tcg')]
+tcg-a64-k4 keep template='' firmware='../guest/dist/firmware/aarch64' ram_mib='2048' max='0' resync='0': tcg-a64-plugin-build
+	#!/usr/bin/env bash
+	set -euo pipefail
+	keep="{{keep}}"
+	case "$keep" in ""|/) echo "give a directory for the logs" >&2; exit 2;; esac
+	mkdir -p -- "$keep"
+	template="{{template}}"
+	if [ -z "$template" ]; then
+		store="$HOME/.local/share/vmlab/templates/aarch64/debian-13"
+		version=$(ls -1 "$store" | sort -V | tail -n 1)
+		template="$store/$version/disk.qcow2"
+	fi
+	[ -f "$template" ] || { echo "no template disk at $template" >&2; exit 2; }
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64k4.XXXXXX")
+	finish() {
+		[ -n "$dir" ] && [ -d "$dir" ] || exit 1
+		[ -n "$keep" ] && [ -d "$keep" ] || exit 1
+		for name in follower-serial.log leader-serial.log last-instructions.txt; do
+			if [ -f "$dir/$name" ]; then cp -- "$dir/$name" "$keep/$name"; fi
+		done
+		rm -rf -- "$dir"
+	}
+	trap finish EXIT
+	# An idle guest waits in host time (-icount sleep=on): the leader may write nothing for minutes.
+	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --code "{{firmware}}/AAVMF_CODE.fd" --vars "{{firmware}}/AAVMF_VARS.fd" --disk "$template" --ram-mib "{{ram_mib}}" --resync "{{resync}}" --silence 900)
+	if [ "{{max}}" != 0 ]; then args+=(--max-instructions "{{max}}"); fi
+	cargo build --release -p vmlab-hv-vmm --example a64_boot_lockstep
+	{
+		echo "K4 of 3e: $(date -Is), commit $(git rev-parse HEAD 2>/dev/null || echo unknown), template $template"
+		echo "firmware {{firmware}}, RAM {{ram_mib}} MiB, $(qemu-system-aarch64 --version | head -n 1)"
+	} > "$keep/run.log"
+	status=0
+	cargo run --release -q -p vmlab-hv-vmm --example a64_boot_lockstep -- "${args[@]}" >> "$keep/run.log" 2>&1 || status=$?
+	{
+		head -n 2 "$keep/run.log"
+		echo "exit code $status ($( [ "$status" = 0 ] && echo 'no CPU difference' || echo 'a CPU difference, or the run did not reach agent ready' ))"
+		grep -E '^(ended:|CPU differences:|JIT:|RAM adopted|The agent|Device reads taken|the run did not|our CPU has no)' "$keep/run.log" || true
+		echo "The first CPU difference (instruction, PC, registers ours / leader):"
+		first=$(awk '/^CPU difference 1 /{on=1; print; next} on && /^  /{print; next} on{exit}' "$keep/run.log")
+		echo "${first:-  none}"
+		echo "The memory writes that differed first:"
+		grep -m 1 '^memory writes of' "$keep/run.log" || echo "  none"
+	} > "$keep/summary.txt"
+	cat "$keep/summary.txt"
+	exit "$status"
+
+# Install the nightly job of K4 (card #1187) as a timer of the user's systemd: at `at` (systemd calendar) it moves the clone `clone` (a clone of vmlab of its own, which nothing else builds in) to the newest commit of `branch` and runs scripts/k4-nightly.sh into `results`; a run that finds the one before it still going ends at once. The timer is transient: install it again after a reboot. `systemctl --user start vmlab-k4-nightly.service` starts a run now
+[group('tcg')]
+tcg-a64-k4-nightly-install clone results branch='next' at='*-*-* 20:00':
+	#!/usr/bin/env bash
+	set -euo pipefail
+	clone="{{clone}}"; results="{{results}}"
+	case "$clone" in ""|/) echo "give the clone" >&2; exit 2;; esac
+	case "$results" in ""|/) echo "give the results directory" >&2; exit 2;; esac
+	[ -d "$clone/.git" ] || git clone -q https://github.com/VMLabDev/vmlab.git "$clone"
+	mkdir -p -- "$results"
+	job="set -eu; git -C '$clone' fetch -q origin '+refs/heads/{{branch}}:refs/remotes/origin/{{branch}}'; git -C '$clone' checkout -q --detach 'origin/{{branch}}'; exec '$clone/hv/scripts/k4-nightly.sh' '$results'"
+	systemctl --user stop vmlab-k4-nightly.timer 2>/dev/null || true
+	systemd-run --user --unit vmlab-k4-nightly --on-calendar "{{at}}" \
+		-p MemoryMax=16G -p MemorySwapMax=0 -p Nice=10 \
+		-E PATH="$PATH" -E HOME="$HOME" -E CARGO_BUILD_JOBS=4 \
+		flock -n "$results/.lock" bash -c "$job"
+	systemctl --user list-timers vmlab-k4-nightly.timer --no-pager
+
 # Run the windows of a boot against QEMU (card C13b, the O4 form that ends in under two hours): windows is the directory that VMLAB_HV_A64_WINDOWS=<dir>,<first>,<every>,<count> made a boot of our machine write, ram_mib the RAM of that machine, budget the most instructions of one window
 [group('tcg')]
 tcg-a64-window-lockstep windows ram_mib budget='20000000': tcg-a64-plugin-build

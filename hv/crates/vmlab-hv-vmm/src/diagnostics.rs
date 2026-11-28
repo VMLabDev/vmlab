@@ -59,7 +59,19 @@ pub(crate) fn vm_state(shared: &VmShared) -> serde_json::Value {
                 != 0
         }),
     });
-    json!({"vcpus":vcpus, "exit_rip":exit_rip,
+    let kvm_stats = shared.kvm_stats.try_lock().map(|stats| {
+        let read = |id: Option<u8>| {
+            stats
+                .iter()
+                .filter(|(of, _)| *of == id)
+                .find_map(|(_, file)| file.read().ok())
+        };
+        json!({
+            "vm":read(None),
+            "vcpus":stats.iter().filter_map(|(id, _)| *id).map(|id| json!({"id":id, "counters":read(Some(id))})).collect::<Vec<_>>(),
+        })
+    });
+    json!({"vcpus":vcpus, "exit_rip":exit_rip, "kvm_stats":kvm_stats,
         "exit_recorder":{"enabled":report::exit_recorder_mode() != report::RECORD_OFF},
         "pci_bars":bars, "timers":timers, "mch_smram":smram,
         "usb_attachments":shared.usb_attachments.try_lock().map(|a| a.iter().map(|a| a.id.clone()).collect::<Vec<_>>())})

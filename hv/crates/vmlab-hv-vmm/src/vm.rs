@@ -182,6 +182,9 @@ pub struct VmShared {
     /// thread holds each mutex across KVM_RUN, snapshots take it while the
     /// thread is parked.
     pub(crate) vcpus: Mutex<Vec<(u8, Arc<Mutex<VcpuFd>>)>>,
+    /// KVM's statistics of the VM (`None`) and of each vCPU, opened before
+    /// the vCPUs first run; diagnostic reports read them.
+    pub(crate) kvm_stats: Mutex<Vec<(Option<u8>, crate::kvm_stats::KvmStats)>>,
     /// How many vCPU threads are parked (out of KVM_RUN and waiting on
     /// `state_cv`); a snapshot waits for this to reach the vCPU count.
     parked: Mutex<usize>,
@@ -297,6 +300,7 @@ impl VmShared {
             display: Mutex::new(None),
             display_generation: std::sync::atomic::AtomicU64::new(0),
             vga_mapping: Mutex::new(None),
+            kvm_stats: Mutex::new(Vec::new()),
             last_frame: Mutex::new(std::time::Instant::now()),
             memory_gate: Mutex::new(MemoryGate::default()),
             memory_cv: Condvar::new(),
@@ -1671,6 +1675,18 @@ impl Vm {
                 .coalesced_vga
                 .set(coalesced)
                 .map_err(|_| VmmError::Other("coalesced VGA already initialized".into()))?;
+        }
+        if let Some(kvm) = shared.kvm.get() {
+            use std::os::fd::AsRawFd;
+            let sources = std::iter::once((None, kvm.vm.as_raw_fd()))
+                .chain(vcpu_fds.iter().map(|(id, fd)| (Some(*id), fd.as_raw_fd())));
+            let mut stats = shared.kvm_stats.lock();
+            for (id, fd) in sources {
+                match crate::kvm_stats::KvmStats::open(fd) {
+                    Ok(file) => stats.push((id, file)),
+                    Err(e) => log::debug!("KVM statistics of {id:?} unavailable: {e}"),
+                }
+            }
         }
         let fds: Vec<(u8, Arc<Mutex<VcpuFd>>)> = vcpu_fds
             .into_iter()
