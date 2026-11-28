@@ -386,6 +386,34 @@ pub struct GuestBus {
     own: u64,
     /// The writes through this clone that ended translated code.
     ended: u64,
+    /// The device accesses through this clone and their time (3e card
+    /// T3-D4: another CPU waits for a CPU that is inside one).
+    pub device: DeviceTimes,
+}
+
+/// The device accesses of one CPU: how many, how many took longer than
+/// `LONG_DEVICE_NS`, their time, and the longest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceTimes {
+    pub accesses: u64,
+    pub long: u64,
+    pub long_ns: u64,
+    pub max_ns: u64,
+}
+
+/// A device access longer than this is counted apart.
+pub const LONG_DEVICE_NS: u64 = 1_000_000;
+
+impl DeviceTimes {
+    fn add(&mut self, started: std::time::Instant) {
+        let ns = started.elapsed().as_nanos() as u64;
+        self.accesses += 1;
+        if ns > LONG_DEVICE_NS {
+            self.long += 1;
+            self.long_ns += ns;
+        }
+        self.max_ns = self.max_ns.max(ns);
+    }
 }
 
 impl GuestBus {
@@ -457,6 +485,7 @@ impl GuestBus {
             }),
             own: 0,
             ended: 0,
+            device: DeviceTimes::default(),
         })
     }
 
@@ -513,12 +542,14 @@ impl Memory for GuestBus {
             return Err(Error::Memory(address));
         }
         let mut at = address;
+        let started = std::time::Instant::now();
         for part in bytes.chunks_mut(BUS_WIDTH) {
             if !self.shared.host.mmio_read(at, part) {
                 return Err(Error::Memory(at));
             }
             at += part.len() as u64;
         }
+        self.device.add(started);
         Ok(())
     }
 
@@ -562,12 +593,14 @@ impl Memory for GuestBus {
             return Err(Error::Memory(address));
         }
         let mut at = address;
+        let started = std::time::Instant::now();
         for part in bytes.chunks(BUS_WIDTH) {
             if !self.shared.host.mmio_write(at, part) {
                 return Err(Error::Memory(at));
             }
             at += part.len() as u64;
         }
+        self.device.add(started);
         // The CPU counts each of its writes as one generation.
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
         self.own += 1;

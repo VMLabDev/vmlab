@@ -409,6 +409,7 @@ pub struct Waits {
     pub waited: u64,
     pub long: u64,
     pub ns: u64,
+    pub max_ns: u64,
 }
 
 /// A wait for the other CPUs longer than this is counted apart: it is
@@ -421,6 +422,7 @@ impl Waits {
         self.waited += u64::from(waited);
         self.long += u64::from(ns > LONG_WAIT_NS);
         self.ns += ns;
+        self.max_ns = self.max_ns.max(ns);
     }
 }
 
@@ -428,11 +430,12 @@ impl std::fmt::Display for Waits {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} ({} waited, {} long, {} us)",
+            "{} ({} waited, {} long, {} us, longest {} us)",
             self.count,
             self.waited,
             self.long,
-            self.ns / 1_000
+            self.ns / 1_000,
+            self.max_ns / 1_000
         )
     }
 }
