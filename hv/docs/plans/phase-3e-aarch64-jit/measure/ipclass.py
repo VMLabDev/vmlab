@@ -59,6 +59,42 @@ CLASSES = (
 )
 
 
+# Classes before CLASSES (card #1212): the serving of the thunk (T3-D2b,
+# T3-D2c), and the exclusive paths of exec.rs.
+EXTRA = (
+    ("compiled code: the thunk and the pure calls",
+     r"^(serve_jump|serve_terminal|serve_next|terminal_run|resolve) .*exec\.rs"),
+    ("exclusives: the paths of exec.rs", r"^(store_exclusive|store_exclusive_locked|load_exclusive) .*exec\.rs"),
+)
+SOFTMMU_CLOSURE = re.compile(r"^\{closure#0\}<vmlab_hv_vmm::vcpu::guest_bus::GuestBus, \d+>")
+
+
+def bare(name):
+    """The name without the generic arguments of each path segment:
+    `serve_jump<vmlab_hv_vmm::vcpu::guest_bus::GuestBus>` is `serve_jump`,
+    `<a::Cpu<B>>::run` is `<a::Cpu>::run`. Before card #1212 the classes
+    matched the whole name, so a generic argument from `vmlab_hv_vmm` put a
+    function of the JIT (`effect`, `serve_jump`, `store_pair` over
+    `GuestBus`) into "devices and the VMM"."""
+    previous = None
+    while previous != name:
+        previous = name
+        name = re.sub(r"(?<=[A-Za-z0-9_}])<[^<>]*>", "", name)
+    return name
+
+
+def classify(function, where):
+    """The class of a frame: `function` with its generic arguments,
+    `where` the file of its line, with the crate path taken away."""
+    if SOFTMMU_CLOSURE.search(function):
+        return "softmmu: the TLB lookup and the load and store paths"
+    text = bare(function) + " " + where
+    for name, pattern in EXTRA + CLASSES:
+        if re.search(pattern, text):
+            return name
+    return "other in the binary"
+
+
 def strip_generics(name):
     """The name without its turbofish arguments: `<a::B>::run::<c::D<E>>`
     is `<a::B>::run`."""
@@ -156,13 +192,7 @@ def main():
         function, where = chain[0]
         function = strip_generics(function)
         where = re.sub(r"^.*/(crates|src|registry/src/[^/]+)/", "", where)
-        text = function + " " + where
-        for name, pattern in CLASSES:
-            if re.search(pattern, text):
-                classes[prefix + name] += count
-                break
-        else:
-            classes[prefix + "other in the binary"] += count
+        classes[prefix + classify(function, where)] += count
         leaves[prefix + function[:70] + "  " + re.sub(r":\d+.*$", "", where)] += count
     if other:
         classes["libraries (libc and others), no caller in the binary"] = other
