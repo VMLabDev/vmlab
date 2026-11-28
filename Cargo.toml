@@ -151,6 +151,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 todo = "warn"
 dbg_macro = "warn"
 
+# Cross-crate ThinLTO for the release profile (card #1216): the hot paths of
+# the TCG CPUs cross the crates of the hypervisor (the executor, the JIT, the
+# guest bus), and inlining across them is measured in the 3e design.
+[profile.release]
+lto = "thin"
+
 [workspace]
 resolver = "3"
 members = ["hv/crates/*"]
