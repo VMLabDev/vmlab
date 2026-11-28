@@ -73,6 +73,9 @@ def parse_args(argv):
                         "jumbo g2g, MTU-1500 g2g1500, or four-flow MTU-1500 g2g-multiflow")
     p.add_argument("--idle-settle", type=float, default=IDLE_SETTLE,
                    help="idle suite: seconds left alone after agent ready before sampling")
+    p.add_argument("--no-apicv", action="store_true",
+                   help="x86_64: configure VMs as on a host without APIC virtualization "
+                        "(no hv-avic), as a nested host such as WSL2 must")
     p.add_argument("--cpus", default=None, help="taskset window override (e.g. 16-19)")
     p.add_argument("--hv-bin", default=os.path.join(lib.REPO_DIR, "target/release/vmlab-hv"))
     p.add_argument("--timeout-scale", type=float, default=1.0)
@@ -1260,6 +1263,7 @@ def sweep_stale_vms():
 
 def main(argv=None):
     args = parse_args(argv)
+    lib.NO_APIC_VIRTUALIZATION = args.no_apicv
     if (args.backend in ("interpreter", "jit") and args.arch == "aarch64") or (
             args.backend == "qemu" and args.guest == "flat-a64"):
         # The flat aarch64 images on our interpreter loop, on its JIT (3e

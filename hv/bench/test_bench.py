@@ -853,13 +853,22 @@ class X86WorkloadTests(unittest.TestCase):
             self.assertIn(name, lib.D28_BAR)
         zero = dict.fromkeys(lib.KVM_STAT_NAMES, 0)
         later = {"exits": 6000, "halt_exits": 1200, "irq_exits": 600,
-                 "hypercalls": 300, "io_exits": 60, "mmio_exits": 120}
+                 "hypercalls": 300, "io_exits": 60, "mmio_exits": 120,
+                 "insn_emulation": 240}
         self.assertEqual(lib.idle_rates(10.0, 13.0, zero, later, 60.0), {
             "idle_cpu_pct": 5.0, "idle_exits_per_s": 100.0,
             "idle_halt_exits_per_s": 20.0, "idle_irq_exits_per_s": 10.0,
             "idle_hypercalls_per_s": 5.0, "idle_user_exits_per_s": 3.0,
+            "idle_emulations_per_s": 4.0,
         })
         self.assertEqual(lib.idle_rates(0.0, 0.6, None, later, 60.0), {"idle_cpu_pct": 1.0})
+
+    def test_no_apicv_turns_off_avic_on_any_host(self):
+        import run
+        self.assertTrue(run.parse_args(["--no-apicv"]).no_apicv)
+        self.assertFalse(run.parse_args([]).no_apicv)
+        with mock.patch.object(lib, "NO_APIC_VIRTUALIZATION", True):
+            self.assertFalse(lib.host_apic_virtualization())
 
     def serve_once(self, path, script):
         server = socket.socket(socket.AF_UNIX)
@@ -899,7 +908,8 @@ class X86WorkloadTests(unittest.TestCase):
             thread.join(5)
             self.assertEqual(seen[1]["command"], {"command": "dump_diagnostics"})
             self.assertEqual(stats, {"exits": 12, "halt_exits": 5, "irq_exits": 0,
-                                     "hypercalls": 4, "io_exits": 1, "mmio_exits": 0})
+                                     "hypercalls": 4, "io_exits": 1, "mmio_exits": 0,
+                                     "insn_emulation": 0})
             self.assertFalse(os.path.exists(report))
 
     def test_qemu_kvm_stats_sum_query_stats_vcpus(self):

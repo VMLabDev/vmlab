@@ -170,6 +170,7 @@ X86_IDLE_WORKLOADS = (
     "idle_irq_exits_per_s",
     "idle_hypercalls_per_s",
     "idle_user_exits_per_s",
+    "idle_emulations_per_s",
 )
 # KVM's statistic behind each idle exit workload. `user` exits are those
 # KVM hands to the VMM (I/O and MMIO that no in-kernel device takes).
@@ -179,6 +180,10 @@ IDLE_EXIT_COUNTERS = {
     "idle_irq_exits_per_s": ("irq_exits",),
     "idle_hypercalls_per_s": ("hypercalls",),
     "idle_user_exits_per_s": ("io_exits", "mmio_exits"),
+    # Instructions KVM emulates: xAPIC MMIO accesses on a host without APIC
+    # virtualization. A Windows guest told to use the Hyper-V APIC MSRs makes
+    # few (card #1197: about 2000/s on 4 vCPUs before, under 110/s after).
+    "idle_emulations_per_s": ("insn_emulation",),
 }
 X86_G2G_WORKLOADS = ("net_g2g_a2b_tcp_mbps", "net_g2g_b2a_tcp_mbps")
 X86_G2G1500_WORKLOADS = ("net_g2g1500_a2b_tcp_mbps", "net_g2g1500_b2a_tcp_mbps")
@@ -584,7 +589,8 @@ def qmp_cont(path, timeout=60):
 # ---------------------------------------------------------------------------
 
 
-KVM_STAT_NAMES = ("exits", "halt_exits", "irq_exits", "hypercalls", "io_exits", "mmio_exits")
+KVM_STAT_NAMES = ("exits", "halt_exits", "irq_exits", "hypercalls", "io_exits", "mmio_exits",
+                  "insn_emulation")
 
 
 def sum_vcpu_stats(per_vcpu):
@@ -824,10 +830,18 @@ def prepare_run_dir(run, arch, guest, version):
     return overlay, code, os.path.join(run, "vars.fd")
 
 
+# `run.py --no-apicv`: configure VMs as on a host without APIC
+# virtualization (a nested host such as WSL2), where KVM emulates every
+# xAPIC access a guest makes.
+NO_APIC_VIRTUALIZATION = False
+
+
 def host_apic_virtualization():
     """vmlab's cmdline::host_apic_virtualization: kvm_intel's enable_apicv
     or kvm_amd's avic. Decides the hv-avic enlightenment and QEMU's
     kvm-pit lost-tick global on this host."""
+    if NO_APIC_VIRTUALIZATION:
+        return False
     for module, param in [("kvm_intel", "enable_apicv"), ("kvm_amd", "avic")]:
         try:
             with open(f"/sys/module/{module}/parameters/{param}") as f:
