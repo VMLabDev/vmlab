@@ -512,7 +512,8 @@ a `memcpy` loop of glibc) before a card is written.
   cost is that code used by several vCPUs is compiled once for each, at 0.2
   to 1.1 µs a block.
 - **H13b. Size.** B1 measured 34 to 66 bytes of code per guest instruction.
-  The default is one region of 64 MiB per vCPU, reserved at once and touched
+  The default is one region of 256 MiB per vCPU (64 MiB until card
+  T3-D3, T3-D3e), reserved at once and touched
   as it fills. It is inside the memory cap of the VM process, beside the 256
   MiB young generation of the block store.
 - **H13c. Eviction.** The region is cut into four parts, written one after
@@ -2241,6 +2242,85 @@ estimates are *est.*, from the shares above.
   (60.4 to 77.5 s at one vCPU in round 2) is as large as that gain, so the
   verdict on the boot after these cards needs more than three runs or a
   quieter host.
+
+### T3-D3, measured by card #1210
+
+Helios, 2026-11-28, *measured*. One release build of `vmlab-hv` per size
+from `next` at `ecdda53f` (J10 to J14, without T3-D2, which is not merged),
+with only `REGION_BYTES` changed. Debian 13, `--suite boot --repeats 1`,
+the reserved-core pin of #1205 (no `--cpus`), the sizes in turn, one VM of
+this card at a time. The curve ran three rounds of the four sizes at each
+vCPU count, then an A/B five rounds of 64 and 256 MiB. Other cards ran
+builds and VMs at the same time: the load average at the start of a boot
+was 5 to 22, and other work kept 2.4 to 11.4 CPUs busy (`other_busy_cpus`).
+One boot at 512 MiB, one vCPU, went to emergency mode on systemd's 90 s
+device timeout while the host had 24 to 36 % I/O wait and three VMs of
+three cards booted at once (S1F2). It was ended and is not counted. The
+rows are in `bench/history/aarch64.jsonl` with the note "card #1210
+T3-D3". The counters are from the last JIT line of each vCPU (17e9 or
+18e9 instructions of vCPU 0), summed over the vCPUs. The memory is the
+peak of `RssShmem` and `VmRSS` of the VM process, sampled every 2 s.
+`RssShmem` counts each page of the memfd twice, once in each view
+(H13b), so the host memory of the region is half of it. Sources read:
+none outside this repository. No QEMU source was read (X1 to X3).
+
+**T3-D3a. The curve**, the median over the boots of each size (64 and
+256 MiB: the eight boots of the curve and the A/B):
+
+| vCPUs | MiB a CPU | Boots | Drops of a part | Compiles after a drop | Compile, ms | Translation, ms | Region in host memory, MiB | Peak `VmRSS`, MiB |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 64 | 8 | 50.5 | 668,119 | 2,912 | 2,882 | 64 | 1,110 to 1,157 |
+| 1 | 128 | 3 | 12 | 204,286 | 1,690 | 3,155 | 128 | 1,265 to 1,280 |
+| 1 | 256 | 8 | 1.5 | 15,488 | 1,188 | 2,930 | 256 | 1,503 to 1,535 |
+| 1 | 512 | 2 | 0 | 0 | 1,179 | 2,983 | 304 to 320 | 1,598 to 1,665 |
+| 4 | 64 | 8 | 48 | 439,219 | 3,267 | 5,431 | 256 | 2,201 to 2,278 |
+| 4 | 128 | 3 | 6 | 56,565 | 2,209 | 5,342 | 512 | 2,710 to 2,746 |
+| 4 | 256 | 8 | 0 | 0 | 2,083 | 5,413 | 654 to 739 | 3,002 to 3,339 |
+| 4 | 512 | 3 | 0 | 0 | 2,263 | 5,982 | 652 to 690 | 2,991 to 3,139 |
+
+The first compiles are 0.37 to 0.41 million at one vCPU and 0.70 to 0.81
+million at four (each vCPU compiles its own copy, H13a), at every size.
+The code that a boot compiles the first time is 0.30 to 0.33 GB at one
+vCPU (the bytes of code at 512 MiB), and 0.59 to 0.69 GB over four vCPUs.
+
+**T3-D3b. The rows, before and after.** The boot to agent ready, s, the
+boots whose cores were chosen free (`chosen: free`):
+
+| vCPUs | 64 MiB (before) | 256 MiB (after) | Before over after |
+|---|---|---|---|
+| 1 | 68.51 (8: 54.95 to 128.42) | 62.41 (7: 52.21 to 80.37) | 1.10 |
+| 4 | 40.43 (6: 40.17 to 46.80) | 40.13 (4: 38.28 to 42.87) | 1.01 |
+
+With the boots on loaded cores too, the medians are 68.51 and 63.54 s at
+one vCPU (1.08) and 41.17 and 42.38 s at four (0.97), where four boots of
+the A/B at four vCPUs took 70 to 224 s at a load of 10 to 22. In the five
+pairs of the A/B at one vCPU the 256 MiB boot was faster in three, by 3.7
+to 8.6 s, and slower in two, by 10.1 and 12.0 s.
+
+- **T3-D3c. The compiles after a drop go, the translations stay.** At 256
+  MiB a boot drops a part once or twice at one vCPU and never at four. The
+  compile time falls by 1.7 s at one vCPU (2,912 to 1,188 ms) and by 1.2 s
+  summed over four vCPUs. The translation time does not move: the
+  translations of each boot are exactly its first compiles plus the
+  compiles after an invalidation, because the block store keeps a block's
+  translation when its code is dropped. So the basis of the draft, 64 % of
+  translation and compile, counted the translation that a drop never
+  repeats. The bound is the compile share alone: 1.7 s of a boot of 55 to
+  68 s at one vCPU, 2.5 to 3 %, and at four vCPUs about 0.3 s of a 40 s
+  boot (1.2 s over four threads), under 1 %.
+- **T3-D3d. The boot rows do not resolve the gain.** The medians say 1.10
+  times at one vCPU and 1.01 at four, but the spread of the boots at one
+  vCPU (52 to 128 s) is ten times the 1.7 s that the counters bound, and
+  the pairs of the A/B split three to two. The estimate of the draft, 1.03
+  to 1.07, is measured at its lower end for one vCPU by the counters and
+  not by the times, and not reached at four vCPUs.
+- **T3-D3e. The size is 256 MiB.** 128 MiB leaves 0.2 million compiles
+  after a drop at one vCPU. 512 MiB removes the last 15,000 at one vCPU
+  (about 40 ms) and changes nothing at four, but lets a VM that runs longer
+  than a boot keep up to 512 MiB of host memory a vCPU, 2 GiB for four.
+  At 256 MiB a 4-vCPU boot keeps 0.65 to 0.74 GiB of region, 0.4 to 0.5
+  GiB more than at 64 MiB, and at most 1 GiB. `REGION_BYTES` is 256 MiB
+  (H13b).
 
 ## 8. The cards
 
