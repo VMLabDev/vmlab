@@ -525,7 +525,7 @@ where QEMU places it (`0xffe00000` for 2 GiB; C7 measures the rule for other
 sizes). `/chosen` carries the `rng-seed` and the `stdout-path`.
 
 Differences to QEMU's tree, each in the approved-differences file of the
-hwref diff (O6): the ISA strings and the MMU type (G2), and no `riscv,pmu`
+hwref diff (O4): the ISA strings and the MMU type (G2), and no `riscv,pmu`
 node, because Sscofpmf is absent.
 
 There is no ACPI (`acpi=off`), so nothing of 3d's ACPI work applies. SMBIOS
