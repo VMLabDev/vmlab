@@ -18,7 +18,8 @@ pub mod tlb;
 mod value;
 pub use cpu::{Privilege, Riscv64, SpecializationStats, TRACE_CACHE_BYTES, TraceProfile};
 pub use memory::{
-    CodeStamp, FlatMemory, HostPage, Memory, RESERVATION_GRANULE, SharedMemory, next_identity,
+    CodeStamp, FlatMemory, HostPage, Memory, Quiesce, RESERVATION_GRANULE, SharedMemory,
+    next_identity,
 };
 use num_bigint::BigUint;
 use std::collections::BTreeMap;

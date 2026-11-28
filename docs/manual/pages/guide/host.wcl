@@ -508,11 +508,52 @@ the old identity is kept. When the checks pass, vmlab saves the new identity
 before boot and `vmlab up` announces the switch once.
 DOC
 
+  h3 "aarch64 guests on vmlab-hv"
+
+  p <<'DOC'
+vmlab-hv runs an aarch64 VM on its own emulator, on an x86_64 host, with or
+without `/dev/kvm`. The machine is `virt`: a GICv2 with one to eight vCPUs,
+an Armv8.0-A CPU with CRC32, AES, SHA1 and SHA2 and no PMU, AAVMF from the
+same firmware lookup as QEMU's, a PL011 serial console, the agent's port,
+virtio disks and virtio-net NICs. Each device takes the PCI slot QEMU gives
+it, so a template built under QEMU boots unchanged. CD-ROMs are read-only
+virtio disks. Online and offline snapshots work.
+
+The machine has no display, input devices or USB yet. The guest runs
+headless: read its serial console with `vmlab logs`, and reach it with
+`vmlab exec` and `vmlab shell`. `vm screenshot`, the other screen and input
+verbs, and `vmlab record` say the machine has no display. `vmlab up` warns
+about it for a VM whose profile names a display device, because the same VM
+had a screen on QEMU. The display and input devices are the only ones left
+out with a warning rather than refused, until virtio-gpu and input arrive on
+the `virt` machine. The install CD-ROM is a read-only virtio disk, which
+cannot be ejected. Shares go over SMB,
+because the machine has no virtio-fs, and NICs take the stream socket, not
+the kernel fast path.
+
+vmlab-hv refuses, for an aarch64 VM, a `gpu {}` block, `usb = true`, a TPM,
+`audio`, a `cpu_model`, more than eight vCPUs, `accel = "kvm"` and
+`qemu_args`. There is no fallback to QEMU: `vmlab validate`, `vmlab up` and
+`vmlab vm start` fail with an error that names the VM and each device the
+`virt` machine lacks. An aarch64 VM that ran on QEMU moves to vmlab-hv at its
+next start, by the same rules as the x86 move above, and fails its start the
+same way when vmlab-hv refuses it.
+
+QEMU stays available for aarch64 to troubleshoot: set `hypervisor = "qemu"`
+on the VM, or `hypervisor { vm = "qemu" }` in the host config.
+
+Emulation is slow next to KVM. A heavily loaded host can push a guest's
+boot past its own timeouts: Fedora 44 at one vCPU fell into emergency mode on
+systemd's 90 s device timeout at a host load of about 14. Run aarch64 guests
+on a host that is not heavily loaded, and give them two vCPUs.
+DOC
+
   h3 "QEMU runs no x86 guest"
 
   p <<'DOC'
-vmlab-hv is the only hypervisor for x86 and x86_64 guests. QEMU runs aarch64
-and riscv64 guests. Each way an x86 machine used to reach QEMU is now an
+vmlab-hv is the only hypervisor for x86 and x86_64 guests, and it runs
+aarch64 guests on its own emulator (see below). QEMU runs riscv64 guests, and
+an aarch64 guest only when a setting puts it there. Each way an x86 machine used to reach QEMU is now an
 error, from `vmlab validate` and again from `vmlab up` and `vmlab vm start`,
 naming the machine and the fix:
 DOC
@@ -539,9 +580,10 @@ an offline snapshot. Offline snapshots restore under either hypervisor.
 DOC
 
   p <<'DOC'
-Every new x86 VM and every container on an x86_64 host selects vmlab-hv. A
-VM of another architecture falls back to QEMU, with the reason in `status`,
-`status --json`, and an info line at `up`. Containers require KVM and never
+Every new x86 or aarch64 VM and every container on an x86_64 host selects
+vmlab-hv, and what vmlab-hv refuses of them is an error. Any other VM falls
+back to QEMU, with the reason in `status`, `status --json`, and an info line
+at `up`. Containers require KVM and never
 fall back to TCG.
 vmlab-hv is vmlab's own
 hypervisor, built a phase at a time, on an x86_64 host with a usable

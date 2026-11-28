@@ -29,11 +29,17 @@ macOS guests on vmlab-hv. Those templates do not run until their card is done.
 
 ## Other architectures
 
-- aarch64 and riscv64 VMs run on QEMU's `virt` machine.
+- aarch64 VMs run on vmlab-hv's emulated `virt` machine (§22.5, phase 3d),
+  and an existing QEMU aarch64 identity moves there at the next start. QEMU
+  runs an aarch64 VM only when a setting names it (troubleshooting). A VM
+  vmlab-hv refuses (a `gpu {}`, `usb = true`, a TPM, `audio`, `qemu_args`,
+  more than eight vCPUs) fails at `up` and `vm start`, naming each device,
+  and does not fall back to QEMU.
+- riscv64 VMs run on QEMU's `virt` machine until phase 3b.
   `src/qemu/cmdline.rs` composes only that argv now, and refuses an x86
   guest, `agent_transport = "isa-serial"` and a floppy before an argv exists.
-  Automatic selection still falls back to QEMU for these guests, with a
-  reason in `status`.
+  Automatic selection falls back to QEMU for riscv64, with a reason in
+  `status`.
 - Containers on a host that is not x86_64 run on QEMU
   (`src/qemu/container.rs`). On an x86_64 host every container runs on
   vmlab-hv.
@@ -41,7 +47,7 @@ macOS guests on vmlab-hv. Those templates do not run until their card is done.
   (`src/qmp/`), the process supervision (`src/qemu/process.rs`) and the
   TCG fallback (`plan_accel`) serve those guests.
 - The AAVMF and riscv64 firmware lookup in `src/qemu/firmware.rs` serves
-  them. The x86 OVMF and SeaBIOS lookups in the same file serve vmlab-hv.
+  them, and the AAVMF lookup serves vmlab-hv's aarch64 machine too. The x86 OVMF and SeaBIOS lookups in the same file serve vmlab-hv.
 - A host GPU's `qemu_binary`, its `qemu_env` and the Vulkan PCI filter apply
   to an aarch64 VM on QEMU. vmlab-hv reads the filter layer, and ignores
   `qemu_binary` and `qemu_env` with a warning each.

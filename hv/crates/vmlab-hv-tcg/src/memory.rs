@@ -58,6 +58,17 @@ pub struct CodeStamp {
     pub generation: u64,
 }
 
+/// A CPU of a machine of several, which a memory takes out of its run loop
+/// for the time of a device access (aarch64 3e card T3-D4): a CPU there
+/// holds no translation that it uses, so the other CPUs do not wait for it
+/// to take what they invalidated, and it takes that before it goes on.
+pub trait Quiesce {
+    /// The CPU leaves its run loop, before the device is called.
+    fn leave(&mut self);
+    /// The CPU is back, after the device returned.
+    fn enter(&mut self);
+}
+
 /// Physical accesses, including page table accesses, arrive here from Sail.
 /// Implementations may dispatch MMIO, share RAM across harts, and track writes.
 /// An access the implementation does not hold fails with `Error::Memory` and
@@ -66,6 +77,27 @@ pub struct CodeStamp {
 pub trait Memory {
     fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<()>;
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()>;
+    /// As `read`, for an access of one page that a CPU makes inside a
+    /// block. A memory that serves the address with a device may call
+    /// `quiesce.leave()` before the device and `quiesce.enter()` after it.
+    /// The default is `read`.
+    fn read_device(
+        &mut self,
+        address: u64,
+        bytes: &mut [u8],
+        _quiesce: &mut dyn Quiesce,
+    ) -> Result<()> {
+        self.read(address, bytes)
+    }
+    /// As `write`, under the rule of `read_device`.
+    fn write_device(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        _quiesce: &mut dyn Quiesce,
+    ) -> Result<()> {
+        self.write(address, bytes)
+    }
     fn generation(&self) -> u64;
     /// Some promises side-effect-free RAM fetch, a unique memory-instance ID,
     /// and invalidation when any covered page or its mapping changes.

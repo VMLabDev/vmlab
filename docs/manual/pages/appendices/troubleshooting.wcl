@@ -44,9 +44,10 @@ page apx_troubleshooting {
   h2 "KVM is unavailable and the guest runs under TCG"
   code text { source = "{machine}: KVM unavailable for {arch} — falling back to TCG (slow)" }
   p <<DOC
-    This is a warning, not an error, for an aarch64 or riscv64 guest on QEMU.
-    The [machine](guide_architecture) still
-    boots, with `-accel tcg`, and every instruction is emulated. Boot takes
+    This is a warning, not an error, for an aarch64 guest, which vmlab-hv
+    runs on its emulator, and a riscv64 guest on QEMU. The
+    [machine](guide_architecture) still boots, and every instruction is
+    emulated. Boot takes
     minutes rather than seconds and provisioning runs at the same pace.
   DOC
   p <<DOC

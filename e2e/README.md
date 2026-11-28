@@ -37,7 +37,7 @@ A vmlab run writes no hypervisor setting: automatic selection puts every x86 VM 
 
 `core` runs three labs in sequence on vmlab-hv; its four-machine `core-lab` was the QEMU run's. Normal cleanup keeps at most two VMs running at once. `core-hv` covers lifecycle, hardware and parallel provisions with two machines. `core-hv-provision` checks a provision dependency with two machines. `core-hv-scratch` checks the blank-disk boot and forced stop with one machine. The labs reuse `core-lab`'s media and provision script. Both floppy features keep their phase-4 skip reason. Reload checks edit memory. They check the live launch and the guest, including a pending edit, restart, a stopped-machine rebuild, and an unchanged peer PID. `core-unmountable` runs on both hypervisors.
 
-`admin` first brings up its aarch64 `admin-lab` on its own, which automatic selection puts on QEMU, for `arch.emulated`, and destroys it. It then uses the x86_64 scratch VM in `admin-hv` on vmlab-hv for the administration checks. `admin-roots` runs on vmlab-hv. Process checks identify a live QEMU by its lab name or a live vmlab-hv by its exact `--machine` path, so a leftover description file cannot pass a shutdown check.
+`admin` first brings up its aarch64 `admin-lab` on its own for `arch.emulated`, and destroys it. On a vmlab run automatic selection puts it on vmlab-hv's emulated `virt` machine: the check reads its machine description, waits for AAVMF's banner on the serial console, and expects `vm screenshot` to say the machine has no display. On a QEMU run it is pinned to QEMU, and the check takes a screenshot. It then uses the x86_64 scratch VM in `admin-hv` on vmlab-hv for the administration checks. `admin-roots` runs on vmlab-hv. Process checks identify a live QEMU by its lab name or a live vmlab-hv by its exact `--machine` path, so a leftover description file cannot pass a shutdown check.
 
 `core-admin-coverage.md` lists the 33 formerly suppressed features, their original labs, and the reason each was skipped.
 
@@ -51,9 +51,9 @@ Every feature in `features.py` carries a phase tag in `PHASES`:
 - `3`: TCG guests on vmlab-hv; no feature carries it now.
 - `4`: the legacy PC.
 
-`QEMU_ONLY` lists the features of the guests QEMU still runs, each with its reason: `arch.emulated`. They are in scope on every run. The x86 features only QEMU ran, `vm.hw.qemu_args` and the external-virtiofsd checks, were removed with QEMU's x86 support.
+`EVERY_RUN` lists the features in scope on every run, each with its reason: `arch.emulated`, whose aarch64 guest vmlab-hv emulates on a vmlab run and QEMU runs on a QEMU run. The x86 features only QEMU ran, `vm.hw.qemu_args` and the external-virtiofsd checks, were removed with QEMU's x86 support.
 
-The default `vmlab` run covers phases 1, 2a through 2f, and 4. No feature is tagged phase 3: its one feature, `arch.emulated`, runs on QEMU on every run. Use `--vmlab-phase` to select an earlier cutoff.
+The default `vmlab` run covers phases 1, 2a through 2f, and 4. No feature is tagged phase 3: its one feature, `arch.emulated`, is in scope on every run. Use `--vmlab-phase` to select an earlier cutoff.
 
 An out-of-scope feature is reported as skipped with the reason `vmlab-hv phase N`. A pass from a VM that ran on QEMU says nothing about vmlab-hv. A scenario with no feature in scope does not run. Every feature still passes, fails or skips with a reason, and each row in `results.json` names the run's hypervisor. vmlab-hv's parity gate for a phase is a `--hypervisor vmlab` run that passes every feature in that phase.
 

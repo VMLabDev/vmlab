@@ -209,7 +209,7 @@ FEATURES: dict[str, str] = {
     "worktree.clone": "`up` in a linked worktree clones each machine from the main checkout's freeze",
     "worktree.clone.macs": "a worktree machine keeps the frozen MACs, and the main and worktree labs run at once",
     # -- architectures -----------------------------------------------------
-    "arch.emulated": "a non-x86 guest under TCG emulation",
+    "arch.emulated": "an aarch64 guest under emulation: vmlab-hv's, or QEMU's TCG on a QEMU run",
     "vm.legacy.freedos": "FreeDOS 1.3: agent, exec, disk roundtrip, display and stop",
     "vm.legacy.windows98": "Windows 98 SE: agent, exec, disk roundtrip, display and stop",
     "vm.legacy.windows7": "Windows 7 7600.0.1: agent, exec, disk roundtrip, display and stop",
@@ -304,11 +304,12 @@ _GROUPS: dict[str, list[str]] = {
           "vm.legacy.server2016"],
 }
 
-# Features of the guests QEMU still runs, and why (PRD §22): automatic
-# selection puts a guest that is not x86 on QEMU, so these are in scope on
-# every run. QEMU runs no x86 guest, so on a QEMU run nothing else is.
-QEMU_ONLY: dict[str, str] = {
-    "arch.emulated": "an aarch64 guest, which QEMU runs under TCG",
+# Features in scope on every run, and why (PRD §22): the aarch64 guest runs
+# on vmlab-hv's emulator on a vmlab run (phase 3d), and a QEMU run pins it to
+# QEMU, the troubleshooting route. QEMU runs no x86 guest, so on a QEMU run
+# nothing else is in scope.
+EVERY_RUN: dict[str, str] = {
+    "arch.emulated": "an aarch64 guest, which vmlab-hv emulates, and QEMU on a QEMU run",
 }
 
 # Why a QEMU run skips every other feature.
@@ -316,9 +317,9 @@ NO_X86_ON_QEMU = "QEMU runs no x86 guest (PRD §22)"
 
 PHASES: dict[str, str] = {fid: phase for phase, ids in _GROUPS.items() for fid in ids}
 
-_untagged = set(FEATURES) - set(PHASES) - set(QEMU_ONLY)
-_unknown = (set(PHASES) | set(QEMU_ONLY)) - set(FEATURES)
-_twice = sum(len(ids) for ids in _GROUPS.values()) + len(QEMU_ONLY) - len(set(PHASES) | set(QEMU_ONLY))
+_untagged = set(FEATURES) - set(PHASES) - set(EVERY_RUN)
+_unknown = (set(PHASES) | set(EVERY_RUN)) - set(FEATURES)
+_twice = sum(len(ids) for ids in _GROUPS.values()) + len(EVERY_RUN) - len(set(PHASES) | set(EVERY_RUN))
 assert not _untagged and not _unknown and not _twice, (
     f"phase tags out of step with FEATURES: untagged {sorted(_untagged)}, unknown {sorted(_unknown)}, "
     f"{_twice} tagged twice"
@@ -328,7 +329,7 @@ assert not _untagged and not _unknown and not _twice, (
 def out_of_scope(feature: str, hypervisor: str, delivered: str = VMLAB_DELIVERED) -> str | None:
     """Why `feature` does not apply on `hypervisor` with phases through
     `delivered` landed, or None when it does."""
-    if feature in QEMU_ONLY:
+    if feature in EVERY_RUN:
         return None
     if hypervisor == "qemu":
         return NO_X86_ON_QEMU

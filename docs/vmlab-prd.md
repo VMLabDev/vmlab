@@ -299,7 +299,7 @@ Each VM block can express:
   - `keepawake = "auto" | "on" | "off"` on the host GPU (default `auto`: the warning's condition) has the lab daemon ask the supervisor (`gpu.keepawake`), before the emulator spawns, to hold the GPU awake. The supervisor runs one helper per GPU, `vmlab-gpu-keepawake` (C, compiled by the build script, embedded, written to `<data dir>/gpu-keepawake/<digest>/`): an OpenGL ES context on the GPU through EGL's device platform that clears a 16x16 renderbuffer every 100 ms, because a context with no work does not keep an NVIDIA GPU from suspending. It runs until the supervisor stops, and exits by itself once the supervisor is no longer its parent. A helper that cannot start is a warning in the lab log, not a refused start. `vmlab status -v` shows `keepawake=on|off|lost|failed` after `host_gpu=` (`lost`: the helper exited since that start); `--json` carries it as `keepawake`. Template builds do not ask for one.
 
   Validation (§5.1) runs the same pick and resolution a start runs: `host_gpu` must be a non-empty string; a `passthrough` name this host lacks, or nothing to pick, is an error; a `virgl`/`vulkan` name this host lacks is a warning, not an error; and the picked GPU's address must name a PCI device (with a render node and a runtime power state other than `error`, for `virgl`/`vulkan`), its `vulkan_icd` must exist, and its `qemu_binary` must be an executable file for the VM's arch.
-- `display`, `firmware`, `tpm`, `secure_boot` — normally supplied by the profile, overridable per VM. `display` takes vmlab's names (`virtio-vga`, `virtio-gpu`, `qxl`, `std`, `vmware` for `vmware-svga`, the VMware SVGA II macOS drives with no driver of its own) or a QEMU device name as given. A template's `display` is narrower, because template metadata comes from any registry and the string becomes a `-device` value: one of those names or a QEMU display device by name with no properties (`VGA`, `cirrus-vga`, `qxl-vga`, `virtio-gpu-pci`, `vmware-svga`, `bochs-display`, `ramfb`, `ati-vga`); a `template {}` block declaring another string is refused, and so is a pulled or imported template that records one. `secure_boot = true` is enforced: by default the VM's UEFI variable store starts from a template with Microsoft's keys enrolled, and a host with no such template refuses the VM rather than boot one in setup mode, where nothing is verified. **Only an x86_64 guest's variable store is protected from its own OS**: vmlab-hv lets nothing but SMM write it. An aarch64 guest runs on QEMU's `virt` machine, which has no secure world, so its store is flash the guest kernel can write: secure boot there verifies the boot chain, but code in the guest kernel can replace PK, KEK, db and dbx or turn secure boot off, and the change survives a reset. `up` says so in a warning for every such VM, under either key store; it is not refused. No other VM and nothing on the host is reachable this way.
+- `display`, `firmware`, `tpm`, `secure_boot` — normally supplied by the profile, overridable per VM. `display` takes vmlab's names (`virtio-vga`, `virtio-gpu`, `qxl`, `std`, `vmware` for `vmware-svga`, the VMware SVGA II macOS drives with no driver of its own) or a QEMU device name as given. A template's `display` is narrower, because template metadata comes from any registry and the string becomes a `-device` value: one of those names or a QEMU display device by name with no properties (`VGA`, `cirrus-vga`, `qxl-vga`, `virtio-gpu-pci`, `vmware-svga`, `bochs-display`, `ramfb`, `ati-vga`); a `template {}` block declaring another string is refused, and so is a pulled or imported template that records one. `secure_boot = true` is enforced: by default the VM's UEFI variable store starts from a template with Microsoft's keys enrolled, and a host with no such template refuses the VM rather than boot one in setup mode, where nothing is verified. **Only an x86_64 guest's variable store is protected from its own OS**: vmlab-hv lets nothing but SMM write it. An aarch64 guest runs on a `virt` machine, vmlab-hv's or QEMU's, which has no secure world, so its store is flash the guest kernel can write: secure boot there verifies the boot chain, but code in the guest kernel can replace PK, KEK, db and dbx or turn secure boot off, and the change survives a reset. `up` says so in a warning for every such VM, under either key store; it is not refused. No other VM and nothing on the host is reachable this way.
 - `secure_boot_keys` and `secure_boot_vars` — the **key store** secure boot starts from, for guests signed with keys that are not Microsoft's (image-based systems that sign their UKI with a key the user generated, and enroll it themselves). `secure_boot_keys = "microsoft"` is the default and today's behaviour. `secure_boot_keys = "setup"` pairs the secure-boot CODE with the **blank** VARS, so the firmware starts in setup mode and the guest enrolls its own keys on first boot (systemd-boot's auto-enroll); the VM's own VARS copy keeps what it enrolled, and every later boot enforces it. Setup mode is only ever this explicit opt-in — the refusal above stands without it. `secure_boot_vars = "<path>"` (relative to the lab file) names a **pre-enrolled** VARS file — PK, KEK and db already set, e.g. by `virt-fw-vars` — copied once at first start in place of the bundled template, so the guest enforces from its first boot; it boots under the secure-boot CODE and must be the size of that CODE's VARS template (a start refuses another size). `secure_boot_keys` resolves VM > template > profile like the rest of this list; `secure_boot_vars` is declared on a vm or template block. The two are exclusive on one block, and both need `secure_boot = true` under OVMF: validation rejects either where secure boot resolves off, naming the layer each side came from — except a key store inherited from below the layer that turned secure boot off, which that layer has made moot. A template built with either records it in its metadata (`secure_boot_keys = "setup"`, or `"vars"` with the file stored beside its disk as `OVMF_VARS.fd`, carried by export/import and in the OCI config blob), so its clones start from the same store unless the VM names its own; a variant may override `secure_boot_keys` but carries no file of its own. Like every VARS copy, an existing VM's store is never replaced: update existing keys through authenticated guest-side servicing, without deleting or replacing `OVMF_VARS.fd`. A firmware asset update never changes an existing store.
 - **UEFI firmware ships with vmlab.** The guest asset set carries firmware under `firmware/<arch>/`, pinned by version and sha256. For x86_64, vmlab builds the 4 MiB OVMF CODE and secure-boot CODE from the same pinned edk2 revision and configuration as Debian, with the vmlab wordmark replacing TianoCore's logo. The default `OVMF_VARS_4M.ms.fd` is rebuilt from Debian's store with the pinned current Microsoft x64 dbx, retaining Debian's PK and the full 2011 and 2023 KEK/db sets. The unchanged original remains selectable as `OVMF_VARS_4M.ms.debian.fd` through `secure_boot_vars`; the blank template stays unchanged. `SECUREBOOT-BUILDINFO.json` records source URLs, hashes, inventory and licensing. The flash layout remains compatible with existing per-VM VARS. `BUILDINFO` records the source commit and build hashes. AArch64 retains Debian's AAVMF pair and secure-boot pair pending its branding build and compatibility validation. QEMU and vmlab-hv SeaBIOS guests receive the vmlab splash through their firmware inputs. The editable logo is `guest/logo/wordmark.svg`. A host needs no OVMF package, and every host boots the same bytes. The lookup, for plain UEFI and secure boot alike: the host config's `firmware_dir` (laid out `<dir>/<arch>/` like the bundled set, and authoritative for an arch it has a directory for), then the bundled set in the guest asset directories' order, then the host's distro firmware. A secure-boot CODE build is only ever taken with its enrolled VARS, unless the machine asks for setup mode or names its own VARS file (`secure_boot_keys`/`secure_boot_vars` above). Each VM copies its VARS template once, at first start, and keeps that copy. Beside it, `OVMF_VARS.boot` records whether the store's last start had secure boot, because a store is writable by the guest while secure boot is off and an enrolled store cannot be told from a blank one by its size. A start with `secure_boot = true` on a store last booted without it is refused, naming the store: deleting `OVMF_VARS.fd` gives the next start a freshly enrolled one. A store with no record predates it and is accepted, unless it is byte for byte the blank template where enrolled keys were asked for. The record goes where the store goes: into an offline snapshot and a freeze. A VM whose store was created under a firmware of another flash layout keeps booting a build of that layout. Nothing host-specific about firmware enters a template's sealed metadata — it records `firmware`, `secure_boot` and `secure_boot_keys`, never a path.
 - The bundled x86_64 OVMF uses zero boot-menu wait and selective controller connection without replacing persistent BootOrder. Its default excludes edk2 networking and uses reproducible iPXE; `firmware_network_stack = true` selects native HTTP/PXE instead. `firmware_debug = true` selects DEBUG CODE and records port 0x402 alongside the UART log on either hypervisor. Paired `firmware_width` and `firmware_height` request a transient boot GOP mode on QEMU or vmlab-hv, bounded to 320..8192 by 200..8192. vmlab-hv uses the read-only fw_cfg transport from protocol/binary revision 450de8c or later. These options are per VM and require x86_64 OVMF. Reproducible SeaBIOS has separate q35 and legacy builds and paints the splash on both hypervisors during POST with no added wait. FW7, ARM firmware branding and tuning, is deferred.
@@ -2738,7 +2738,9 @@ declaring one fixed port still collide (§3.2).
 Every machine runs on exactly one hypervisor: **QEMU**, driven over QMP, or
 **vmlab-hv**, vmlab's own hypervisor under `hv/`,
 driven over its own control protocol. Since §22.4, vmlab-hv is the only
-hypervisor for x86 and x86_64 guests, and QEMU runs the other architectures. ADR-0021 records the decision; the
+hypervisor for x86 and x86_64 guests. Since §22.5 it runs aarch64 guests too,
+on its own emulator, and QEMU runs riscv64 guests and an aarch64 guest that
+a setting puts there to troubleshoot. ADR-0021 records the decision; the
 Hypervisor seam (ADR-0001, ADR-0020) is what lets both run behind one
 lifecycle.
 
@@ -2746,8 +2748,9 @@ lifecycle.
 `hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
 automatic for both kinds. Automatic selection uses the existing identity,
-including the x86 migration (§22.3), and selects vmlab-hv for every new x86
-machine and QEMU for one of another architecture (§22.1, §22.4). The field is declared on the machine only and
+including the x86 migration (§22.3) and the aarch64 one (§22.5), and selects
+vmlab-hv for every new x86 machine and every new aarch64 VM, whose refusals
+are errors, and QEMU for any other (§22.1, §22.4, §22.5). The field is declared on the machine only and
 never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
@@ -2775,7 +2778,8 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 2d | GPUs (`gpu {}`): virgl and Venus on a host render node | Selectable |
 | 2e | virtio-fs shares, served in process, and audio (HDA) | Selectable |
 | 2f | Host USB (`usb = true`) and vfio (`gpu { mode = "passthrough" }`) | Selectable |
-| 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
+| 3d | Emulated aarch64 on the `virt` machine: AAVMF, virtio disks and NICs, the agent port, no display (§22.5) | Default for aarch64 VMs |
+| 3b | Emulated riscv64 | Not started: QEMU runs it |
 | 4 | Legacy PCs: i440fx, IDE, ISA serial, e1000, PCnet, floppy, UHCI and Cirrus | Selectable (4a to 4d); 4e in progress |
 | macOS | Intel macOS on q35 and OVMF: VMware SVGA, a USB keyboard, the Apple SMC, the SMBIOS baseboard and the profile's Skylake model | Selectable |
 
@@ -2805,7 +2809,7 @@ for it is refused). Everything else is refused: on the pc machine, a virtio-net 
 core with IDE, a named CPU and `agent_transport = "isa-serial"` (4a), e1000 and
 PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); a
 floppy on a machine other than pc;
-`accel = "tcg"` (3); another display device, NIC model or `cpu_model`, and `input =
+`accel = "tcg"` on an x86 guest (x86 guests are not emulated); another display device, NIC model or `cpu_model`, and `input =
 "usb"`, outside a macOS guest; and `qemu_args`, QEMU's own argv, in every phase. QEMU runs no x86
 guest (§22.4), so for an x86 machine a refusal is an error that only a change
 to the machine resolves. A
@@ -3103,6 +3107,70 @@ guests, under KVM where the host is that architecture and TCG elsewhere, and
   `accel = "tcg"` among them, does not run on this release.
   `docs/agents/qemu-removal-remaining.md` lists what still uses QEMU.
 - **e2e.** A vmlab run leaves both kinds to automatic selection, so the x86
-  scenarios run on vmlab-hv and `arch.emulated`'s aarch64 guest runs on QEMU.
+  scenarios run on vmlab-hv and `arch.emulated`'s aarch64 guest runs on QEMU
+  (on vmlab-hv since §22.5).
   `--hypervisor qemu` runs `arch.emulated` alone. The x86 features that only
   QEMU ran, `vm.hw.qemu_args` and the external-virtiofsd checks, are removed.
+
+### 22.5 Amendment: vmlab-hv runs aarch64 guests (phase 3d)
+
+This amendment moves aarch64 VMs to vmlab-hv at the end of its phase 3d
+(the operator's decision Q4 of `hv/docs/plans/phase-3d-aarch64/DESIGN.md`).
+QEMU stays available for aarch64 as a troubleshooting tool, selected by a
+setting, and not as a product path. riscv64 stays on QEMU until phase 3b.
+
+- **The machine.** vmlab-hv runs an aarch64 VM on its emulator, on an x86_64
+  host, with or without `/dev/kvm`: the `virt` machine with a GICv2 of one to
+  eight vCPUs, an Armv8.0-A CPU with CRC32, AES, SHA1 and SHA2 and no PMU,
+  AAVMF on two flash banks, a PL011 serial console, PSCI, and the agent's
+  virtio-serial port, virtio-blk disks and virtio-net NICs as PCI functions
+  in the slots QEMU's `virt` argv gives them, so a template built under QEMU
+  finds them where it expects. CD-ROMs are read-only virtio-blk, as under
+  QEMU. Online and offline snapshots work.
+- **Firmware.** The AAVMF pair is looked up as for QEMU (§5.2): the host
+  config's `firmware_dir`, vmlab's bundle, then the distro's. Each VM has its
+  own VARS copy. The x86 OVMF size check does not apply.
+- **No display yet.** The machine has no display device, input device or
+  USB controller. A profile's display device is left out, not refused: the
+  guest runs headless on its serial console (`vmlab logs`), and is reached
+  with `vmlab exec` and `vmlab shell`. `vm screenshot`, `vm type` and the
+  other screen and input verbs, `vmlab record` and `--record` say the machine
+  has no display, and `machine.capabilities` reports none. Because a VM that
+  ran on QEMU had a screen, `up` and `vm start` warn, for a VM whose hardware
+  names a display device, that it runs headless, what that takes away, and
+  that `hypervisor = "qemu"` keeps a screen. The display and input devices are
+  the only ones the machine lacks that are left out with a warning rather
+  than refused, until virtio-gpu and input arrive on `virt` (R2, #1225). The
+  install CD-ROM is a read-only virtio disk on either hypervisor, and an
+  eject of it is refused by name.
+- **Refusals.** vmlab-hv refuses, for an aarch64 VM: a host that is not
+  x86_64; `accel = "kvm"`; `qemu_args`; a machine other than `virt`; firmware
+  other than UEFI; more than eight vCPUs or less than 64 MiB; a `gpu {}`
+  block; `usb = true`; a TPM; `audio`; a `cpu_model`; a NIC model other than
+  virtio-net; `agent_transport = "isa-serial"`; an Apple SMC; and a floppy.
+  `accel = "tcg"` is accepted and changes nothing. A share is never virtio-fs
+  on this machine: `transport = "auto"` places it on SMB, and an explicit
+  `transport = "virtiofs"` fails the start. A NIC takes the stream socket,
+  never the kernel fast path's TAP queues.
+- **Selection.** Automatic selection puts every new aarch64 VM on vmlab-hv.
+  There is no QEMU fallback: when `vmlab_refusals` names a reason,
+  `vmlab validate`, `up` and `vm start` fail with the refusal, which names
+  the VM and each device the `virt` machine lacks, as §22.4 says for an x86
+  machine. An explicit
+  `hypervisor = "qemu"` or a host default `hypervisor { vm = "qemu" }` puts it
+  on QEMU, which is how a lab uses QEMU to troubleshoot.
+- **Existing machines.** An aarch64 VM whose identity is QEMU, saved or
+  inferred from its disks, moves to vmlab-hv at its next start under the
+  rules of §22.3: `status` shows vmlab-hv before the switch is saved, the
+  start checks the hardware, saves the switch before boot, and `up` announces
+  it once. When vmlab-hv refuses it, the start fails with the refusal and
+  keeps the old identity. It does not stay on QEMU; an explicit
+  `hypervisor = "qemu"` puts it there to troubleshoot. Offline snapshots carry
+  over. Online QEMU snapshots are refused by name, with §22.3's instructions.
+- **Known limit.** Emulated aarch64 is slow next to KVM, and a heavily
+  loaded host can push a guest's boot past its own timeouts: Fedora 44 at one
+  vCPU fell into emergency mode on systemd's 90 s device timeout at a host
+  load of about 14. Run an aarch64 guest on a host that is not heavily
+  loaded, and give it two vCPUs.
+- **e2e.** A vmlab run puts `arch.emulated`'s aarch64 guest on vmlab-hv. A QEMU
+  run pins it to QEMU.

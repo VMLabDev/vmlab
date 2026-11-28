@@ -100,9 +100,14 @@ every x86 and x86_64 VM, and every container on an x86_64 host, runs on
 vmlab-hv under KVM only. `hypervisor = "qemu"`, a host default of `qemu` that
 reaches an x86 machine, and `qemu_args` on one are validation errors naming the
 replacement; what vmlab-hv refuses is an error with no fallback; a host
-without usable `/dev/kvm` fails with `KVM is required`. QEMU keeps aarch64 and
-riscv64 on the `virt` machine (`src/qemu/cmdline.rs` composes no q35 or pc
-argv), which still fall back to it automatically with a reason.
+without usable `/dev/kvm` fails with `KVM is required`. **aarch64 VMs run on
+vmlab-hv's emulator** (§22.5, phase 3d): the `virt` machine on AAVMF,
+headless, devices in QEMU's `virt` slots (`describe::virt`), existing QEMU
+identities migrating at the next start; QEMU runs one only to troubleshoot,
+and what vmlab-hv refuses of one fails `up` or `vm start` naming each device,
+with no fallback (#1224). QEMU keeps riscv64 on the `virt` machine
+(`src/qemu/cmdline.rs` composes no q35 or pc argv), which still falls back to
+it automatically with a reason.
 **Existing x86 QEMU identities migrate at the next start** (§22.3), including
 identities inferred from old disks and inherited by clones from frozen worktree
 generations. Explicit machine and host settings still take precedence. Machine
