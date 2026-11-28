@@ -384,6 +384,57 @@ pub struct MachineCounts {
     pub code_mails: u64,
     pub code_pages: u64,
     pub wait_ns: u64,
+    /// The broadcasts by kind and the wait of each (3e card T3-D4).
+    pub waits: BroadcastWaits,
+}
+
+/// The broadcasts of one CPU by kind (3e card T3-D4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BroadcastWaits {
+    /// `TLBI ... IS` of every entry, of one address, of one ASID.
+    pub all: Waits,
+    pub page: Waits,
+    pub asid: Waits,
+    /// A page that gets translated code (H11c).
+    pub code_page: Waits,
+    /// A store into translated code (H11a).
+    pub code_mail: Waits,
+}
+
+/// How many broadcasts of one kind, how many of them found another CPU
+/// to wait for, how many waited over `LONG_WAIT_NS`, and the time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Waits {
+    pub count: u64,
+    pub waited: u64,
+    pub long: u64,
+    pub ns: u64,
+}
+
+/// A wait for the other CPUs longer than this is counted apart: it is
+/// more than a round trip of compiled code.
+pub const LONG_WAIT_NS: u64 = 100_000;
+
+impl Waits {
+    fn add(&mut self, waited: bool, ns: u64) {
+        self.count += 1;
+        self.waited += u64::from(waited);
+        self.long += u64::from(ns > LONG_WAIT_NS);
+        self.ns += ns;
+    }
+}
+
+impl std::fmt::Display for Waits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({} waited, {} long, {} us)",
+            self.count,
+            self.waited,
+            self.long,
+            self.ns / 1_000
+        )
+    }
 }
 
 impl Side {
@@ -461,6 +512,7 @@ impl Side {
             }
         }
         let started = std::time::Instant::now();
+        let waited = shootdown.outstanding(id);
         let mut spins = 0u32;
         while shootdown.outstanding(id) {
             // Mail of a CPU that waits on this one is taken here.
@@ -474,7 +526,16 @@ impl Side {
                 std::hint::spin_loop();
             }
         }
-        self.machine.wait_ns += started.elapsed().as_nanos() as u64;
+        let ns = started.elapsed().as_nanos() as u64;
+        self.machine.wait_ns += ns;
+        let waits = &mut self.machine.waits;
+        match invalidation {
+            Some(Invalidation::All) => waits.all.add(waited, ns),
+            Some(Invalidation::Page { .. }) => waits.page.add(waited, ns),
+            Some(Invalidation::Asid(_)) => waits.asid.add(waited, ns),
+            Some(Invalidation::CodePage(_)) => waits.code_page.add(waited, ns),
+            None => waits.code_mail.add(waited, ns),
+        }
     }
 
     /// A store of this CPU ended translated code of some CPU in a page
