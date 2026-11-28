@@ -31,9 +31,10 @@ macOS guests on vmlab-hv. Those templates do not run until their card is done.
 
 - aarch64 VMs run on vmlab-hv's emulated `virt` machine (§22.5, phase 3d),
   and an existing QEMU aarch64 identity moves there at the next start. QEMU
-  runs an aarch64 VM only when a setting names it (troubleshooting) or when
-  vmlab-hv refuses the VM (a `gpu {}`, `usb = true`, a TPM, `audio`,
-  `qemu_args`, more than eight vCPUs), with the reason in `status`.
+  runs an aarch64 VM only when a setting names it (troubleshooting). A VM
+  vmlab-hv refuses (a `gpu {}`, `usb = true`, a TPM, `audio`, `qemu_args`,
+  more than eight vCPUs) fails at `up` and `vm start`, naming each device,
+  and does not fall back to QEMU.
 - riscv64 VMs run on QEMU's `virt` machine until phase 3b.
   `src/qemu/cmdline.rs` composes only that argv now, and refuses an x86
   guest, `agent_transport = "isa-serial"` and a floppy before an argv exists.
