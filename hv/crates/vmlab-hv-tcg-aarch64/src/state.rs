@@ -29,6 +29,10 @@ pub mod slot {
     pub const FPCR: usize = 70;
     pub const FPSR: usize = 71;
     pub const COUNT: usize = 72;
+    /// The slots of one word, bit `n` for the slot `n`: every slot but
+    /// those of V0 to V31. Their high halves are 0 in every state, which
+    /// compiled code counts on (`jit::Shape::narrow`, 3e card #1213).
+    pub const NARROW: u128 = ((1u128 << COUNT) - 1) & !(((1u128 << 32) - 1) << V0);
 }
 
 const fn bits(name: &'static str, width: u16) -> Slot {
@@ -382,6 +386,15 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_narrow_slots_are_those_of_one_word() {
+        for (n, slot) in SLOTS.iter().enumerate() {
+            let one_word = matches!(slot.ty, ScalarType::Bits(width) if width <= 64);
+            assert_eq!(slot::NARROW >> n & 1 == 1, one_word, "{}", slot.name);
+        }
+        assert_eq!(slot::NARROW >> slot::COUNT, 0);
+    }
 
     #[test]
     fn the_layout_matches_the_slot_numbers() {
