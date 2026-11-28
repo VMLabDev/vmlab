@@ -351,6 +351,24 @@ impl EmulatedVcpu {
             jit.joins,
             jit.side_exits,
         );
+        let waits = &jit.machine.waits;
+        if waits.code_page.count + waits.code_mail.count + waits.all.count > 0
+            || waits.page.count + waits.asid.count > 0
+        {
+            log::info!(
+                "vcpu {}: broadcasts: TLBI of everything {}, of a page {}, of an ASID {}; code pages {}; code mails {}; device accesses {} ({} long, {} us long, longest {} us)",
+                self.id,
+                waits.all,
+                waits.page,
+                waits.asid,
+                waits.code_page,
+                waits.code_mail,
+                self.cpu.memory.device.accesses,
+                self.cpu.memory.device.long,
+                self.cpu.memory.device.long_ns / 1_000,
+                self.cpu.memory.device.max_ns / 1_000,
+            );
+        }
     }
 
     fn log_unknown(&mut self) {
