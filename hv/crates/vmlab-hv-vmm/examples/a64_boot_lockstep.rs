@@ -600,7 +600,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         qemu: arguments.qemu.clone(),
         plugin: arguments.plugin.clone(),
         directory: directory.clone(),
-        cpu: "cortex-a53".into(),
+        cpu: boot::K4_LEADER_CPU.into(),
         ram_mib: arguments.ram_mib,
         code: arguments.code.clone(),
         vars: leader_vars,
@@ -1055,6 +1055,12 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             Some(Adopt::Identity(rt, encoding)) => {
                 let (ours, theirs) = (cpu.state.x(rt), next.core.x[rt]);
                 if ours != theirs && cpu.taken.is_none() {
+                    if boot::reports_pmu(encoding, theirs) && !boot::reports_pmu(encoding, ours) {
+                        println!(
+                            "the leader reports a PMU in {} ({theirs:#x}) and our CPU none: the guest's PMU accesses will differ",
+                            boot::register_name(encoding)
+                        );
+                    }
                     identity.entry(encoding).or_insert((ours, theirs, 0)).2 += 1;
                     cpu.state.set_x(rt, theirs);
                 }
