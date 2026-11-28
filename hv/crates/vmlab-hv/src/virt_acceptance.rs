@@ -580,6 +580,9 @@ fn a_virt_machine_with_a_display_serves_its_screen_and_its_input() {
     machine.quit();
 }
 
+/// More clicks than the tablet queues reports for (1024, two a click).
+const CLICKS: u32 = 600;
+
 /// The keys that take this AAVMF from its boot manager to its shell, as in
 /// `TO_THE_SHELL`, typed on the USB keyboard as qcodes.
 const TO_THE_SHELL_ON_USB: [(&str, &str); 4] = [
@@ -621,6 +624,7 @@ fn aavmf_shows_its_console_on_the_virtio_gpu_and_reads_the_usb_keyboard() {
     );
     with_display(&mut description);
     let mut machine = Machine::start(dir.path(), &description);
+    let machine_stderr = machine.stderr.clone();
     let native = dir.path().join("display.sock");
     let keys = input_client(&native);
     ok(machine.client.call(Control::Resume).unwrap());
@@ -684,6 +688,31 @@ fn aavmf_shows_its_console_on_the_virtio_gpu_and_reads_the_usb_keyboard() {
         "AAVMF reached its shell on the USB keyboard; its console is {}x{} with {lit} lit pixels",
         screen.width, screen.height
     );
+    // The pointer: a click is two reports that the tablet does not merge,
+    // and it queues 1024 of them for a guest that does not read it. More
+    // clicks than that fill the queue of a tablet that no guest polls, and
+    // the machine says so on its stderr. AAVMF's absolute pointer driver
+    // takes each report off the interrupt endpoint.
+    for click in 0..CLICKS {
+        let x = click % 640;
+        keys.send(&vmlab_hv_display::Message::PointerAbs {
+            x,
+            y: 400,
+            width: 640,
+            height: 480,
+        })
+        .unwrap();
+        for mask in [1, 0] {
+            keys.send(&vmlab_hv_display::Message::Buttons { mask })
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     drop(keys);
     machine.quit();
+    let log = std::fs::read_to_string(&machine_stderr).unwrap_or_default();
+    assert!(
+        !log.contains("input queue full"),
+        "the guest did not read the tablet: {log}"
+    );
 }
