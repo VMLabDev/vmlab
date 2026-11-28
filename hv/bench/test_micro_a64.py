@@ -27,6 +27,28 @@ class MicroA64Tests(unittest.TestCase):
                                        "--vcpus", "1", "--dry-run"]), 0)
             a64.assert_not_called()
 
+    def test_qemu_cpu_option(self):
+        # P6: another CPU model for the aarch64 QEMU rows, and nowhere else.
+        self.assertEqual(run.main(["--backend", "qemu", "--arch", "aarch64",
+                                   "--guest", "flat-a64", "--vcpus", "1",
+                                   "--qemu-cpu", "max", "--dry-run"]), 0)
+        args = run.parse_args(["--qemu-cpu", "cortex-a53"])
+        self.assertEqual(run.qemu_cpu(args, "aarch64"), "cortex-a53")
+        self.assertEqual(run.qemu_cpu(args, "riscv64"), "max")
+        self.assertEqual(run.qemu_cpu(run.parse_args([]), "aarch64"), "max")
+        self.assertIn("max", micro_a64.qemu_argv("/k.elf", "max"))
+        self.assertEqual(micro_a64.qemu_argv("/k.elf")[
+            micro_a64.qemu_argv("/k.elf").index("-cpu") + 1], "cortex-a53")
+        for argv in (["--backend", "vmlab-hv", "--arch", "aarch64"],
+                     ["--backend", "qemu", "--arch", "riscv64"],
+                     ["--backend", "qemu", "--arch", "all"],
+                     ["--backend", "jit", "--arch", "aarch64", "--vcpus", "1"],
+                     ["--backend", "qemu", "--arch", "riscv64", "--guest", "flat-rv64gc"],
+                     ["--backend", "qemu", "--arch", "aarch64", "--qemu-cpu", "max,pauth=off"]):
+            with self.subTest(argv=argv), self.assertRaises(lib.BenchError):
+                run.main([*argv, *([] if "--qemu-cpu" in argv else ["--qemu-cpu", "max"]),
+                          "--dry-run"])
+
     def test_wrong_arch_and_cpu_count_are_refused(self):
         with self.assertRaises(lib.BenchError):
             run.main(["--backend", "qemu", "--arch", "riscv64", "--guest", "flat-a64",

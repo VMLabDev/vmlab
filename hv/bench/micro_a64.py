@@ -46,7 +46,8 @@ INSTRUCTION_LIMIT = 4_000_000_000
 QEMU_BINARY = "qemu-system-aarch64"
 # The machine and the CPU of the lockstep oracle (DESIGN.md O3). The image
 # is the ELF, loaded at its own addresses and entered at EL1.
-QEMU_MACHINE_ARGS = ("-machine", "virt", "-cpu", "cortex-a53", "-accel", "tcg",
+QEMU_CPU = "cortex-a53"
+QEMU_MACHINE_ARGS = ("-machine", "virt", "-accel", "tcg",
                      "-smp", "1", "-m", "128M",
                      "-semihosting-config", "enable=on,target=native")
 QEMU_MEMORY_MAX = "8G"
@@ -118,8 +119,10 @@ def qemu_version():
     return subprocess.check_output([QEMU_BINARY, "--version"], text=True).splitlines()[0].strip()
 
 
-def qemu_argv(kernel):
-    return [QEMU_BINARY, *QEMU_MACHINE_ARGS, "-kernel", str(kernel),
+def qemu_argv(kernel, cpu=QEMU_CPU):
+    """`cpu` is the oracle's cortex-a53 unless `--qemu-cpu` names another
+    model (3e DESIGN.md P6): the image is Armv8.0 code either way."""
+    return [QEMU_BINARY, *QEMU_MACHINE_ARGS, "-cpu", cpu, "-kernel", str(kernel),
             "-display", "none", "-serial", "none", "-monitor", "none"]
 
 
@@ -181,11 +184,12 @@ def run_qemu(args, commit, dirty, host, log, pin):
     workloads = build_workloads()
     startup_elf, _ = build_loop(STARTUP_ITERATIONS)
     environment = dict(os.environ)
+    cpu = args.qemu_cpu or QEMU_CPU
     prefix = [*lib.systemd_run_prefix(QEMU_MEMORY_MAX), *lib.taskset_prefix(pin)]
     # One run that is not recorded: the recorded ones then miss the cold
     # page cache of the QEMU binary, which is not guest execution.
-    micro.measure_qemu([*prefix, *qemu_argv(startup_elf)], environment)
-    startup_samples = [micro.measure_qemu([*prefix, *qemu_argv(startup_elf)], environment)[0]
+    micro.measure_qemu([*prefix, *qemu_argv(startup_elf, cpu)], environment)
+    startup_samples = [micro.measure_qemu([*prefix, *qemu_argv(startup_elf, cpu)], environment)[0]
                        for _ in range(max(args.repeats, micro.FLAT_QEMU_MIN_REPEATS))]
     startup = statistics.median(startup_samples)
     log(f"qemu startup baseline: median {startup:.6f} s over {len(startup_samples)} repeats")
@@ -196,7 +200,7 @@ def run_qemu(args, commit, dirty, host, log, pin):
         if expected is not None and instructions != expected:
             raise lib.BenchError(f"{name}: interpreter count {instructions} != {expected}")
         noise = noise_record(pin, QEMU_MEMORY_MAX, qemu_version())
-        noise.update({"qemu": {"machine": "virt", "cpu": "cortex-a53", "accel": "tcg",
+        noise.update({"qemu": {"machine": "virt", "cpu": cpu, "accel": "tcg",
                                "memory": "128M", "kernel": "elf with semihosting SYS_EXIT"},
                       "startup_samples": startup_samples, "startup_median": startup,
                       "instruction_count": instructions,
@@ -205,7 +209,7 @@ def run_qemu(args, commit, dirty, host, log, pin):
         for repeat in range(args.repeats):
             # QEMU ends with the exit code of the guest: a wrong checksum
             # fails the run in measure_qemu.
-            wall, _, _ = micro.measure_qemu([*prefix, *qemu_argv(elf)], environment)
+            wall, _, _ = micro.measure_qemu([*prefix, *qemu_argv(elf, cpu)], environment)
             net = wall - startup
             if net <= 0:
                 raise lib.BenchError(f"{name}: wall {wall:.6f} s is not above the startup"
