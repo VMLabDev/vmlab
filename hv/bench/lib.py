@@ -872,6 +872,210 @@ def pin_cpus(vcpus, override=None):
     width = 4 if vcpus == 1 else 8
     return f"{half}-{min(cpus - 1, half + width - 1)}"
 
+def parse_cpu_list(text):
+    """A sysfs/taskset CPU list (`0-3,8,10-11`) as a sorted list of ints."""
+    cpus = set()
+    for part in text.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            low, high = part.split("-", 1)
+            cpus.update(range(int(low), int(high) + 1))
+        else:
+            cpus.add(int(part))
+    return sorted(cpus)
+
+
+def format_cpu_list(cpus):
+    """The inverse of parse_cpu_list: runs collapse to `a-b`."""
+    parts = []
+    for _, run in itertools.groupby(enumerate(sorted(set(cpus))), lambda p: p[1] - p[0]):
+        values = [cpu for _, cpu in run]
+        parts.append(str(values[0]) if len(values) == 1 else f"{values[0]}-{values[-1]}")
+    return ",".join(parts)
+
+
+SYS_CPU = "/sys/devices/system/cpu"
+ALL_CPUS = object()  # read_core_topology: keep every online core
+
+
+def read_core_topology(root=SYS_CPU, allowed=None):
+    """The physical cores of the host, read from sysfs, never hard-coded.
+
+    Returns a list of `{"cpus": [...], "l3": key}`, one per core, where
+    `cpus` are the core's SMT threads (`topology/thread_siblings_list`) and
+    `l3` names the last-level cache the core shares (`cache/index3`), so
+    cores can be kept on one L3. Only online CPUs count, and only cores whose
+    every thread is in `allowed` (default: this process's affinity), because
+    a core the bench cannot pin whole cannot be reserved.
+    """
+    try:
+        with open(os.path.join(root, "online")) as f:
+            online = set(parse_cpu_list(f.read()))
+    except OSError as error:
+        raise BenchError(f"cannot read the CPU topology under {root}: {error}") from None
+    if allowed is None:
+        allowed = os.sched_getaffinity(0)
+    allowed = online if allowed is ALL_CPUS else set(allowed)
+    cores = {}
+    for cpu in sorted(online):
+        base = os.path.join(root, f"cpu{cpu}")
+        try:
+            with open(os.path.join(base, "topology", "thread_siblings_list")) as f:
+                threads = tuple(c for c in parse_cpu_list(f.read()) if c in online)
+        except OSError:
+            threads = (cpu,)
+        l3 = None
+        try:
+            with open(os.path.join(base, "cache", "index3", "shared_cpu_list")) as f:
+                l3 = f.read().strip()
+        except OSError:
+            pass
+        cores.setdefault(threads, l3)
+    return [{"cpus": list(threads), "l3": l3} for threads, l3 in sorted(cores.items())
+            if set(threads) <= allowed]
+
+
+# A core counts as free when no thread of it was busier than this over the
+# sample taken before the choice.
+IDLE_BUSY = 0.10
+
+
+def reserve_width(vcpus):
+    """How many physical cores a TCG VM gets: one per vCPU thread plus one
+    for the process's other threads (I/O, the main loop)."""
+    return max(2, vcpus + 1)
+
+
+def choose_cores(cores, busy, count):
+    """Pick `count` whole physical cores for the VM; pure over its inputs.
+
+    `cores` is read_core_topology's list, `busy` maps a CPU to its busy
+    fraction over a short sample (a missing CPU counts as idle). A core is
+    free when every thread of it, the SMT siblings included, is at most
+    IDLE_BUSY busy. The choice, in order: `count` free cores on one L3
+    (the L3 group highest in the topology first, away from cpu 0, where
+    kernel and daemon work concentrates); else free cores anywhere, highest
+    first; else the free ones plus the least busy of the rest. Within each
+    step the core highest in the topology wins.
+
+    Returns `(chosen, all_free)`: the chosen cores, highest first, and
+    whether each of them was free.
+    """
+    if count > len(cores):
+        raise BenchError(f"need {count} whole cores, the host offers {len(cores)}")
+
+    def load(core):
+        return max(busy.get(cpu, 0.0) for cpu in core["cpus"])
+
+    def top_first(group):
+        return sorted(group, key=lambda core: -max(core["cpus"]))
+
+    free = [core for core in cores if load(core) <= IDLE_BUSY]
+    groups = {}
+    for core in free:
+        groups.setdefault(core["l3"], []).append(core)
+    for group in sorted(groups.values(), key=lambda g: -max(max(c["cpus"]) for c in g)):
+        if len(group) >= count:
+            return top_first(group)[:count], True
+    if len(free) >= count:
+        return top_first(free)[:count], True
+    rest = sorted((core for core in cores if load(core) > IDLE_BUSY),
+                  key=lambda core: (load(core), -max(core["cpus"])))
+    return top_first(free) + rest[: count - len(free)], False
+
+
+PROC_STAT = "/proc/stat"
+
+
+def read_cpu_times(path=PROC_STAT):
+    """Per-CPU `(busy, total)` jiffies from /proc/stat; idle and iowait are
+    the idle part. `{}` when the file cannot be read."""
+    times = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                name, *fields = line.split()
+                if not name.startswith("cpu") or name == "cpu":
+                    continue
+                values = [int(v) for v in fields[:8]]
+                idle = values[3] + values[4]
+                total = sum(values)
+                times[int(name[3:])] = (total - idle, total)
+    except (OSError, ValueError, IndexError):
+        return {}
+    return times
+
+
+def busy_fractions(before, after):
+    """Each CPU's busy fraction between two read_cpu_times samples."""
+    fractions = {}
+    for cpu, (busy_after, total_after) in after.items():
+        if cpu not in before:
+            continue
+        busy_before, total_before = before[cpu]
+        total = total_after - total_before
+        fractions[cpu] = (busy_after - busy_before) / total if total > 0 else 0.0
+    return fractions
+
+
+def host_load(before, after, reserved):
+    """The load a row is read against: busy CPUs (sums of busy fractions)
+    on the reserved CPUs, which holds the VM itself, and on every other CPU
+    of the host, which is other work only."""
+    fractions = busy_fractions(before, after)
+    reserved = set(reserved)
+    inside = sum(v for cpu, v in fractions.items() if cpu in reserved)
+    outside = sum(v for cpu, v in fractions.items() if cpu not in reserved)
+    return {
+        "reserved_busy_cpus": round(inside, 2),
+        "other_busy_cpus": round(outside, 2),
+        "other_cpus": len([cpu for cpu in fractions if cpu not in reserved]),
+    }
+
+
+# How long the bench samples /proc/stat before it chooses its cores.
+CHOICE_SAMPLE_SECONDS = 1.0
+
+
+def reserve_cores(vcpus, override=None, root=SYS_CPU, stat=PROC_STAT,
+                  sample_seconds=CHOICE_SAMPLE_SECONDS):
+    """The pin of a TCG VM: whole physical cores, the SMT siblings of its
+    threads inside the pin so that the bench never puts other work there.
+
+    Returns `(pin, record)`; `record` goes into every history row: the
+    cores (each a list of its threads), the pin, whether every sibling of a
+    pinned CPU is inside the pin, how the cores were chosen (`free`,
+    `loaded` when too few cores were free, `override` for `--cpus`), and the
+    busy fraction of every pinned CPU when the choice was made.
+    """
+    # An override is recorded as given, so every core it touches counts.
+    cores = read_core_topology(root, allowed=ALL_CPUS if override else None)
+    before = read_cpu_times(stat)
+    if sample_seconds:
+        time.sleep(sample_seconds)
+    busy = busy_fractions(before, read_cpu_times(stat))
+    if override:
+        pinned = set(parse_cpu_list(override))
+        chosen = [core for core in cores if pinned & set(core["cpus"])]
+        siblings = all(set(core["cpus"]) <= pinned for core in chosen)
+        pin, how = override, "override"
+    else:
+        chosen, all_free = choose_cores(cores, busy, reserve_width(vcpus))
+        pinned = {cpu for core in chosen for cpu in core["cpus"]}
+        siblings = True
+        pin, how = format_cpu_list(pinned), "free" if all_free else "loaded"
+    record = {
+        "pin": pin,
+        "cores": [core["cpus"] for core in chosen],
+        "siblings_reserved": siblings,
+        "chosen": how,
+        "busy_at_choice": {str(cpu): round(busy.get(cpu, 0.0), 3) for cpu in sorted(pinned)},
+    }
+    return pin, record
+
+
 def taskset_prefix(pin):
     return ["taskset", "-c", pin]
 
