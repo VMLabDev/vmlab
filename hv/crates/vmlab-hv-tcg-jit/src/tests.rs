@@ -2609,4 +2609,3 @@ fn an_output_to_a_narrow_slot_makes_no_store_to_its_high_half() {
         assert_eq!(slots, [kept | 5, 7 << 64 | 6, 5], "narrow {narrow:#b}");
     }
 }
-

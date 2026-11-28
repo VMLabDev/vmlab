@@ -748,7 +748,11 @@ mod tests {
                     for index in [RAX, RBX, RBP, R12, R13, R15] {
                         let sum = address.replacen(
                             NAMES[usize::from(base.0)],
-                            &format!("{} + {}", NAMES[usize::from(base.0)], NAMES[usize::from(index.0)]),
+                            &format!(
+                                "{} + {}",
+                                NAMES[usize::from(base.0)],
+                                NAMES[usize::from(index.0)]
+                            ),
                             1,
                         );
                         add(format!("lea {name}, {sum}"), &|a| {

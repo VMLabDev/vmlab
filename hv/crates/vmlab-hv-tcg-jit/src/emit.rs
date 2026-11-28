@@ -2138,7 +2138,15 @@ impl Emitter<'_> {
                 }
                 let a = self.value(op.a, at);
                 let b = self.value(op.b, at);
-                let t = self.target(op.a, a, at);
+                // The shift writes the register before the `or` reads `b`:
+                // a `b` that is `a` must not be in it.
+                let t = if op.a == op.b {
+                    let t = self.allocate(at);
+                    self.load(t, a);
+                    t
+                } else {
+                    self.target(op.a, a, at)
+                };
                 if width != 0 {
                     self.asm.shift_imm(Shift::Shl, t, width);
                 }
