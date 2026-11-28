@@ -1974,6 +1974,7 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
     let mut jit = Jit::with_capacity(16 << 20).expect("a code region");
     let mut random = Random(0x3e_0003);
     let (mut hits, mut misses, mut watched, mut left) = (0u64, 0u64, 0u64, 0);
+    let mut unaligned = 0u64;
     for round in 0..3000 {
         let count = 1 + random.below(if round % 10 == 0 { 300 } else { 60 }) as usize;
         let memory = if round % 4 == 0 {
@@ -2027,9 +2028,16 @@ fn inlined_loads_and_stores_leave_what_the_interpreter_leaves() {
         }
         misses += ran.misses;
         hits += ran.logged.len() as u64;
+        // Hits at an address that is not a multiple of the size (N10).
+        unaligned += ran
+            .logged
+            .iter()
+            .filter(|&&(va, bytes, ..)| va % u64::from(bytes.min(8)) != 0)
+            .count() as u64;
         watched += ran.watched;
     }
     assert!(left > 100, "{left} blocks left");
+    assert!(unaligned > 100, "{unaligned} logged hits not aligned");
     assert!(
         misses > 1000 && hits > 1000,
         "{misses} misses, {hits} logged hits"
