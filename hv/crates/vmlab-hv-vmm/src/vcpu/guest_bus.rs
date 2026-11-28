@@ -727,7 +727,6 @@ impl GuestBus {
             .read_slice(bytes, GuestAddress(address))
             .map_err(|_| Error::Memory(address))
     }
-
 }
 
 impl Memory for GuestBus {
