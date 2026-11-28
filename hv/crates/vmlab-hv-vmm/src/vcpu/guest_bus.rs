@@ -419,14 +419,161 @@ struct Shared {
     roms: Vec<(u64, u64)>,
 }
 
-/// The region of RAM of `shared` that holds the whole range, and the offset
-/// in it.
-#[inline(always)]
-fn shared_ram(shared: &Shared, address: u64, len: usize) -> Option<(&Region, u64)> {
-    shared.regions.iter().find_map(|region| {
-        let offset = address.checked_sub(region.base)?;
-        (offset.checked_add(len as u64)? <= region.len).then_some((region, offset))
-    })
+impl Shared {
+    /// The region of RAM that holds the whole range, and the offset in it.
+    #[inline(always)]
+    fn ram(&self, address: u64, len: usize) -> Option<(&Region, u64)> {
+        self.regions.iter().find_map(|region| {
+            let offset = address.checked_sub(region.base)?;
+            (offset.checked_add(len as u64)? <= region.len).then_some((region, offset))
+        })
+    }
+
+    fn is_rom(&self, address: u64) -> bool {
+        self.roms
+            .iter()
+            .any(|(base, end)| *base <= address && address < *end)
+    }
+
+    /// Whether RAM holds a part of the range. Such an access reaches over
+    /// the end of a region: no bus access is made for its other part.
+    fn touches_ram(&self, address: u64, len: usize) -> bool {
+        let end = address.saturating_add(len as u64);
+        self.regions
+            .iter()
+            .any(|region| address < region.base + region.len && region.base < end)
+    }
+
+    /// `Memory::read` of a CPU whose device accesses `device` counts.
+    #[inline]
+    fn read(&self, device: &mut DeviceTimes, address: u64, bytes: &mut [u8]) -> Result<()> {
+        // RAM is read straight from its mapping: vm-memory's read takes a
+        // lookup and a slice per access, which was a third of the time of
+        // a boot (card C13).
+        if let Some((region, offset)) = self.ram(address, bytes.len()) {
+            // SAFETY: `ram` found the whole range inside the region, whose
+            // mapping `Shared::memory` keeps alive.
+            unsafe { copy_in(region.host + offset as usize, bytes) };
+            return Ok(());
+        }
+        self.device_read(device, address, bytes, None)
+    }
+
+    /// `Memory::write` of a CPU whose counts are `tally`.
+    #[inline]
+    fn write(&self, tally: Tally<'_>, address: u64, bytes: &[u8]) -> Result<()> {
+        if let Some((region, offset)) = self.ram(address, bytes.len()) {
+            if self.is_rom(address) {
+                return Ok(());
+            }
+            let host = region.host + offset as usize;
+            if self.direct && !region.stamps.watched(offset, bytes.len()) {
+                // No code of a CPU there: no stamp (the module comment).
+                // SAFETY: `ram` found the whole range inside the region,
+                // whose mapping `Shared::memory` keeps alive, and RAM is
+                // writable.
+                unsafe { copy_out_to(host, bytes) };
+                compiler_fence(Ordering::SeqCst);
+                if region.stamps.watched(offset, bytes.len()) {
+                    *tally.ended += u64::from(region.stamps.wrote(offset as usize, bytes.len()));
+                    *tally.own += 1;
+                }
+                return Ok(());
+            }
+            // The bitmap makes the watch words even: one that is odd now
+            // ends code. A translator that makes one odd after this look
+            // finds its word changed (`watch_holds`).
+            *tally.ended += u64::from(region.stamps.watched(offset, bytes.len()));
+            let _atomic = self.serialize.then(|| self.transaction.lock());
+            // SAFETY: as above.
+            unsafe { copy_out_to(host, bytes) };
+            // The bitmap of the region moves the generations, after the
+            // write, as vm-memory reports its own writes.
+            // SAFETY: the bitmap is inside the region, as `host` is.
+            let bitmap = unsafe { &*region.bitmap };
+            vm_memory::bitmap::Bitmap::mark_dirty(bitmap, offset as usize, bytes.len());
+            *tally.own += 1;
+            return Ok(());
+        }
+        self.device_write(tally, address, bytes, None)
+    }
+
+    /// The generation that a reservation of the range is taken against.
+    fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+        match self.ram(address, len) {
+            Some((region, offset)) => region.stamps.newest(offset, len),
+            None => self.generation.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The device part of `read`, with the CPU out of its run loop while
+    /// the device serves it when `quiesce` is given (3e card T3-D4).
+    fn device_read(
+        &self,
+        device: &mut DeviceTimes,
+        address: u64,
+        bytes: &mut [u8],
+        quiesce: Option<&mut dyn Quiesce>,
+    ) -> Result<()> {
+        if self.touches_ram(address, bytes.len()) {
+            return Err(Error::Memory(address));
+        }
+        let started = std::time::Instant::now();
+        let mut away = quiesce;
+        if let Some(quiesce) = away.as_deref_mut() {
+            quiesce.leave();
+        }
+        let mut at = address;
+        let mut result = Ok(());
+        for part in bytes.chunks_mut(BUS_WIDTH) {
+            if !self.host.mmio_read(at, part) {
+                result = Err(Error::Memory(at));
+                break;
+            }
+            at += part.len() as u64;
+        }
+        if let Some(quiesce) = away {
+            quiesce.enter();
+        }
+        device.add(started);
+        result
+    }
+
+    /// The device part of `write`, as `device_read`.
+    fn device_write(
+        &self,
+        tally: Tally<'_>,
+        address: u64,
+        bytes: &[u8],
+        quiesce: Option<&mut dyn Quiesce>,
+    ) -> Result<()> {
+        if self.touches_ram(address, bytes.len()) {
+            return Err(Error::Memory(address));
+        }
+        let started = std::time::Instant::now();
+        let mut away = quiesce;
+        if let Some(quiesce) = away.as_deref_mut() {
+            quiesce.leave();
+        }
+        let mut at = address;
+        let mut result = Ok(());
+        for part in bytes.chunks(BUS_WIDTH) {
+            if !self.host.mmio_write(at, part) {
+                result = Err(Error::Memory(at));
+                break;
+            }
+            at += part.len() as u64;
+        }
+        if let Some(quiesce) = away {
+            quiesce.enter();
+        }
+        tally.device.add(started);
+        result?;
+        // The CPU counts each of its writes as one generation.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *tally.own += 1;
+        Ok(())
+    }
 }
 
 /// The memory of one emulated CPU. Every CPU of a machine has a clone.
@@ -440,6 +587,15 @@ pub struct GuestBus {
     /// The device accesses through this clone and their time (3e card
     /// T3-D4: another CPU waits for a CPU that is inside one).
     pub device: DeviceTimes,
+}
+
+/// The counts of one CPU that its writes move: the fields of `GuestBus`
+/// beside `shared`, borrowed apart from it, so that a write borrows
+/// `shared` and does not clone it.
+struct Tally<'a> {
+    own: &'a mut u64,
+    ended: &'a mut u64,
+    device: &'a mut DeviceTimes,
 }
 
 /// The device accesses of one CPU: how many, how many took longer than
@@ -549,24 +705,20 @@ impl GuestBus {
     /// The region of RAM that holds the whole range, and the offset in it.
     #[inline(always)]
     fn ram(&self, address: u64, len: usize) -> Option<(&Region, u64)> {
-        shared_ram(&self.shared, address, len)
+        self.shared.ram(address, len)
     }
 
-    fn is_rom(&self, address: u64) -> bool {
-        self.shared
-            .roms
-            .iter()
-            .any(|(base, end)| *base <= address && address < *end)
-    }
-
-    /// Whether RAM holds a part of the range. Such an access reaches over
-    /// the end of a region: no bus access is made for its other part.
-    fn touches_ram(&self, address: u64, len: usize) -> bool {
-        let end = address.saturating_add(len as u64);
-        self.shared
-            .regions
-            .iter()
-            .any(|region| address < region.base + region.len && region.base < end)
+    /// `shared`, borrowed apart from the counts that a write moves.
+    #[inline(always)]
+    fn split(&mut self) -> (&Shared, Tally<'_>) {
+        (
+            &self.shared,
+            Tally {
+                own: &mut self.own,
+                ended: &mut self.ended,
+                device: &mut self.device,
+            },
+        )
     }
 
     fn copy_out(&self, address: u64, bytes: &mut [u8]) -> Result<()> {
@@ -576,126 +728,18 @@ impl GuestBus {
             .map_err(|_| Error::Memory(address))
     }
 
-    /// The device part of `read`, with the CPU out of its run loop while
-    /// the device serves it when `quiesce` is given (3e card T3-D4).
-    fn device_read(
-        &mut self,
-        address: u64,
-        bytes: &mut [u8],
-        quiesce: Option<&mut dyn Quiesce>,
-    ) -> Result<()> {
-        if self.touches_ram(address, bytes.len()) {
-            return Err(Error::Memory(address));
-        }
-        let started = std::time::Instant::now();
-        let mut away = quiesce;
-        if let Some(quiesce) = away.as_deref_mut() {
-            quiesce.leave();
-        }
-        let mut at = address;
-        let mut result = Ok(());
-        for part in bytes.chunks_mut(BUS_WIDTH) {
-            if !self.shared.host.mmio_read(at, part) {
-                result = Err(Error::Memory(at));
-                break;
-            }
-            at += part.len() as u64;
-        }
-        if let Some(quiesce) = away {
-            quiesce.enter();
-        }
-        self.device.add(started);
-        result
-    }
-
-    /// The device part of `write`, as `device_read`.
-    fn device_write(
-        &mut self,
-        address: u64,
-        bytes: &[u8],
-        quiesce: Option<&mut dyn Quiesce>,
-    ) -> Result<()> {
-        if self.touches_ram(address, bytes.len()) {
-            return Err(Error::Memory(address));
-        }
-        let started = std::time::Instant::now();
-        let mut away = quiesce;
-        if let Some(quiesce) = away.as_deref_mut() {
-            quiesce.leave();
-        }
-        let mut at = address;
-        let mut result = Ok(());
-        for part in bytes.chunks(BUS_WIDTH) {
-            if !self.shared.host.mmio_write(at, part) {
-                result = Err(Error::Memory(at));
-                break;
-            }
-            at += part.len() as u64;
-        }
-        if let Some(quiesce) = away {
-            quiesce.enter();
-        }
-        self.device.add(started);
-        result?;
-        // The CPU counts each of its writes as one generation.
-        self.shared.generation.fetch_add(1, Ordering::SeqCst);
-        self.own += 1;
-        Ok(())
-    }
 }
 
 impl Memory for GuestBus {
     #[inline]
     fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<()> {
-        // RAM is read straight from its mapping: vm-memory's read takes a
-        // lookup and a slice per access, which was a third of the time of
-        // a boot (card C13).
-        if let Some((region, offset)) = self.ram(address, bytes.len()) {
-            // SAFETY: `ram` found the whole range inside the region, whose
-            // mapping `Shared::memory` keeps alive.
-            unsafe { copy_in(region.host + offset as usize, bytes) };
-            return Ok(());
-        }
-        self.device_read(address, bytes, None)
+        self.shared.read(&mut self.device, address, bytes)
     }
 
     #[inline]
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
-        let shared = self.shared.clone();
-        if let Some((region, offset)) = shared_ram(&shared, address, bytes.len()) {
-            if self.is_rom(address) {
-                return Ok(());
-            }
-            let host = region.host + offset as usize;
-            if shared.direct && !region.stamps.watched(offset, bytes.len()) {
-                // No code of a CPU there: no stamp (the module comment).
-                // SAFETY: `ram` found the whole range inside the region,
-                // whose mapping `Shared::memory` keeps alive, and RAM is
-                // writable.
-                unsafe { copy_out_to(host, bytes) };
-                compiler_fence(Ordering::SeqCst);
-                if region.stamps.watched(offset, bytes.len()) {
-                    self.ended += u64::from(region.stamps.wrote(offset as usize, bytes.len()));
-                    self.own += 1;
-                }
-                return Ok(());
-            }
-            // The bitmap makes the watch words even: one that is odd now
-            // ends code. A translator that makes one odd after this look
-            // finds its word changed (`watch_holds`).
-            self.ended += u64::from(region.stamps.watched(offset, bytes.len()));
-            let _atomic = shared.serialize.then(|| shared.transaction.lock());
-            // SAFETY: as above.
-            unsafe { copy_out_to(host, bytes) };
-            // The bitmap of the region moves the generations, after the
-            // write, as vm-memory reports its own writes.
-            // SAFETY: the bitmap is inside the region, as `host` is.
-            let bitmap = unsafe { &*region.bitmap };
-            vm_memory::bitmap::Bitmap::mark_dirty(bitmap, offset as usize, bytes.len());
-            self.own += 1;
-            return Ok(());
-        }
-        self.device_write(address, bytes, None)
+        let (shared, tally) = self.split();
+        shared.write(tally, address, bytes)
     }
 
     fn read_device(
@@ -709,7 +753,8 @@ impl Memory for GuestBus {
             unsafe { copy_in(region.host + offset as usize, bytes) };
             return Ok(());
         }
-        self.device_read(address, bytes, Some(quiesce))
+        self.shared
+            .device_read(&mut self.device, address, bytes, Some(quiesce))
     }
 
     fn write_device(
@@ -718,10 +763,11 @@ impl Memory for GuestBus {
         bytes: &[u8],
         quiesce: &mut dyn Quiesce,
     ) -> Result<()> {
-        if shared_ram(&self.shared, address, bytes.len()).is_some() {
-            return self.write(address, bytes);
+        let (shared, tally) = self.split();
+        if shared.ram(address, bytes.len()).is_some() {
+            return shared.write(tally, address, bytes);
         }
-        self.device_write(address, bytes, Some(quiesce))
+        shared.device_write(tally, address, bytes, Some(quiesce))
     }
 
     fn generation(&self) -> u64 {
@@ -752,29 +798,26 @@ impl Memory for GuestBus {
     }
 
     fn reservation_generation(&self, address: u64, len: usize) -> u64 {
-        match self.ram(address, len) {
-            Some((region, offset)) => region.stamps.newest(offset, len),
-            None => self.generation(),
-        }
+        self.shared.reservation_generation(address, len)
     }
 
     fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
-        let shared = self.shared.clone();
+        let (shared, tally) = self.split();
         let _atomic = shared.serialize.then(|| shared.transaction.lock());
         // The generation first: a device write between the two reads is
         // then seen by the store.
-        let generation = self.reservation_generation(address, bytes.len());
-        self.read(address, bytes)?;
+        let generation = shared.reservation_generation(address, bytes.len());
+        shared.read(tally.device, address, bytes)?;
         Ok(generation)
     }
 
     fn store_conditional(&mut self, address: u64, bytes: &[u8], generation: u64) -> Result<bool> {
-        let shared = self.shared.clone();
+        let (shared, tally) = self.split();
         let _atomic = shared.serialize.then(|| shared.transaction.lock());
-        if self.reservation_generation(address, bytes.len()) != generation {
+        if shared.reservation_generation(address, bytes.len()) != generation {
             return Ok(false);
         }
-        self.write(address, bytes)?;
+        shared.write(tally, address, bytes)?;
         Ok(true)
     }
 
@@ -789,7 +832,7 @@ impl Memory for GuestBus {
             return None;
         }
         let (region, offset) = self.ram(page, PAGE as usize)?;
-        let watch = if self.is_rom(page) {
+        let watch = if self.shared.is_rom(page) {
             0
         } else {
             &region.stamps.watch[(offset / PAGE) as usize] as *const AtomicU32 as usize
@@ -808,8 +851,8 @@ impl Memory for GuestBus {
         if !self.shared.direct {
             return None;
         }
-        let shared = self.shared.clone();
-        let (region, offset) = shared_ram(&shared, address, 1)?;
+        let shared = &*self.shared;
+        let (region, offset) = shared.ram(address, 1)?;
         let word = &region.stamps.watch[(offset / PAGE) as usize];
         // Under the mutex: a word that another translator made odd has had
         // its barrier.
@@ -849,12 +892,12 @@ impl Memory for GuestBus {
     }
 
     fn compare_and_store(&mut self, address: u64, expected: &[u8], new: &[u8]) -> Result<bool> {
-        let shared = self.shared.clone();
+        let (shared, tally) = self.split();
         let len = new.len();
         if shared.direct
             && expected.len() == len
-            && !self.is_rom(address)
-            && let Some((region, offset)) = shared_ram(&shared, address, len)
+            && !shared.is_rom(address)
+            && let Some((region, offset)) = shared.ram(address, len)
             && (region.host + offset as usize).is_multiple_of(len)
         {
             let word = |bytes: &[u8]| {
@@ -875,8 +918,8 @@ impl Memory for GuestBus {
             };
             if let Some(swapped) = swapped {
                 if swapped && region.stamps.watched(offset, len) {
-                    self.ended += u64::from(region.stamps.wrote(offset as usize, len));
-                    self.own += 1;
+                    *tally.ended += u64::from(region.stamps.wrote(offset as usize, len));
+                    *tally.own += 1;
                 }
                 return Ok(swapped);
             }
@@ -885,11 +928,11 @@ impl Memory for GuestBus {
         // a ROM, the bus, or one CPU on a host without the operation.
         let mut now = [0u8; 16];
         let now = &mut now[..expected.len()];
-        self.read(address, now)?;
+        shared.read(tally.device, address, now)?;
         if now != expected {
             return Ok(false);
         }
-        self.write(address, new)?;
+        shared.write(tally, address, new)?;
         Ok(true)
     }
 }
