@@ -186,12 +186,44 @@ unsafe fn copy_in(from: usize, bytes: &mut [u8]) {
                 bytes.copy_from_slice(&v.to_le_bytes());
             }
             _ => {
-                for (index, byte) in bytes.iter_mut().enumerate() {
-                    *byte = std::ptr::read_volatile((from + index) as *const u8);
+                let mut index = 0;
+                while index < bytes.len() {
+                    let at = from + index;
+                    let part = &mut bytes[index..];
+                    let size = piece(at, part.len());
+                    match size {
+                        8 => {
+                            let v = std::ptr::read_volatile(at as *const u64);
+                            part[..8].copy_from_slice(&v.to_le_bytes());
+                        }
+                        4 => {
+                            let v = std::ptr::read_volatile(at as *const u32);
+                            part[..4].copy_from_slice(&v.to_le_bytes());
+                        }
+                        2 => {
+                            let v = std::ptr::read_volatile(at as *const u16);
+                            part[..2].copy_from_slice(&v.to_le_bytes());
+                        }
+                        _ => part[0] = std::ptr::read_volatile(at as *const u8),
+                    }
+                    index += size;
                 }
             }
         }
     }
+}
+
+/// The size of the next host access of a copy that has `left` bytes to go
+/// at the host address `at`: the largest of 8, 4, 2 and 1 that `at` is
+/// aligned to and that is not more than `left` (card #1216). An access of
+/// more than 8 bytes, or one that is not aligned to its size, so moves in
+/// words, and every part of it that is aligned to 8, 4 or 2 is still one
+/// host access, as the elements of a pair need. `left` is at least 1.
+#[inline(always)]
+fn piece(at: usize, left: usize) -> usize {
+    let aligned = 1usize << at.trailing_zeros().min(3);
+    let fits = 1usize << (usize::BITS - 1 - left.leading_zeros()).min(3);
+    aligned.min(fits)
 }
 
 /// Copy `bytes` into guest RAM at the host address `to`, as `copy_in` reads.
@@ -219,8 +251,27 @@ unsafe fn copy_out_to(to: usize, bytes: &[u8]) {
                 std::ptr::write_volatile(to as *mut u64, u64::from_le_bytes(word));
             }
             _ => {
-                for (index, byte) in bytes.iter().enumerate() {
-                    std::ptr::write_volatile((to + index) as *mut u8, *byte);
+                let mut index = 0;
+                while index < bytes.len() {
+                    let at = to + index;
+                    let part = &bytes[index..];
+                    let size = piece(at, part.len());
+                    match size {
+                        8 => std::ptr::write_volatile(
+                            at as *mut u64,
+                            u64::from_le_bytes(part[..8].try_into().expect("8 bytes")),
+                        ),
+                        4 => std::ptr::write_volatile(
+                            at as *mut u32,
+                            u32::from_le_bytes(part[..4].try_into().expect("4 bytes")),
+                        ),
+                        2 => std::ptr::write_volatile(
+                            at as *mut u16,
+                            u16::from_le_bytes(part[..2].try_into().expect("2 bytes")),
+                        ),
+                        _ => std::ptr::write_volatile(at as *mut u8, part[0]),
+                    }
+                    index += size;
                 }
             }
         }
@@ -840,5 +891,53 @@ impl Memory for GuestBus {
         }
         self.write(address, new)?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_in, copy_out_to, piece};
+
+    #[test]
+    fn a_piece_is_aligned_and_fits() {
+        for at in 0..64usize {
+            for left in 1..40usize {
+                let size = piece(at, left);
+                assert!([1, 2, 4, 8].contains(&size), "{at} {left}");
+                assert!(at.is_multiple_of(size) && size <= left, "{at} {left}");
+                // Nothing larger would do.
+                let larger = size * 2;
+                assert!(
+                    larger > 8 || !at.is_multiple_of(larger) || larger > left,
+                    "{at} {left}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_copies_move_every_byte_at_every_offset_and_length() {
+        let source: Vec<u8> = (0..96u8).map(|n| n.wrapping_mul(37) ^ 0x5a).collect();
+        // A buffer of words, so that its offsets are the host alignments.
+        let mut ram = vec![0u64; 12];
+        for offset in 0..24usize {
+            for len in 0..48usize {
+                ram.fill(0);
+                let base = ram.as_mut_ptr() as usize;
+                // SAFETY: offset + len is inside the 96 bytes of `ram`.
+                unsafe { copy_out_to(base + offset, &source[..len]) };
+                let mut bytes = [0u8; 96];
+                for (n, word) in ram.iter().enumerate() {
+                    bytes[n * 8..n * 8 + 8].copy_from_slice(&word.to_le_bytes());
+                }
+                assert_eq!(&bytes[offset..offset + len], &source[..len], "{offset} {len}");
+                assert!(bytes[..offset].iter().all(|&b| b == 0), "{offset} {len}");
+                assert!(bytes[offset + len..].iter().all(|&b| b == 0), "{offset} {len}");
+                let mut back = vec![0u8; len];
+                // SAFETY: as above.
+                unsafe { copy_in(base + offset, &mut back) };
+                assert_eq!(back, &source[..len], "{offset} {len}");
+            }
+        }
     }
 }
