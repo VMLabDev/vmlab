@@ -54,6 +54,16 @@
 //! register slots of the state. RAX, RCX and RDX are scratch. The others,
 //! but RSP, are the pool.
 //!
+//! Card #1213: an operation of one word computes its result in the
+//! register that its word gets, the register of its first operand where
+//! nothing reads that operand later, so a result makes no move out of RAX.
+//! A load of one word loads into the register of its result. An `Add` of
+//! 64 bits that only the address of one inline load or store reads is
+//! taken into that access, as a `lea` of a base and a displacement or of a
+//! base and an index (`folds`). The outputs of a side exit go to the state
+//! straight from their registers, and an output of one word to a slot that
+//! its owner keeps narrow (`Shape::narrow`) makes no store to its high half.
+//!
 //! Sources read: the Intel 64 and IA-32 Architectures Software Developer's
 //! Manual, volume 2, for what each instruction computes, and the System V
 //! AMD64 ABI for the call of the thunk. The operations are those of
@@ -1017,32 +1027,6 @@ impl Emitter<'_> {
             Val::Reg(reg) => self.asm.mov(dst, Rm::Reg(reg)),
             Val::Mem(memory) => self.asm.mov(dst, memory),
             Val::Imm(value) => self.asm.mov_imm(dst, value),
-        }
-    }
-
-    /// `<alu> rax, value`.
-    fn alu(&mut self, alu: Alu, value: Val) {
-        match value {
-            Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
-                self.asm.alu_imm(alu, Rm::Reg(RAX), value as i32);
-            }
-            other => {
-                let rm = self.rm(other, RDX);
-                self.asm.alu(alu, RAX, rm);
-            }
-        }
-    }
-
-    /// `rax &= mask`, in its shortest form.
-    fn mask(&mut self, mask: u64) {
-        if mask == u64::MAX {
-        } else if mask == u64::from(u32::MAX) {
-            self.asm.mov32(RAX, RAX);
-        } else if i32::try_from(mask as i64).is_ok() {
-            self.asm.alu_imm(Alu::And, Rm::Reg(RAX), mask as i32);
-        } else {
-            self.asm.mov_imm(RDX, mask);
-            self.asm.alu(Alu::And, RAX, Rm::Reg(RDX));
         }
     }
 
@@ -2209,7 +2193,7 @@ impl Emitter<'_> {
         self.value(place.slot + Slot::from(high), at)
     }
 
-    /// `<alu> dst, value` for RAX or RCX, through RDX where it must.
+    /// `<alu> dst, value`, through RDX where it must. `dst` is not RDX.
     fn alu_on(&mut self, alu: Alu, dst: Reg, value: Val) {
         match value {
             Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
