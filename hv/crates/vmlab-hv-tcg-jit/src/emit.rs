@@ -2318,8 +2318,7 @@ impl Emitter<'_> {
             // anything, so the call keeps none. 0 and the exit codes leave
             // as they are, and anything else is the code of the next block.
             Self::call_thunk(&mut self.asm, TERMINAL, &[]);
-            self.asm
-                .alu_imm(Alu::Cmp, Rm::Reg(RAX), LOWEST_CODE as i32);
+            self.asm.alu_imm(Alu::Cmp, Rm::Reg(RAX), LOWEST_CODE as i32);
             self.asm.jcc_absolute(Cond::B, self.exit);
             self.asm.jmp_reg(RAX);
             return;

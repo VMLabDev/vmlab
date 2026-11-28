@@ -2717,9 +2717,7 @@ unsafe fn serve_terminal<M: Memory>(env: &mut Env<M>, tag: *mut std::ffi::c_void
         Some(count) => count.wrapping_sub(terminal.own_generation),
         None => env.side.own_writes,
     };
-    if env.side.code_written
-        || env.memory.generation() != terminal.generation.wrapping_add(own)
-    {
+    if env.side.code_written || env.memory.generation() != terminal.generation.wrapping_add(own) {
         return 0;
     }
     // SAFETY: the state of the CPU, which compiled code does not touch
@@ -5360,7 +5358,14 @@ impl<M: Memory> Cpu<M> {
         if write && timer_row(row) {
             self.timer_written = true;
         }
-        access_register(&mut self.state, &mut self.side, &environment, row, rt, write);
+        access_register(
+            &mut self.state,
+            &mut self.side,
+            &environment,
+            row,
+            rt,
+            write,
+        );
         Ok(())
     }
 
@@ -6171,7 +6176,6 @@ impl<M: Memory> Cpu<M> {
     }
 }
 
-
 /// Whether the register of `row` is one of the generic timer's, whose write
 /// the owner of a machine CPU must see at once (`Cpu::timer_written`).
 fn timer_row(row: usize) -> bool {
@@ -6237,7 +6241,6 @@ fn pstate(state: &mut State, field: PstateField, immediate: u8) -> Result<(), Ex
     Ok(())
 }
 
-
 /// `SYS` (or `SYSL` when `read`) of the operation op1:CRn:CRm:op2 with
 /// the register `rt`: a cache, TLB or address translation operation.
 /// What the loop and the thunk (card T3-D2) both run. `None`: an operation
@@ -6301,9 +6304,7 @@ fn operation<M: Memory>(
                 Kind::Write
             };
             let par = match side.mmu.walk(memory, value, false) {
-                Ok(page) if page.flags & mmu::needed(kind, op2 & 2 != 0) != 0 => {
-                    mmu::par_of(&page)
-                }
+                Ok(page) if page.flags & mmu::needed(kind, op2 & 2 != 0) != 0 => mmu::par_of(&page),
                 Ok(page) => mmu::par_fault(mmu::Fault {
                     kind: mmu::FaultKind::Permission,
                     level: page.level,
@@ -7000,7 +7001,13 @@ mod tests {
         // SP_EL1: add x2, x2, #1 ; b -4.
         let make = |jit| {
             let mut cpu = terminal_cpu(
-                &[0x9100_0400, 0xd50b_7422, 0xd503_42ff, 0x9100_0421, 0x17ff_fffc],
+                &[
+                    0x9100_0400,
+                    0xd50b_7422,
+                    0xd503_42ff,
+                    0x9100_0421,
+                    0x17ff_fffc,
+                ],
                 jit,
             );
             for (index, word) in [0x9100_0442u32, 0x17ff_ffff].iter().enumerate() {
